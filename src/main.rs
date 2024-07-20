@@ -195,6 +195,59 @@ fn parse_toplevel_declaration<'s>(
 }
 
 #[derive(Debug)]
+pub struct TypeGenericArgs<'s> {
+    pub open_angle_bracket_token: Token<'s>,
+    pub args: Vec<(Type<'s>, Option<Token<'s>>)>,
+    pub close_angle_bracket_token: Token<'s>,
+}
+fn parse_type_generic_args<'s>(state: &mut ParseState<'s>) -> ParseResult<TypeGenericArgs<'s>> {
+    let open_angle_bracket_token = state.consume_by_kind(TokenKind::OpenAngleBracket)?.clone();
+
+    let mut args = Vec::new();
+    let mut can_continue = true;
+    while state
+        .current_token()
+        .is_some_and(|t| t.kind != TokenKind::CloseAngleBracket)
+    {
+        if !can_continue {
+            return Err(state.err(ParseErrorKind::ListNotPunctuated(TokenKind::Comma)));
+        }
+
+        let t = parse_type(state)?;
+        let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
+
+        can_continue = opt_comma_token.is_some();
+        args.push((t, opt_comma_token));
+    }
+
+    let close_angle_bracket_token = state.consume_by_kind(TokenKind::CloseAngleBracket)?.clone();
+
+    Ok(TypeGenericArgs {
+        open_angle_bracket_token,
+        args,
+        close_angle_bracket_token,
+    })
+}
+
+#[derive(Debug)]
+pub struct Type<'s> {
+    pub name_token: Token<'s>,
+    pub generic_args: Option<TypeGenericArgs<'s>>,
+}
+fn parse_type<'s>(state: &mut ParseState<'s>) -> ParseResult<Type<'s>> {
+    let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+    let generic_args = match state.current_token() {
+        Some(t) if t.kind == TokenKind::OpenAngleBracket => Some(parse_type_generic_args(state)?),
+        _ => None,
+    };
+
+    Ok(Type {
+        name_token,
+        generic_args,
+    })
+}
+
+#[derive(Debug)]
 pub enum ConstExpression<'s> {
     Number(Token<'s>),
 }
@@ -313,7 +366,7 @@ pub struct StructMember<'s> {
     pub attribute_lists: Vec<AttributeList<'s>>,
     pub name_token: Token<'s>,
     pub colon_token: Token<'s>,
-    pub type_token: Token<'s>,
+    pub ty: Type<'s>,
 }
 fn parse_struct_member<'s>(state: &mut ParseState<'s>) -> ParseResult<StructMember<'s>> {
     let mut attribute_lists = Vec::new();
@@ -328,13 +381,13 @@ fn parse_struct_member<'s>(state: &mut ParseState<'s>) -> ParseResult<StructMemb
         .consume_in_block_by_kind(TokenKind::Identifier)?
         .clone();
     let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
-    let type_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+    let ty = parse_type(state)?;
 
     Ok(StructMember {
         attribute_lists,
         name_token,
         colon_token,
-        type_token,
+        ty,
     })
 }
 
@@ -380,7 +433,7 @@ pub enum FunctionDeclarationInputArguments<'s> {
         attribute_lists: Vec<AttributeList<'s>>,
         varname_token: Token<'s>,
         colon_token: Token<'s>,
-        type_token: Token<'s>,
+        ty: Type<'s>,
     },
     Multiple {
         open_parenthese_token: Token<'s>,
@@ -388,7 +441,7 @@ pub enum FunctionDeclarationInputArguments<'s> {
             Vec<AttributeList<'s>>,
             Token<'s>,
             Token<'s>,
-            Token<'s>,
+            Type<'s>,
             Option<Token<'s>>,
         )>,
         close_parenthese_token: Token<'s>,
@@ -422,7 +475,7 @@ fn parse_function_declaration_input_arguments<'s>(
 
                 let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
                 let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
-                let type_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+                let ty = parse_type(state)?;
                 let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
 
                 can_continue = opt_comma_token.is_some();
@@ -430,7 +483,7 @@ fn parse_function_declaration_input_arguments<'s>(
                     attribute_lists,
                     name_token,
                     colon_token,
-                    type_token,
+                    ty,
                     opt_comma_token,
                 ));
             }
@@ -454,13 +507,13 @@ fn parse_function_declaration_input_arguments<'s>(
 
             let varname_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
             let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
-            let type_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+            let ty = parse_type(state)?;
 
             Ok(FunctionDeclarationInputArguments::Single {
                 attribute_lists,
                 varname_token,
                 colon_token,
-                type_token,
+                ty,
             })
         }
     }
@@ -470,11 +523,11 @@ fn parse_function_declaration_input_arguments<'s>(
 pub enum FunctionDeclarationOutput<'s> {
     Single {
         attribute_lists: Vec<AttributeList<'s>>,
-        type_token: Token<'s>,
+        ty: Type<'s>,
     },
     Tupled {
         open_parenthese_token: Token<'s>,
-        elements: Vec<(Vec<AttributeList<'s>>, Token<'s>, Option<Token<'s>>)>,
+        elements: Vec<(Vec<AttributeList<'s>>, Type<'s>, Option<Token<'s>>)>,
         close_parenthese_token: Token<'s>,
     },
 }
@@ -504,11 +557,11 @@ fn parse_function_declaration_output<'s>(
                     attribute_lists.push(parse_attribute_list(state)?);
                 }
 
-                let type_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+                let ty = parse_type(state)?;
                 let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
 
                 can_continue = opt_comma_token.is_some();
-                elements.push((attribute_lists, type_token, opt_comma_token));
+                elements.push((attribute_lists, ty, opt_comma_token));
             }
 
             let close_parenthese_token = state.consume_by_kind(TokenKind::CloseParenthese)?.clone();
@@ -528,11 +581,11 @@ fn parse_function_declaration_output<'s>(
                 attribute_lists.push(parse_attribute_list(state)?);
             }
 
-            let type_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+            let ty = parse_type(state)?;
 
             Ok(FunctionDeclarationOutput::Single {
                 attribute_lists,
-                type_token,
+                ty,
             })
         }
     }
