@@ -4,7 +4,7 @@ struct FragmentShaderInputs with
   [PushConstant(0)]
   threshold: Float
 
-[FragmentShader]
+[FragmentShader] # fsh
 fragMain inputs: FragmentShaderInputs -> [location(0)] Float4 do
   let i = subpassLoad inputs.sourceTex
   if i.r >= inputs.threshold || i.g >= inputs.threshold || i.b >= inputs.threshold then i else Float4 0.0f

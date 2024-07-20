@@ -67,6 +67,12 @@ impl<'s> Tokenizer<'s> {
             return Ok(None);
         }
 
+        if self.source.starts_with('#') {
+            // line comment
+            self.source = self.source.trim_start_matches(|c| c != '\n');
+            return self.next_token();
+        }
+
         if self.source.starts_with("->") {
             let tk = Token {
                 slice: &self.source[..2],
@@ -190,7 +196,7 @@ impl<'s> Tokenizer<'s> {
         let (ident_char_count, ident_byte_count) = self
             .source
             .chars()
-            .take_while(|&c| !"=!\"#$%&'()[]_?><.,;:@=~-^|\\ \t\r\n".contains(c))
+            .take_while(|&c| !"=!\"#%&'()[]?><.,;:@=~-^|\\ \t\r\n".contains(c))
             .fold((0, 0), |(a, b), c| (a + 1, b + c.len_utf8()));
         assert!(
             ident_byte_count > 0,
