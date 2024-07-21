@@ -1,3 +1,7 @@
+use std::{cell::RefCell, collections::HashMap};
+
+use typed_arena::Arena;
+
 fn main() {
     let src = std::fs::read_to_string("./sample_bloom_extract.csh").expect("Failed to load source");
     let mut tokenizer = Tokenizer {
@@ -18,10 +22,1168 @@ fn main() {
         token_ptr: 0,
         indent_context_stack: Vec::new(),
     };
+    let mut tlds = Vec::new();
     while parse_state.current_token().is_some() {
         let tld = parse_toplevel_declaration(&mut parse_state).unwrap();
         println!("tld: {tld:#?}");
+        tlds.push(tld);
     }
+
+    let intrinsic_symbol_scope = IntrinsicSymbolScope::new();
+    let mut scope_stack = Vec::new();
+
+    let mut partially_typed_types = HashMap::new();
+    for tld in tlds.iter() {
+        match tld {
+            ToplevelDeclaration::Struct(s) => {
+                partially_typed_types.insert(
+                    s.name_token.slice,
+                    (
+                        SourceRef::from(&s.name_token),
+                        UserDefinedTypePartiallyTyped::Struct(
+                            s.member_list
+                                .iter()
+                                .map(|x| UserDefinedStructMemberPartiallyTyped {
+                                    name: SourceRef::from(&x.name_token),
+                                    ty: x.ty.clone(),
+                                    attributes: x
+                                        .attribute_lists
+                                        .iter()
+                                        .flat_map(|xs| {
+                                            xs.attribute_list.iter().map(|x| x.0.clone())
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        ),
+                    ),
+                );
+            }
+            ToplevelDeclaration::Function(_) => (),
+        }
+    }
+
+    let mut top_scope = SymbolScope {
+        user_defined_type_symbols: HashMap::new(),
+        function_inputs: Vec::new(),
+        local_vars: Vec::new(),
+        function_input_index_by_name: HashMap::new(),
+        local_var_index_by_name: HashMap::new(),
+    };
+    top_scope
+        .user_defined_type_symbols
+        .extend(partially_typed_types.into_iter().map(|(k, (org, v))| {
+            (
+                k,
+                (
+                    org,
+                    match v {
+                        UserDefinedTypePartiallyTyped::Struct(s) => UserDefinedType::Struct(
+                            s.into_iter()
+                                .map(|x| UserDefinedStructMember {
+                                    name: x.name,
+                                    ty: ConcreteType::build(&scope_stack, x.ty),
+                                    attributes: x.attributes,
+                                })
+                                .collect(),
+                        ),
+                    },
+                ),
+            )
+        }));
+    println!("TopScopeSymbols: {top_scope:#?}");
+    scope_stack.push(top_scope);
+
+    let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
+        panic!("not a function?");
+    };
+    let symbol_scope_arena = Arena::new();
+    let global_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new_intrinsics());
+    let function_symbol_scope =
+        symbol_scope_arena.alloc(SymbolScope2::new(Some(global_symbol_scope)));
+    match f.input_args {
+        FunctionDeclarationInputArguments::Single {
+            varname_token, ty, ..
+        } => {
+            function_symbol_scope.declare_function_input(
+                SourceRef::from(&varname_token),
+                ConcreteType::build(&scope_stack, ty),
+            );
+        }
+        FunctionDeclarationInputArguments::Multiple { args, .. } => {
+            for (_, n, _, ty, _) in args {
+                function_symbol_scope.declare_function_input(
+                    SourceRef::from(&n),
+                    ConcreteType::build(&scope_stack, ty),
+                );
+            }
+        }
+    }
+    let mut simplify_context = SimplificationContext {
+        symbol_scope_arena: &symbol_scope_arena,
+        vars: Vec::new(),
+    };
+    let last_var_id = simplify_expression(f.body, &mut simplify_context, &function_symbol_scope);
+    println!("simplified exprs:");
+    for (n, x) in simplify_context.vars.iter().enumerate() {
+        print_simp_expr(x, n, 0);
+    }
+    println!("last id: {last_var_id}");
+
+    // let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
+    //     panic!("not a function decl?");
+    // };
+
+    // let mut fscope = SymbolScope {
+    //     user_defined_type_symbols: HashMap::new(),
+    //     function_inputs: Vec::new(),
+    //     local_vars: Vec::new(),
+    //     function_input_index_by_name: HashMap::new(),
+    //     local_var_index_by_name: HashMap::new(),
+    // };
+    // match f.input_args {
+    //     FunctionDeclarationInputArguments::Single {
+    //         varname_token, ty, ..
+    //     } => {
+    //         fscope.declare_function_input(&varname_token, ConcreteType::build(&scope_stack, ty));
+    //     }
+    //     FunctionDeclarationInputArguments::Multiple { args, .. } => {
+    //         for a in args {
+    //             fscope.declare_function_input(&a.1, ConcreteType::build(&scope_stack, a.3));
+    //         }
+    //     }
+    // }
+    // scope_stack.push(fscope);
+    // let transformed = transform_expression(&intrinsic_symbol_scope, &mut scope_stack, f.body);
+    // println!("transformed body: {transformed:#?}");
+    // println!("scope: {scope_stack:#?}");
+}
+
+fn print_simp_expr(x: &SimplifiedExpression, vid: usize, nested: usize) {
+    match x {
+        SimplifiedExpression::ScopedBlock {
+            expressions,
+            returning,
+            ..
+        } => {
+            println!("  {}%{vid} = Scope {{", "  ".repeat(nested));
+            for (n, x) in expressions.iter().enumerate() {
+                print_simp_expr(x, n, nested + 1);
+            }
+            println!("  {}returning %{returning}", "  ".repeat(nested + 1));
+            println!("  {}}}", "  ".repeat(nested));
+        }
+        _ => println!("  {}%{vid} = {x:?}", "  ".repeat(nested)),
+    }
+}
+
+#[derive(Debug)]
+pub struct IntrinsicFunctionSymbol {
+    pub name: &'static str,
+    pub ty: ConcreteType<'static>,
+}
+
+#[derive(Debug)]
+pub struct FunctionInputVariable<'s> {
+    pub occurence: SourceRef<'s>,
+    pub ty: ConcreteType<'s>,
+}
+
+#[derive(Debug)]
+pub struct LocalVariable<'s> {
+    pub occurence: SourceRef<'s>,
+    pub ty: ConcreteType<'s>,
+    pub init_expr_id: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum VarId {
+    FunctionInput(usize),
+    ScopeLocal(usize),
+    IntrinsicFunction(&'static str),
+    IntrinsicTypeConstructor(IntrinsicType),
+}
+
+#[derive(Debug)]
+pub struct SymbolScope2<'a, 's> {
+    parent: Option<&'a SymbolScope2<'a, 's>>,
+    intrinsic_symbols: HashMap<&'s str, IntrinsicFunctionSymbol>,
+    function_input_vars: Vec<FunctionInputVariable<'s>>,
+    local_vars: RefCell<Vec<LocalVariable<'s>>>,
+    var_id_by_name: RefCell<HashMap<&'s str, VarId>>,
+}
+impl<'a, 's> SymbolScope2<'a, 's> {
+    pub fn new(parent: Option<&'a SymbolScope2<'a, 's>>) -> Self {
+        Self {
+            parent,
+            intrinsic_symbols: HashMap::new(),
+            function_input_vars: Vec::new(),
+            local_vars: RefCell::new(Vec::new()),
+            var_id_by_name: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn new_intrinsics() -> Self {
+        let mut intrinsic_symbols = HashMap::new();
+        let mut var_id_by_name = HashMap::new();
+
+        intrinsic_symbols.insert(
+            "subpassLoad",
+            IntrinsicFunctionSymbol {
+                name: "OpImageRead#SubpassData",
+                ty: ConcreteType::Function {
+                    args: vec![ConcreteType::Intrinsic(IntrinsicType::SubpassInput)],
+                    output: Some(Box::new(ConcreteType::Intrinsic(IntrinsicType::Float4))),
+                },
+            },
+        );
+        var_id_by_name.insert(
+            "Float4",
+            VarId::IntrinsicTypeConstructor(IntrinsicType::Float4),
+        );
+
+        Self {
+            parent: None,
+            intrinsic_symbols,
+            function_input_vars: Vec::new(),
+            local_vars: RefCell::new(Vec::new()),
+            var_id_by_name: RefCell::new(var_id_by_name),
+        }
+    }
+
+    pub fn declare_function_input(&mut self, name: SourceRef<'s>, ty: ConcreteType<'s>) -> VarId {
+        match self.var_id_by_name.borrow_mut().entry(name.slice) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                self.function_input_vars.push(FunctionInputVariable {
+                    occurence: name.clone(),
+                    ty,
+                });
+                let vid = VarId::FunctionInput(self.function_input_vars.len() - 1);
+                v.insert(vid);
+                vid
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("Function Input {} is already declared", name.slice);
+            }
+        }
+    }
+
+    pub fn declare_local_var(
+        &self,
+        name: SourceRef<'s>,
+        ty: ConcreteType<'s>,
+        init_expr: usize,
+    ) -> VarId {
+        self.local_vars.borrow_mut().push(LocalVariable {
+            occurence: name.clone(),
+            ty,
+            init_expr_id: init_expr,
+        });
+        let vid = VarId::ScopeLocal(self.local_vars.borrow().len() - 1);
+        self.var_id_by_name.borrow_mut().insert(name.slice, vid);
+        vid
+    }
+
+    pub fn lookup(&self, name: &'s str) -> Option<(&Self, VarId)> {
+        if let Some(x) = self.intrinsic_symbols.get(name) {
+            return Some((self, VarId::IntrinsicFunction(x.name)));
+        }
+
+        match self.var_id_by_name.borrow().get(name) {
+            Some(vid) => Some((self, *vid)),
+            None => match self.parent {
+                Some(ref p) => p.lookup(name),
+                None => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SimplifiedExpression<'a, 's> {
+    Add(usize, usize),
+    Sub(usize, usize),
+    Mul(usize, usize),
+    Div(usize, usize),
+    Rem(usize, usize),
+    BitAnd(usize, usize),
+    BitOr(usize, usize),
+    BitXor(usize, usize),
+    Eq(usize, usize),
+    Ne(usize, usize),
+    Gt(usize, usize),
+    Ge(usize, usize),
+    Lt(usize, usize),
+    Le(usize, usize),
+    LogAnd(usize, usize),
+    LogOr(usize, usize),
+    Neg(usize),
+    BitNot(usize),
+    LogNot(usize),
+    Funcall(usize, Vec<usize>),
+    MemberRef(usize, SourceRef<'s>),
+    LoadVar(&'a SymbolScope2<'a, 's>, VarId),
+    InitializeVar(&'a SymbolScope2<'a, 's>, VarId),
+    StoreLocal(SourceRef<'s>, usize),
+    IntrinsicFunction(&'static str),
+    IntrinsicTypeConstructor(IntrinsicType),
+    Select(usize, usize, usize),
+    Cast(usize, ConcreteType<'s>),
+    ConstInt(SourceRef<'s>),
+    ConstFloat(SourceRef<'s>),
+    ConstNumber(SourceRef<'s>),
+    ConstUnit,
+    ConstructTuple(Vec<usize>),
+    ScopedBlock {
+        symbol_scope: &'a SymbolScope2<'a, 's>,
+        expressions: Vec<SimplifiedExpression<'a, 's>>,
+        returning: usize,
+    },
+}
+pub struct SimplificationContext<'a, 's> {
+    pub symbol_scope_arena: &'a Arena<SymbolScope2<'a, 's>>,
+    pub vars: Vec<SimplifiedExpression<'a, 's>>,
+}
+impl<'a, 's> SimplificationContext<'a, 's> {
+    pub fn add(&mut self, expr: SimplifiedExpression<'a, 's>) -> usize {
+        self.vars.push(expr);
+
+        self.vars.len() - 1
+    }
+}
+fn simplify_expression<'a, 's>(
+    ast: Expression<'s>,
+    ctx: &mut SimplificationContext<'a, 's>,
+    symbol_scope: &'a SymbolScope2<'a, 's>,
+) -> usize {
+    match ast {
+        Expression::Binary(left, op, right) => {
+            let left = simplify_expression(*left, ctx, symbol_scope);
+            let right = simplify_expression(*right, ctx, symbol_scope);
+
+            ctx.add(match op.slice {
+                "+" => SimplifiedExpression::Add(left, right),
+                "-" => SimplifiedExpression::Sub(left, right),
+                "*" => SimplifiedExpression::Mul(left, right),
+                "/" => SimplifiedExpression::Div(left, right),
+                "%" => SimplifiedExpression::Rem(left, right),
+                "&" => SimplifiedExpression::BitAnd(left, right),
+                "|" => SimplifiedExpression::BitOr(left, right),
+                "^" => SimplifiedExpression::BitXor(left, right),
+                "==" => SimplifiedExpression::Eq(left, right),
+                "!=" => SimplifiedExpression::Ne(left, right),
+                ">=" => SimplifiedExpression::Ge(left, right),
+                "<=" => SimplifiedExpression::Le(left, right),
+                ">" => SimplifiedExpression::Gt(left, right),
+                "<" => SimplifiedExpression::Lt(left, right),
+                "&&" => SimplifiedExpression::LogAnd(left, right),
+                "||" => SimplifiedExpression::LogOr(left, right),
+                _ => unreachable!("unknown binary op"),
+            })
+        }
+        Expression::Prefixed(op, expr) => {
+            let expr = simplify_expression(*expr, ctx, symbol_scope);
+
+            match op.slice {
+                "+" => expr,
+                "-" => ctx.add(SimplifiedExpression::Neg(expr)),
+                "!" => ctx.add(SimplifiedExpression::LogNot(expr)),
+                "~" => ctx.add(SimplifiedExpression::BitNot(expr)),
+                _ => unreachable!("unknown prefixed op"),
+            }
+        }
+        Expression::Lifted(_, x, _) => simplify_expression(*x, ctx, symbol_scope),
+        Expression::Blocked(stmts, x) => {
+            let new_symbol_scope = ctx
+                .symbol_scope_arena
+                .alloc(SymbolScope2::new(Some(symbol_scope)));
+            let mut new_ctx = SimplificationContext {
+                symbol_scope_arena: ctx.symbol_scope_arena,
+                vars: Vec::new(),
+            };
+
+            for s in stmts {
+                match s {
+                    Statement::Let {
+                        varname_token,
+                        expr,
+                        ..
+                    } => {
+                        let res = simplify_expression(expr, &mut new_ctx, new_symbol_scope);
+                        let vid = new_symbol_scope.declare_local_var(
+                            SourceRef::from(&varname_token),
+                            ConcreteType::Inferred,
+                            res,
+                        );
+                        new_ctx.add(SimplifiedExpression::InitializeVar(new_symbol_scope, vid));
+                    }
+                }
+            }
+
+            let last_id = simplify_expression(*x, &mut new_ctx, new_symbol_scope);
+            ctx.add(SimplifiedExpression::ScopedBlock {
+                symbol_scope: new_symbol_scope,
+                expressions: new_ctx.vars,
+                returning: last_id,
+            })
+        }
+        Expression::MemberRef(base, _, name) => {
+            let base = simplify_expression(*base, ctx, symbol_scope);
+
+            ctx.add(SimplifiedExpression::MemberRef(
+                base,
+                SourceRef::from(&name),
+            ))
+        }
+        Expression::Funcall {
+            base_expr, args, ..
+        } => {
+            let base_expr = simplify_expression(*base_expr, ctx, symbol_scope);
+            let args = args
+                .into_iter()
+                .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
+                .collect();
+
+            ctx.add(SimplifiedExpression::Funcall(base_expr, args))
+        }
+        Expression::FuncallSingle(base_expr, arg) => {
+            let base_expr = simplify_expression(*base_expr, ctx, symbol_scope);
+            let arg = simplify_expression(*arg, ctx, symbol_scope);
+
+            ctx.add(SimplifiedExpression::Funcall(base_expr, vec![arg]))
+        }
+        Expression::Number(t) => {
+            let has_hex_prefix = t.slice.starts_with("0x") || t.slice.starts_with("0X");
+            let has_float_suffix = t.slice.ends_with(['f', 'F']);
+            let has_fpart = t.slice.contains('.');
+
+            ctx.add(if has_hex_prefix {
+                SimplifiedExpression::ConstInt(SourceRef::from(&t))
+            } else if has_float_suffix {
+                SimplifiedExpression::ConstFloat(SourceRef::from(&t))
+            } else if has_fpart {
+                SimplifiedExpression::ConstNumber(SourceRef::from(&t))
+            } else {
+                SimplifiedExpression::ConstInt(SourceRef::from(&t))
+            })
+        }
+        Expression::Var(x) => {
+            let Some((scope, vid)) = symbol_scope.lookup(x.slice) else {
+                panic!("Error: referencing undefined symbol '{}' {x:?}", x.slice);
+            };
+
+            match vid {
+                VarId::IntrinsicFunction(name) => {
+                    ctx.add(SimplifiedExpression::IntrinsicFunction(name))
+                }
+                VarId::IntrinsicTypeConstructor(t) => {
+                    ctx.add(SimplifiedExpression::IntrinsicTypeConstructor(t))
+                }
+                _ => ctx.add(SimplifiedExpression::LoadVar(scope, vid)),
+            }
+        }
+        Expression::Tuple(_, xs, _) => {
+            let xs = xs
+                .into_iter()
+                .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
+                .collect();
+
+            ctx.add(SimplifiedExpression::ConstructTuple(xs))
+        }
+        Expression::If {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let condition = simplify_expression(*condition, ctx, symbol_scope);
+            let then_expr = simplify_expression(*then_expr, ctx, symbol_scope);
+            let else_expr = match else_expr {
+                None => ctx.add(SimplifiedExpression::ConstUnit),
+                Some(x) => simplify_expression(*x, ctx, symbol_scope),
+            };
+
+            ctx.add(SimplifiedExpression::Select(
+                condition, then_expr, else_expr,
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceRef<'s> {
+    pub slice: &'s str,
+    pub line: usize,
+    pub col: usize,
+}
+impl<'s> From<&'_ Token<'s>> for SourceRef<'s> {
+    #[inline]
+    fn from(value: &'_ Token<'s>) -> Self {
+        Self {
+            slice: value.slice,
+            line: value.line,
+            col: value.col,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IntrinsicType {
+    Bool,
+    UInt,
+    UInt2,
+    UInt3,
+    UInt4,
+    SInt,
+    SInt2,
+    SInt3,
+    SInt4,
+    Float,
+    Float2,
+    Float3,
+    Float4,
+    Float2x2,
+    Float2x3,
+    Float2x4,
+    Float3x2,
+    Float3x3,
+    Float3x4,
+    Float4x2,
+    Float4x3,
+    Float4x4,
+    Sampler1D,
+    Sampler2D,
+    Sampler3D,
+    Texture1D,
+    Texture2D,
+    Texture3D,
+    SubpassInput,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConcreteType<'s> {
+    Inferred,
+    Intrinsic(IntrinsicType),
+    UnknownIntClass,
+    UnknownNumberClass,
+    UserDefined {
+        name: &'s str,
+        generic_args: Vec<ConcreteType<'s>>,
+    },
+    Tuple(Vec<ConcreteType<'s>>),
+    Function {
+        args: Vec<ConcreteType<'s>>,
+        output: Option<Box<ConcreteType<'s>>>,
+    },
+    IntrinsicTypeConstructor(IntrinsicType),
+}
+impl<'s> ConcreteType<'s> {
+    pub fn build(scope_stack: &[SymbolScope], t: Type<'s>) -> Self {
+        fn rec_lookup<'s>(t: Type<'s>, scope_stack: &[SymbolScope]) -> ConcreteType<'s> {
+            match scope_stack.last() {
+                None => panic!("Error: referencing undefined type: {}", t.name_token.slice),
+                Some(x) => match x.user_defined_type_symbols.get(t.name_token.slice) {
+                    Some(_) => ConcreteType::UserDefined {
+                        name: t.name_token.slice,
+                        generic_args: t
+                            .generic_args
+                            .map_or_else(Vec::new, |x| x.args)
+                            .into_iter()
+                            .map(|x| ConcreteType::build(scope_stack, x.0))
+                            .collect(),
+                    },
+                    None => rec_lookup(t, &scope_stack[..scope_stack.len() - 1]),
+                },
+            }
+        }
+
+        match t.name_token.slice {
+            "UInt" => Self::Intrinsic(IntrinsicType::UInt),
+            "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
+            "UInt3" => Self::Intrinsic(IntrinsicType::UInt3),
+            "UInt4" => Self::Intrinsic(IntrinsicType::UInt4),
+            "SInt" => Self::Intrinsic(IntrinsicType::SInt),
+            "SInt2" => Self::Intrinsic(IntrinsicType::SInt2),
+            "SInt3" => Self::Intrinsic(IntrinsicType::SInt3),
+            "SInt4" => Self::Intrinsic(IntrinsicType::SInt4),
+            "Float" => Self::Intrinsic(IntrinsicType::Float),
+            "Float2" => Self::Intrinsic(IntrinsicType::Float2),
+            "Float3" => Self::Intrinsic(IntrinsicType::Float3),
+            "Float4" => Self::Intrinsic(IntrinsicType::Float4),
+            "Float2x2" => Self::Intrinsic(IntrinsicType::Float2x2),
+            "Float2x3" => Self::Intrinsic(IntrinsicType::Float2x3),
+            "Float2x4" => Self::Intrinsic(IntrinsicType::Float2x4),
+            "Float3x2" => Self::Intrinsic(IntrinsicType::Float3x2),
+            "Float3x3" => Self::Intrinsic(IntrinsicType::Float3x3),
+            "Float3x4" => Self::Intrinsic(IntrinsicType::Float3x4),
+            "Float4x2" => Self::Intrinsic(IntrinsicType::Float4x2),
+            "Float4x3" => Self::Intrinsic(IntrinsicType::Float4x3),
+            "Float4x4" => Self::Intrinsic(IntrinsicType::Float4x4),
+            "Sampler1D" => Self::Intrinsic(IntrinsicType::Sampler1D),
+            "Sampler2D" => Self::Intrinsic(IntrinsicType::Sampler2D),
+            "Sampler3D" => Self::Intrinsic(IntrinsicType::Sampler3D),
+            "Texture1D" => Self::Intrinsic(IntrinsicType::Texture1D),
+            "Texture2D" => Self::Intrinsic(IntrinsicType::Texture2D),
+            "Texture3D" => Self::Intrinsic(IntrinsicType::Texture3D),
+            "SubpassInput" => Self::Intrinsic(IntrinsicType::SubpassInput),
+            _ => rec_lookup(t, scope_stack),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Variable<'s> {
+    pub declaration_ref: SourceRef<'s>,
+    pub ty: ConcreteType<'s>,
+    pub init_expr: Option<TypedExpression<'s>>,
+}
+
+#[derive(Debug)]
+pub struct IntrinsicSymbolScope {
+    symbol_type_table: HashMap<&'static str, ConcreteType<'static>>,
+    type_constructors: HashMap<&'static str, IntrinsicType>,
+}
+impl IntrinsicSymbolScope {
+    pub fn new() -> Self {
+        let mut symbol_type_table = HashMap::new();
+        symbol_type_table.insert(
+            "subpassLoad",
+            ConcreteType::Function {
+                args: vec![ConcreteType::Intrinsic(IntrinsicType::SubpassInput)],
+                output: Some(Box::new(ConcreteType::Intrinsic(IntrinsicType::Float4))),
+            },
+        );
+        let mut type_constructors = HashMap::new();
+        type_constructors.insert("Float4", IntrinsicType::Float4);
+
+        Self {
+            symbol_type_table,
+            type_constructors,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UserDefinedStructMemberPartiallyTyped<'s> {
+    pub name: SourceRef<'s>,
+    pub ty: Type<'s>,
+    pub attributes: Vec<Attribute<'s>>,
+}
+
+#[derive(Debug)]
+pub enum UserDefinedTypePartiallyTyped<'s> {
+    Struct(Vec<UserDefinedStructMemberPartiallyTyped<'s>>),
+}
+
+#[derive(Debug)]
+pub struct UserDefinedStructMember<'s> {
+    pub name: SourceRef<'s>,
+    pub ty: ConcreteType<'s>,
+    pub attributes: Vec<Attribute<'s>>,
+}
+
+#[derive(Debug)]
+pub enum UserDefinedType<'s> {
+    Struct(Vec<UserDefinedStructMember<'s>>),
+}
+
+#[derive(Debug)]
+pub struct SymbolScope<'s> {
+    user_defined_type_symbols: HashMap<&'s str, (SourceRef<'s>, UserDefinedType<'s>)>,
+    function_inputs: Vec<Variable<'s>>,
+    local_vars: Vec<Variable<'s>>,
+    function_input_index_by_name: HashMap<&'s str, usize>,
+    local_var_index_by_name: HashMap<&'s str, usize>,
+}
+impl<'s> SymbolScope<'s> {
+    pub fn declare_function_input(
+        &mut self,
+        name_token: &Token<'s>,
+        ty: ConcreteType<'s>,
+    ) -> usize {
+        let var_index = self.function_inputs.len();
+        self.function_inputs.push(Variable {
+            declaration_ref: SourceRef {
+                slice: name_token.slice,
+                line: name_token.line,
+                col: name_token.col,
+            },
+            ty,
+            init_expr: None,
+        });
+        self.function_input_index_by_name
+            .insert(name_token.slice, var_index);
+
+        var_index
+    }
+
+    pub fn declare_local_var(
+        &mut self,
+        name_token: &Token<'s>,
+        ty: ConcreteType<'s>,
+        init_expr: TypedExpression<'s>,
+    ) -> usize {
+        let var_index = self.local_vars.len();
+        self.local_vars.push(Variable {
+            declaration_ref: SourceRef {
+                slice: name_token.slice,
+                line: name_token.line,
+                col: name_token.col,
+            },
+            ty,
+            init_expr: Some(init_expr),
+        });
+        self.local_var_index_by_name
+            .insert(name_token.slice, var_index);
+
+        var_index
+    }
+}
+
+#[derive(Debug)]
+pub enum SimplifiedStatement {
+    InitializeLocalVar { var_index: usize },
+}
+
+#[derive(Debug)]
+pub enum TypedExpression<'s> {
+    Block(Vec<SimplifiedStatement>, Box<TypedExpression<'s>>),
+    Tuple(Vec<TypedExpression<'s>>),
+    Add(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Sub(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Mul(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Div(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Mod(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    BitAnd(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    BitOr(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    BitXor(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Eq(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Ne(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Lt(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Le(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Gt(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    Ge(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    LogAnd(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    LogOr(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
+    If(
+        Box<TypedExpression<'s>>,
+        Box<TypedExpression<'s>>,
+        Option<Box<TypedExpression<'s>>>,
+    ),
+    Neg(Box<TypedExpression<'s>>),
+    BitNot(Box<TypedExpression<'s>>),
+    LogNot(Box<TypedExpression<'s>>),
+    MemberRef(Box<TypedExpression<'s>>, SourceRef<'s>),
+    Funcall(Box<TypedExpression<'s>>, Vec<TypedExpression<'s>>),
+    LocalVar {
+        var_index: usize,
+        scope_ascending: usize,
+    },
+    InputVar(usize),
+    IntrinsicRef(&'s str),
+    IntrinsicTyConRef(IntrinsicType),
+    IntLiteral(&'s str),
+    FloatLiteral(&'s str),
+    NumberLiteral(&'s str),
+    Cast(Box<TypedExpression<'s>>, ConcreteType<'s>),
+}
+pub fn simplify_statement<'s>(
+    intrinsic_symbol_scope: &IntrinsicSymbolScope,
+    scope_stack: &mut [SymbolScope<'s>],
+    stmt: Statement<'s>,
+) -> SimplifiedStatement {
+    match stmt {
+        Statement::Let {
+            varname_token,
+            expr,
+            ..
+        } => {
+            let expr = transform_expression(intrinsic_symbol_scope, scope_stack, expr);
+
+            let Some(scope) = scope_stack.last_mut() else {
+                panic!("cannot declare variables outside of a function");
+            };
+
+            let var_index = scope.declare_local_var(&varname_token, ConcreteType::Inferred, expr);
+            SimplifiedStatement::InitializeLocalVar { var_index }
+        }
+    }
+}
+pub fn transform_expression<'s>(
+    intrinsic_symbol_scope: &IntrinsicSymbolScope,
+    scope_stack: &mut [SymbolScope<'s>],
+    expr: Expression<'s>,
+) -> TypedExpression<'s> {
+    match expr {
+        Expression::Lifted(_, x, _) => {
+            transform_expression(intrinsic_symbol_scope, scope_stack, *x)
+        }
+        Expression::Binary(left, op, right) => match op.slice {
+            "+" => TypedExpression::Add(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "-" => TypedExpression::Sub(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "*" => TypedExpression::Mul(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "/" => TypedExpression::Div(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "%" => TypedExpression::Mod(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "&" => TypedExpression::BitAnd(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "|" => TypedExpression::BitOr(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "^" => TypedExpression::BitXor(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "==" => TypedExpression::Eq(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "!=" => TypedExpression::Ne(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            ">=" => TypedExpression::Ge(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "<=" => TypedExpression::Le(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            ">" => TypedExpression::Gt(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "<" => TypedExpression::Lt(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "&&" => TypedExpression::LogAnd(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            "||" => TypedExpression::LogOr(
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *left,
+                )),
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *right,
+                )),
+            ),
+            _ => unreachable!("unknown op"),
+        },
+        Expression::Prefixed(op, x) => match op.slice {
+            "+" => transform_expression(intrinsic_symbol_scope, scope_stack, *x),
+            "-" => TypedExpression::Neg(Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *x,
+            ))),
+            "!" => TypedExpression::LogNot(Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *x,
+            ))),
+            "~" => TypedExpression::BitNot(Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *x,
+            ))),
+            _ => unreachable!("unknown op"),
+        },
+        Expression::Blocked(stmts, final_expr) => TypedExpression::Block(
+            stmts
+                .into_iter()
+                .map(|x| simplify_statement(intrinsic_symbol_scope, scope_stack, x))
+                .collect(),
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *final_expr,
+            )),
+        ),
+        Expression::If {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => TypedExpression::If(
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *condition,
+            )),
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *then_expr,
+            )),
+            else_expr.map(|x| {
+                Box::new(transform_expression(
+                    intrinsic_symbol_scope,
+                    scope_stack,
+                    *x,
+                ))
+            }),
+        ),
+        Expression::MemberRef(src, _, name) => TypedExpression::MemberRef(
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *src,
+            )),
+            SourceRef {
+                slice: name.slice,
+                line: name.line,
+                col: name.col,
+            },
+        ),
+        Expression::Funcall {
+            base_expr, args, ..
+        } => TypedExpression::Funcall(
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *base_expr,
+            )),
+            args.into_iter()
+                .map(|x| transform_expression(intrinsic_symbol_scope, scope_stack, x.0))
+                .collect(),
+        ),
+        Expression::FuncallSingle(base_expr, arg) => TypedExpression::Funcall(
+            Box::new(transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *base_expr,
+            )),
+            vec![transform_expression(
+                intrinsic_symbol_scope,
+                scope_stack,
+                *arg,
+            )],
+        ),
+        Expression::Number(t) => {
+            let has_fpart = t.slice.contains('.');
+            let has_float_suffix = t.slice.ends_with(['f', 'F']);
+            let has_hex_prefix = t.slice.starts_with("0x") || t.slice.starts_with("0X");
+
+            if has_hex_prefix {
+                TypedExpression::IntLiteral(t.slice)
+            } else if has_float_suffix {
+                TypedExpression::FloatLiteral(t.slice)
+            } else if has_fpart {
+                TypedExpression::NumberLiteral(t.slice)
+            } else {
+                TypedExpression::IntLiteral(t.slice)
+            }
+        }
+        Expression::Var(v) => {
+            match lookup_local_var(v.slice, scope_stack, intrinsic_symbol_scope) {
+                Some(LookupLocalVarResult::LocalVar(index, ascendants)) => {
+                    TypedExpression::LocalVar {
+                        var_index: index,
+                        scope_ascending: ascendants,
+                    }
+                }
+                Some(LookupLocalVarResult::Input(x)) => TypedExpression::InputVar(x),
+                Some(LookupLocalVarResult::Intrinsic) => TypedExpression::IntrinsicRef(v.slice),
+                Some(LookupLocalVarResult::IntrinsicTypeConstructor(t)) => {
+                    TypedExpression::IntrinsicTyConRef(t)
+                }
+                None => panic!("Error: referencing undefined variable: {} {v:?}", v.slice),
+            }
+        }
+        Expression::Tuple(_, elements, _) => TypedExpression::Tuple(
+            elements
+                .into_iter()
+                .map(|x| transform_expression(intrinsic_symbol_scope, scope_stack, x.0))
+                .collect(),
+        ),
+    }
+}
+
+enum LookupLocalVarResult {
+    LocalVar(usize, usize),
+    Input(usize),
+    Intrinsic,
+    IntrinsicTypeConstructor(IntrinsicType),
+}
+
+fn lookup_local_var(
+    name: &str,
+    scope_stack: &[SymbolScope],
+    intrinsic_symbol_scope: &IntrinsicSymbolScope,
+) -> Option<LookupLocalVarResult> {
+    fn rec(
+        name: &str,
+        scope_stack: &[SymbolScope],
+        ascendants: usize,
+    ) -> Option<LookupLocalVarResult> {
+        let Some(scope) = scope_stack.last() else {
+            return None;
+        };
+
+        if let Some(&x) = scope.local_var_index_by_name.get(name) {
+            return Some(LookupLocalVarResult::LocalVar(x, ascendants));
+        }
+
+        if let Some(&x) = scope.function_input_index_by_name.get(name) {
+            return Some(LookupLocalVarResult::Input(x));
+        }
+
+        rec(name, &scope_stack[..scope_stack.len() - 1], ascendants + 1)
+    }
+
+    if intrinsic_symbol_scope.symbol_type_table.contains_key(name) {
+        return Some(LookupLocalVarResult::Intrinsic);
+    }
+
+    if let Some(t) = intrinsic_symbol_scope.type_constructors.get(name) {
+        return Some(LookupLocalVarResult::IntrinsicTypeConstructor(t.clone()));
+    }
+
+    rec(name, scope_stack, 0)
 }
 
 #[derive(Debug)]
@@ -194,7 +1356,7 @@ fn parse_toplevel_declaration<'s>(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeGenericArgs<'s> {
     pub open_angle_bracket_token: Token<'s>,
     pub args: Vec<(Type<'s>, Option<Token<'s>>)>,
@@ -229,7 +1391,7 @@ fn parse_type_generic_args<'s>(state: &mut ParseState<'s>) -> ParseResult<TypeGe
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Type<'s> {
     pub name_token: Token<'s>,
     pub generic_args: Option<TypeGenericArgs<'s>>,
@@ -247,7 +1409,7 @@ fn parse_type<'s>(state: &mut ParseState<'s>) -> ParseResult<Type<'s>> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConstExpression<'s> {
     Number(Token<'s>),
 }
@@ -267,7 +1429,7 @@ fn lookahead_const_expression(state: &ParseState) -> bool {
         .is_some_and(|t| t.kind == TokenKind::Number)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AttributeArg<'s> {
     Single(ConstExpression<'s>),
     Multiple {
@@ -313,7 +1475,7 @@ fn lookahead_attribute_arg(state: &ParseState) -> bool {
         || lookahead_const_expression(state)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Attribute<'s> {
     pub name_token: Token<'s>,
     pub arg: Option<AttributeArg<'s>>,
