@@ -36,6 +36,7 @@ fn main() {
     let global_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new_intrinsics());
 
     let mut partially_typed_types = HashMap::new();
+    let mut user_defined_function_nodes = Vec::new();
     for tld in tlds.iter() {
         match tld {
             ToplevelDeclaration::Struct(s) => {
@@ -62,7 +63,7 @@ fn main() {
                     ),
                 );
             }
-            ToplevelDeclaration::Function(_) => (),
+            ToplevelDeclaration::Function(f) => user_defined_function_nodes.push(f),
         }
     }
 
@@ -93,68 +94,153 @@ fn main() {
                 ),
             )
         }));
+    for f in user_defined_function_nodes {
+        top_scope.declare_function(UserDefinedFunctionSymbol {
+            occurence: SourceRef::from(&f.fname_token),
+            attribute: f
+                .attribute_lists
+                .iter()
+                .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a.clone()))
+                .fold(SymbolAttribute::default(), |attrs, a| {
+                    eval_symbol_attributes(attrs, a)
+                }),
+            inputs: match &f.input_args {
+                FunctionDeclarationInputArguments::Single {
+                    attribute_lists,
+                    varname_token,
+                    ty,
+                    ..
+                } => vec![(
+                    attribute_lists
+                        .iter()
+                        .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a.clone()))
+                        .fold(SymbolAttribute::default(), |attrs, a| {
+                            eval_symbol_attributes(attrs, a)
+                        }),
+                    SourceRef::from(varname_token),
+                    ConcreteType::build(global_symbol_scope, &top_scope_opaque_types, ty.clone()),
+                )],
+                FunctionDeclarationInputArguments::Multiple { args, .. } => args
+                    .iter()
+                    .map(|(attribute_lists, varname_token, _, ty, _)| {
+                        (
+                            attribute_lists
+                                .iter()
+                                .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a.clone()))
+                                .fold(SymbolAttribute::default(), |attrs, a| {
+                                    eval_symbol_attributes(attrs, a)
+                                }),
+                            SourceRef::from(varname_token),
+                            ConcreteType::build(
+                                global_symbol_scope,
+                                &top_scope_opaque_types,
+                                ty.clone(),
+                            ),
+                        )
+                    })
+                    .collect(),
+            },
+            output: match &f.output {
+                Some(FunctionDeclarationOutput::Single {
+                    attribute_lists,
+                    ty,
+                }) => vec![(
+                    attribute_lists
+                        .iter()
+                        .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a.clone()))
+                        .fold(SymbolAttribute::default(), |attrs, a| {
+                            eval_symbol_attributes(attrs, a)
+                        }),
+                    ConcreteType::build(global_symbol_scope, &top_scope_opaque_types, ty.clone()),
+                )],
+                Some(FunctionDeclarationOutput::Tupled { elements, .. }) => elements
+                    .iter()
+                    .map(|(attribute_lists, ty, _)| {
+                        (
+                            attribute_lists
+                                .iter()
+                                .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a.clone()))
+                                .fold(SymbolAttribute::default(), |attrs, a| {
+                                    eval_symbol_attributes(attrs, a)
+                                }),
+                            ConcreteType::build(
+                                global_symbol_scope,
+                                &top_scope_opaque_types,
+                                ty.clone(),
+                            ),
+                        )
+                    })
+                    .collect(),
+                None => Vec::new(),
+            },
+        })
+    }
     println!("TopScopeSymbols: {top_scope:#?}");
 
-    let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
-        panic!("not a function?");
-    };
-    let function_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new(Some(top_scope)));
-    match f.input_args {
-        FunctionDeclarationInputArguments::Single {
-            varname_token, ty, ..
-        } => {
-            function_symbol_scope.declare_function_input(
-                SourceRef::from(&varname_token),
-                ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
-            );
-        }
-        FunctionDeclarationInputArguments::Multiple { args, .. } => {
-            for (_, n, _, ty, _) in args {
-                function_symbol_scope.declare_function_input(
-                    SourceRef::from(&n),
-                    ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
+    for d in tlds {
+        match d {
+            ToplevelDeclaration::Function(f) => {
+                let function_symbol_scope =
+                    symbol_scope_arena.alloc(SymbolScope2::new(Some(top_scope)));
+                match f.input_args {
+                    FunctionDeclarationInputArguments::Single {
+                        varname_token, ty, ..
+                    } => {
+                        function_symbol_scope.declare_function_input(
+                            SourceRef::from(&varname_token),
+                            ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
+                        );
+                    }
+                    FunctionDeclarationInputArguments::Multiple { args, .. } => {
+                        for (_, n, _, ty, _) in args {
+                            function_symbol_scope.declare_function_input(
+                                SourceRef::from(&n),
+                                ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
+                            );
+                        }
+                    }
+                }
+                let mut simplify_context = SimplificationContext {
+                    symbol_scope_arena: &symbol_scope_arena,
+                    vars: Vec::new(),
+                };
+                let mut last_var_id =
+                    simplify_expression(f.body, &mut simplify_context, function_symbol_scope);
+                optimize_pure_expr(&mut simplify_context.vars, Some(&mut last_var_id.0));
+
+                top_scope.attach_function_body(
+                    f.fname_token.slice,
+                    FunctionBody {
+                        symbol_scope: function_symbol_scope,
+                        expressions: simplify_context.vars,
+                        returning: last_var_id.0,
+                        returning_type: last_var_id.1,
+                    },
                 );
             }
+            ToplevelDeclaration::Struct(_) => (),
         }
     }
-    let mut simplify_context = SimplificationContext {
-        symbol_scope_arena: &symbol_scope_arena,
-        vars: Vec::new(),
-    };
-    let last_var_id = simplify_expression(f.body, &mut simplify_context, &function_symbol_scope);
-    println!("simplified exprs:");
-    for (n, (x, t)) in simplify_context.vars.iter().enumerate() {
-        print_simp_expr(x, t, n, 0);
+
+    for f in top_scope.user_defined_function_symbols.values() {
+        let fb = top_scope.user_defined_function_body.0.borrow();
+        let body = fb.get(f.occurence.slice);
+
+        if body.is_some() {
+            println!("toplevel function '{}':", f.occurence.slice);
+        } else {
+            println!("toplevel function prototype '{}':", f.occurence.slice);
+        }
+        println!("SymbolMeta = {f:#?}");
+        if let Some(b) = body {
+            println!("Function Scope = {:#?}", b.symbol_scope);
+            println!("Body:");
+            for (n, (x, t)) in b.expressions.iter().enumerate() {
+                print_simp_expr(x, t, n, 0);
+            }
+            println!("returning: {}(ty = {:?})", b.returning, b.returning_type);
+        }
     }
-    println!("last id: {}(ty = {:?})", last_var_id.0, last_var_id.1);
-
-    // let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
-    //     panic!("not a function decl?");
-    // };
-
-    // let mut fscope = SymbolScope {
-    //     user_defined_type_symbols: HashMap::new(),
-    //     function_inputs: Vec::new(),
-    //     local_vars: Vec::new(),
-    //     function_input_index_by_name: HashMap::new(),
-    //     local_var_index_by_name: HashMap::new(),
-    // };
-    // match f.input_args {
-    //     FunctionDeclarationInputArguments::Single {
-    //         varname_token, ty, ..
-    //     } => {
-    //         fscope.declare_function_input(&varname_token, ConcreteType::build(&scope_stack, ty));
-    //     }
-    //     FunctionDeclarationInputArguments::Multiple { args, .. } => {
-    //         for a in args {
-    //             fscope.declare_function_input(&a.1, ConcreteType::build(&scope_stack, a.3));
-    //         }
-    //     }
-    // }
-    // scope_stack.push(fscope);
-    // let transformed = transform_expression(&intrinsic_symbol_scope, &mut scope_stack, f.body);
-    // println!("transformed body: {transformed:#?}");
-    // println!("scope: {scope_stack:#?}");
 }
 
 fn print_simp_expr(x: &SimplifiedExpression, ty: &ConcreteType, vid: usize, nested: usize) {
@@ -166,7 +252,7 @@ fn print_simp_expr(x: &SimplifiedExpression, ty: &ConcreteType, vid: usize, nest
         } => {
             println!("  {}%{vid}: {ty:?} = Scope {{", "  ".repeat(nested));
             println!("  {}Function Inputs:", "  ".repeat(nested + 1));
-            for (n, a) in symbol_scope.function_input_vars.iter().enumerate() {
+            for (n, a) in symbol_scope.0.function_input_vars.iter().enumerate() {
                 println!(
                     "  {}  {n} = {}: {:?}",
                     "  ".repeat(nested + 1),
@@ -175,7 +261,7 @@ fn print_simp_expr(x: &SimplifiedExpression, ty: &ConcreteType, vid: usize, nest
                 );
             }
             println!("  {}Local Vars:", "  ".repeat(nested + 1));
-            for (n, a) in symbol_scope.local_vars.borrow().iter().enumerate() {
+            for (n, a) in symbol_scope.0.local_vars.borrow().iter().enumerate() {
                 println!(
                     "  {}  {n} = {}: {:?}",
                     "  ".repeat(nested + 1),
@@ -228,10 +314,28 @@ pub enum VarLookupResult<'x, 's> {
 }
 
 #[derive(Debug)]
+pub struct UserDefinedFunctionSymbol<'s> {
+    pub occurence: SourceRef<'s>,
+    pub attribute: SymbolAttribute,
+    pub inputs: Vec<(SymbolAttribute, SourceRef<'s>, ConcreteType<'s>)>,
+    pub output: Vec<(SymbolAttribute, ConcreteType<'s>)>,
+}
+
+#[derive(Debug)]
+pub struct FunctionBody<'a, 's> {
+    pub symbol_scope: &'a SymbolScope2<'a, 's>,
+    pub expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    pub returning: usize,
+    pub returning_type: ConcreteType<'s>,
+}
+
+#[derive(Debug)]
 pub struct SymbolScope2<'a, 's> {
     parent: Option<&'a SymbolScope2<'a, 's>>,
     intrinsic_symbols: HashMap<&'s str, IntrinsicFunctionSymbol>,
     user_defined_type_symbols: HashMap<&'s str, (SourceRef<'s>, UserDefinedType<'s>)>,
+    user_defined_function_symbols: HashMap<&'s str, UserDefinedFunctionSymbol<'s>>,
+    user_defined_function_body: DebugPrintGuard<RefCell<HashMap<&'s str, FunctionBody<'a, 's>>>>,
     function_input_vars: Vec<FunctionInputVariable<'s>>,
     local_vars: RefCell<Vec<LocalVariable<'s>>>,
     var_id_by_name: RefCell<HashMap<&'s str, VarId>>,
@@ -242,6 +346,8 @@ impl<'a, 's> SymbolScope2<'a, 's> {
             parent,
             intrinsic_symbols: HashMap::new(),
             user_defined_type_symbols: HashMap::new(),
+            user_defined_function_symbols: HashMap::new(),
+            user_defined_function_body: DebugPrintGuard(RefCell::new(HashMap::new())),
             function_input_vars: Vec::new(),
             local_vars: RefCell::new(Vec::new()),
             var_id_by_name: RefCell::new(HashMap::new()),
@@ -255,7 +361,7 @@ impl<'a, 's> SymbolScope2<'a, 's> {
         intrinsic_symbols.insert(
             "subpassLoad",
             IntrinsicFunctionSymbol {
-                name: "OpImageRead#SubpassData",
+                name: "OpImageRead",
                 ty: ConcreteType::Function {
                     args: vec![ConcreteType::Intrinsic(IntrinsicType::SubpassInput)],
                     output: Some(Box::new(ConcreteType::Intrinsic(IntrinsicType::Float4))),
@@ -271,9 +377,40 @@ impl<'a, 's> SymbolScope2<'a, 's> {
             parent: None,
             intrinsic_symbols,
             user_defined_type_symbols: HashMap::new(),
+            user_defined_function_symbols: HashMap::new(),
+            user_defined_function_body: DebugPrintGuard(RefCell::new(HashMap::new())),
             function_input_vars: Vec::new(),
             local_vars: RefCell::new(Vec::new()),
             var_id_by_name: RefCell::new(var_id_by_name),
+        }
+    }
+
+    pub fn declare_function(&mut self, details: UserDefinedFunctionSymbol<'s>) {
+        match self
+            .user_defined_function_symbols
+            .entry(details.occurence.slice)
+        {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(details);
+            }
+            std::collections::hash_map::Entry::Occupied(v) => {
+                panic!(
+                    "Error: same name function was already declared at {}:{}",
+                    v.get().occurence.line + 1,
+                    v.get().occurence.col + 1
+                );
+            }
+        }
+    }
+
+    pub fn attach_function_body(&self, fname: &'s str, body: FunctionBody<'a, 's>) {
+        match self.user_defined_function_body.0.borrow_mut().entry(fname) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(body);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("Error: same name function body was already declared");
+            }
         }
     }
 
@@ -358,7 +495,167 @@ impl<'a, 's> SymbolScope2<'a, 's> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ShaderModel {
+    VertexShader,
+    TessellationControlShader,
+    TessellationEvaluationShader,
+    GeometryShader,
+    FragmentShader,
+    ComputeShader,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BuiltinInputOutput {
+    Position,
+    VertexID,
+    InstanceID,
+}
+
 #[derive(Debug)]
+pub struct SymbolAttribute {
+    pub module_entry_point: bool,
+    pub shader_model: Option<ShaderModel>,
+    pub descriptor_set_location: Option<u32>,
+    pub descriptor_set_binding: Option<u32>,
+    pub input_attachment_index: Option<u32>,
+    pub push_constant_offset: Option<u64>,
+    pub bound_location: Option<u32>,
+    pub bound_builtin_io: Option<BuiltinInputOutput>,
+}
+impl Default for SymbolAttribute {
+    fn default() -> Self {
+        Self {
+            module_entry_point: false,
+            shader_model: None,
+            descriptor_set_location: None,
+            descriptor_set_binding: None,
+            input_attachment_index: None,
+            push_constant_offset: None,
+            bound_location: None,
+            bound_builtin_io: None,
+        }
+    }
+}
+fn eval_symbol_attributes(attr: SymbolAttribute, a: Attribute) -> SymbolAttribute {
+    let args = match a.arg {
+        Some(AttributeArg::Single(x)) => vec![(x, None)],
+        Some(AttributeArg::Multiple { arg_list, .. }) => arg_list,
+        None => Vec::new(),
+    };
+
+    // TODO: User-defined Attributeとかシンボルエイリアスとかをサポートするようになったら真面目に型解決して処理する必要がある
+    match a.name_token.slice {
+        "DescriptorSet" => match <&[(ConstExpression, _); 1]>::try_from(&args[..]) {
+            Ok([(ConstExpression::Number(n), _)]) => SymbolAttribute {
+                descriptor_set_location: Some(n.slice.parse().unwrap()),
+                ..attr
+            },
+            Err(_) => panic!("DescriptorSet attribute requires a number as argument"),
+        },
+        "Binding" => match <&[(ConstExpression, _); 1]>::try_from(&args[..]) {
+            Ok([(ConstExpression::Number(n), _)]) => SymbolAttribute {
+                descriptor_set_binding: Some(n.slice.parse().unwrap()),
+                ..attr
+            },
+            Err(_) => panic!("Binding attribute requires a number as argument"),
+        },
+        "InputAttachment" => match <&[(ConstExpression, _); 1]>::try_from(&args[..]) {
+            Ok([(ConstExpression::Number(n), _)]) => SymbolAttribute {
+                input_attachment_index: Some(n.slice.parse().unwrap()),
+                ..attr
+            },
+            Err(_) => panic!("InputAttachment attribute requires a number as argument"),
+        },
+        "PushConstant" => match <&[(ConstExpression, _); 1]>::try_from(&args[..]) {
+            Ok([(ConstExpression::Number(n), _)]) => SymbolAttribute {
+                push_constant_offset: Some(n.slice.parse().unwrap()),
+                ..attr
+            },
+            Err(_) => panic!("PushConstant attribute requires a number as argument"),
+        },
+        "Location" => match <&[(ConstExpression, _); 1]>::try_from(&args[..]) {
+            Ok([(ConstExpression::Number(n), _)]) => SymbolAttribute {
+                bound_location: Some(n.slice.parse().unwrap()),
+                ..attr
+            },
+            Err(_) => panic!("Location attribute requires a number as argument"),
+        },
+        "Position" => {
+            if args.is_empty() {
+                SymbolAttribute {
+                    bound_builtin_io: Some(BuiltinInputOutput::Position),
+                    ..attr
+                }
+            } else {
+                panic!("Position attribute does not take any arguments");
+            }
+        }
+        "VertexID" => {
+            if args.is_empty() {
+                SymbolAttribute {
+                    bound_builtin_io: Some(BuiltinInputOutput::VertexID),
+                    ..attr
+                }
+            } else {
+                panic!("VertexID attribute does not take any arguments");
+            }
+        }
+        "InstanceID" => {
+            if args.is_empty() {
+                SymbolAttribute {
+                    bound_builtin_io: Some(BuiltinInputOutput::InstanceID),
+                    ..attr
+                }
+            } else {
+                panic!("InstanceID attribute does not take any arguments");
+            }
+        }
+        "VertexShader" => {
+            if args.is_empty() {
+                SymbolAttribute {
+                    module_entry_point: true,
+                    shader_model: Some(ShaderModel::VertexShader),
+                    ..attr
+                }
+            } else {
+                panic!("VertexShader attribute does not take any arguments");
+            }
+        }
+        "FragmentShader" => {
+            if args.is_empty() {
+                SymbolAttribute {
+                    module_entry_point: true,
+                    shader_model: Some(ShaderModel::FragmentShader),
+                    ..attr
+                }
+            } else {
+                panic!("VertexShader attribute does not take any arguments");
+            }
+        }
+        _ => panic!("{}: Unknown attribute", a.name_token.slice),
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct ConstModifiers: u8 {
+        const NEGATE = 1 << 0;
+        const BIT_NOT = 1 << 1;
+        const LOGICAL_NOT = 1 << 2;
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DebugPrintGuard<T>(pub T);
+impl<T> core::fmt::Debug for DebugPrintGuard<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(masked {}...)", core::any::type_name::<T>())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum SimplifiedExpression<'a, 's> {
     Add(usize, usize),
     Sub(usize, usize),
@@ -381,8 +678,8 @@ pub enum SimplifiedExpression<'a, 's> {
     LogNot(usize),
     Funcall(usize, Vec<usize>),
     MemberRef(usize, SourceRef<'s>),
-    LoadVar(&'a SymbolScope2<'a, 's>, VarId),
-    InitializeVar(&'a SymbolScope2<'a, 's>, VarId),
+    LoadVar(DebugPrintGuard<&'a SymbolScope2<'a, 's>>, VarId),
+    InitializeVar(DebugPrintGuard<&'a SymbolScope2<'a, 's>>, VarId),
     StoreLocal(SourceRef<'s>, usize),
     IntrinsicFunction(&'static str),
     IntrinsicTypeConstructor(IntrinsicType),
@@ -394,15 +691,28 @@ pub enum SimplifiedExpression<'a, 's> {
     Swizzle4(usize, usize, usize, usize, usize),
     InstantiateIntrinsicTypeClass(usize, IntrinsicType),
     ConstInt(SourceRef<'s>),
-    ConstFloat(SourceRef<'s>),
     ConstNumber(SourceRef<'s>),
     ConstUnit,
+    ConstUInt(SourceRef<'s>, ConstModifiers),
+    ConstSInt(SourceRef<'s>, ConstModifiers),
+    ConstFloat(SourceRef<'s>, ConstModifiers),
     ConstructTuple(Vec<usize>),
     ScopedBlock {
-        symbol_scope: &'a SymbolScope2<'a, 's>,
+        symbol_scope: DebugPrintGuard<&'a SymbolScope2<'a, 's>>,
         expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
         returning: usize,
     },
+}
+impl SimplifiedExpression<'_, '_> {
+    pub fn is_pure(&self) -> bool {
+        match self {
+            Self::Funcall(_, _)
+            | Self::InitializeVar(_, _)
+            | Self::StoreLocal(_, _)
+            | Self::ScopedBlock { .. } => false,
+            _ => true,
+        }
+    }
 }
 pub struct SimplificationContext<'a, 's> {
     pub symbol_scope_arena: &'a Arena<SymbolScope2<'a, 's>>,
@@ -443,20 +753,9 @@ fn simplify_expression<'a, 's>(
                 Some(x) => x,
                 None => {
                     eprintln!("Error: cannot apply binary op {} between terms", op.slice);
-                    (BinaryOpTypeConversion::NoConversion, ConcreteType::Inferred)
+                    (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
                 }
             };
-
-            // let Some((conv, res)) = (match op.slice {
-            //     "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">" => {
-            //         lt.arithmetic_compare_op_type_conversion(rt)
-            //     }
-            //     "&" | "|" | "^" => lt.bitwise_op_type_conversion(rt),
-            //     "&&" | "||" => lt.logical_op_type_conversion(rt),
-            //     _ => None,
-            // }) else {
-            //     panic!("Error: cannot apply binary op {} between terms", op.slice);
-            // };
 
             let (left, right) = match conv {
                 BinaryOpTypeConversion::NoConversion => (left, right),
@@ -736,7 +1035,10 @@ fn simplify_expression<'a, 's>(
                             res,
                         );
                         new_ctx.add(
-                            SimplifiedExpression::InitializeVar(new_symbol_scope, vid),
+                            SimplifiedExpression::InitializeVar(
+                                DebugPrintGuard(new_symbol_scope),
+                                vid,
+                            ),
                             ty,
                         );
                     }
@@ -747,7 +1049,7 @@ fn simplify_expression<'a, 's>(
             (
                 ctx.add(
                     SimplifiedExpression::ScopedBlock {
-                        symbol_scope: new_symbol_scope,
+                        symbol_scope: DebugPrintGuard(new_symbol_scope),
                         expressions: new_ctx.vars,
                         returning: last_id,
                     },
@@ -820,9 +1122,6 @@ fn simplify_expression<'a, 's>(
                                 }
                             }
                         }
-                        _ => {
-                            unreachable!("unsupported member ref op for type");
-                        }
                     }
                 }
                 _ => {
@@ -831,9 +1130,9 @@ fn simplify_expression<'a, 's>(
                     (
                         ctx.add(
                             SimplifiedExpression::MemberRef(base, SourceRef::from(&name)),
-                            ConcreteType::Inferred,
+                            ConcreteType::Never,
                         ),
-                        ConcreteType::Inferred,
+                        ConcreteType::Never,
                     )
                 }
             }
@@ -856,7 +1155,7 @@ fn simplify_expression<'a, 's>(
                 }
                 ConcreteType::Function { args, .. } => {
                     eprintln!("Error: argument types mismatched({args:?} and {arg_types:?})");
-                    ConcreteType::Inferred
+                    ConcreteType::Never
                 }
                 _ => panic!("Error: not applyable type"),
             };
@@ -880,7 +1179,7 @@ fn simplify_expression<'a, 's>(
                 }
                 ConcreteType::Function { args, .. } => {
                     eprintln!("Error: argument types mismatched({args:?} and [{arg_ty:?}])");
-                    ConcreteType::Inferred
+                    ConcreteType::Never
                 }
                 _ => panic!("Error: not applyable type"),
             };
@@ -905,7 +1204,7 @@ fn simplify_expression<'a, 's>(
                 )
             } else if has_float_suffix {
                 (
-                    SimplifiedExpression::ConstFloat(SourceRef::from(&t)),
+                    SimplifiedExpression::ConstFloat(SourceRef::from(&t), ConstModifiers::empty()),
                     IntrinsicType::Float.into(),
                 )
             } else if has_fpart {
@@ -944,14 +1243,20 @@ fn simplify_expression<'a, 's>(
                 ),
                 VarLookupResult::ScopeLocalVar(vid, ty) => (
                     ctx.add(
-                        SimplifiedExpression::LoadVar(scope, VarId::ScopeLocal(vid)),
+                        SimplifiedExpression::LoadVar(
+                            DebugPrintGuard(scope),
+                            VarId::ScopeLocal(vid),
+                        ),
                         ty.clone(),
                     ),
                     ty,
                 ),
                 VarLookupResult::FunctionInputVar(vid, ty) => (
                     ctx.add(
-                        SimplifiedExpression::LoadVar(scope, VarId::FunctionInput(vid)),
+                        SimplifiedExpression::LoadVar(
+                            DebugPrintGuard(scope),
+                            VarId::FunctionInput(vid),
+                        ),
                         ty.clone(),
                     ),
                     ty.clone(),
@@ -995,11 +1300,10 @@ fn simplify_expression<'a, 's>(
             };
 
             let res_ty = match (tty, ety) {
-                (ConcreteType::Inferred, _) | (_, ConcreteType::Inferred) => ConcreteType::Inferred,
                 (a, b) if a == b => a,
                 _ => {
                     eprintln!("Error: if then block and else block has different result type");
-                    ConcreteType::Inferred
+                    ConcreteType::Never
                 }
             };
 
@@ -1010,6 +1314,343 @@ fn simplify_expression<'a, 's>(
                 ),
                 res_ty,
             )
+        }
+    }
+}
+
+fn optimize_pure_expr<'a, 's>(
+    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    mut block_returning_ref: Option<&mut usize>,
+) {
+    let mut tree_modified = true;
+
+    while tree_modified {
+        tree_modified = false;
+
+        let mut referenced_expr = HashSet::new();
+        referenced_expr.extend(block_returning_ref.as_ref().map(|x| **x));
+        for n in 0..expressions.len() {
+            match &mut expressions[n].0 {
+                &mut SimplifiedExpression::Neg(src) => match expressions[src].0 {
+                    SimplifiedExpression::ConstSInt(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstSInt(
+                            org.clone(),
+                            mods | ConstModifiers::NEGATE,
+                        );
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstFloat(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstFloat(
+                            org.clone(),
+                            mods | ConstModifiers::NEGATE,
+                        );
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(src);
+                    }
+                },
+                &mut SimplifiedExpression::BitNot(src) => match expressions[src].0 {
+                    SimplifiedExpression::ConstUInt(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstUInt(
+                            org.clone(),
+                            mods | ConstModifiers::BIT_NOT,
+                        );
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstSInt(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstSInt(
+                            org.clone(),
+                            mods | ConstModifiers::BIT_NOT,
+                        );
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(src);
+                    }
+                },
+                &mut SimplifiedExpression::LogNot(src) => match expressions[src].0 {
+                    SimplifiedExpression::ConstUInt(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstUInt(
+                            org.clone(),
+                            mods | ConstModifiers::LOGICAL_NOT,
+                        );
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstSInt(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstSInt(
+                            org.clone(),
+                            mods | ConstModifiers::LOGICAL_NOT,
+                        );
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstFloat(ref org, mods) => {
+                        expressions[n].0 = SimplifiedExpression::ConstFloat(
+                            org.clone(),
+                            mods | ConstModifiers::LOGICAL_NOT,
+                        );
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(src);
+                    }
+                },
+                &mut SimplifiedExpression::Add(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Sub(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Mul(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Div(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Rem(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::BitAnd(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::BitOr(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::BitXor(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Eq(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Ne(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Gt(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Ge(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Lt(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Le(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::LogAnd(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::LogOr(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
+                &mut SimplifiedExpression::Select(c, t, e) => {
+                    referenced_expr.extend([c, t, e]);
+                }
+                &mut SimplifiedExpression::Funcall(base, ref args) => {
+                    referenced_expr.insert(base);
+                    referenced_expr.extend(args.iter().copied());
+                }
+                &mut SimplifiedExpression::MemberRef(base, _) => {
+                    referenced_expr.insert(base);
+                }
+                &mut SimplifiedExpression::LoadVar(_, _) => (),
+                &mut SimplifiedExpression::InitializeVar(_, _) => (),
+                &mut SimplifiedExpression::StoreLocal(_, v) => {
+                    referenced_expr.insert(v);
+                }
+                &mut SimplifiedExpression::IntrinsicFunction(_) => (),
+                &mut SimplifiedExpression::IntrinsicTypeConstructor(_) => (),
+                &mut SimplifiedExpression::Cast(x, ref to) => {
+                    let to_ty = to.clone();
+                    let target_ty = expressions[x].1.clone();
+
+                    if to_ty == target_ty {
+                        // cast to same type
+                        expressions[n] = expressions[x].clone();
+                        tree_modified = true;
+                    } else {
+                        referenced_expr.insert(x);
+                    }
+                }
+                &mut SimplifiedExpression::Swizzle1(src, _) => {
+                    referenced_expr.insert(src);
+                }
+                &mut SimplifiedExpression::Swizzle2(src, _, _) => {
+                    referenced_expr.insert(src);
+                }
+                &mut SimplifiedExpression::Swizzle3(src, _, _, _) => {
+                    referenced_expr.insert(src);
+                }
+                &mut SimplifiedExpression::Swizzle4(src, _, _, _, _) => {
+                    referenced_expr.insert(src);
+                }
+                &mut SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                    v,
+                    IntrinsicType::UInt,
+                ) => match &expressions[v].0 {
+                    SimplifiedExpression::ConstInt(t) => {
+                        expressions[n].0 =
+                            SimplifiedExpression::ConstUInt(t.clone(), ConstModifiers::empty());
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(v);
+                    }
+                },
+                &mut SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                    v,
+                    IntrinsicType::SInt,
+                ) => match &expressions[v].0 {
+                    SimplifiedExpression::ConstInt(t) => {
+                        expressions[n].0 =
+                            SimplifiedExpression::ConstSInt(t.clone(), ConstModifiers::empty());
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(v);
+                    }
+                },
+                &mut SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                    v,
+                    IntrinsicType::Float,
+                ) => match &expressions[v].0 {
+                    SimplifiedExpression::ConstInt(t) => {
+                        expressions[n].0 =
+                            SimplifiedExpression::ConstFloat(t.clone(), ConstModifiers::empty());
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstNumber(t) => {
+                        expressions[n].0 =
+                            SimplifiedExpression::ConstFloat(t.clone(), ConstModifiers::empty());
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(v);
+                    }
+                },
+                &mut SimplifiedExpression::InstantiateIntrinsicTypeClass(v, _) => {
+                    referenced_expr.insert(v);
+                }
+                &mut SimplifiedExpression::ConstInt(_) => (),
+                &mut SimplifiedExpression::ConstNumber(_) => (),
+                &mut SimplifiedExpression::ConstUnit => (),
+                &mut SimplifiedExpression::ConstUInt(_, _) => (),
+                &mut SimplifiedExpression::ConstSInt(_, _) => (),
+                &mut SimplifiedExpression::ConstFloat(_, _) => (),
+                &mut SimplifiedExpression::ConstructTuple(ref xs) => {
+                    referenced_expr.extend(xs.iter().copied());
+                }
+                SimplifiedExpression::ScopedBlock {
+                    ref mut expressions,
+                    ref mut returning,
+                    ..
+                } => {
+                    optimize_pure_expr(expressions, Some(returning));
+                }
+            }
+        }
+
+        // unfold single pure computation scope
+        for n in 0..expressions.len() {
+            match &mut expressions[n] {
+                (
+                    SimplifiedExpression::ScopedBlock {
+                        expressions: scope_expr,
+                        ..
+                    },
+                    _,
+                ) if scope_expr.len() == 1 && scope_expr[0].0.is_pure() => {
+                    expressions[n] = scope_expr.remove(0);
+                    tree_modified = true;
+                }
+                _ => (),
+            }
+        }
+
+        // strip unreferenced expression
+        let mut n = 0;
+        let mut org_expr_id = 0;
+        while n < expressions.len() {
+            if !referenced_expr.contains(&org_expr_id) && expressions[n].0.is_pure() {
+                // unreferenced
+                expressions.remove(n);
+                // rewrite shifted reference
+                for m in n..expressions.len() {
+                    match expressions[m].0 {
+                        SimplifiedExpression::Add(ref mut left, ref mut right)
+                        | SimplifiedExpression::Sub(ref mut left, ref mut right)
+                        | SimplifiedExpression::Mul(ref mut left, ref mut right)
+                        | SimplifiedExpression::Div(ref mut left, ref mut right)
+                        | SimplifiedExpression::Rem(ref mut left, ref mut right)
+                        | SimplifiedExpression::BitAnd(ref mut left, ref mut right)
+                        | SimplifiedExpression::BitOr(ref mut left, ref mut right)
+                        | SimplifiedExpression::BitXor(ref mut left, ref mut right)
+                        | SimplifiedExpression::Eq(ref mut left, ref mut right)
+                        | SimplifiedExpression::Ne(ref mut left, ref mut right)
+                        | SimplifiedExpression::Gt(ref mut left, ref mut right)
+                        | SimplifiedExpression::Lt(ref mut left, ref mut right)
+                        | SimplifiedExpression::Ge(ref mut left, ref mut right)
+                        | SimplifiedExpression::Le(ref mut left, ref mut right)
+                        | SimplifiedExpression::LogAnd(ref mut left, ref mut right)
+                        | SimplifiedExpression::LogOr(ref mut left, ref mut right) => {
+                            *left -= if *left > n { 1 } else { 0 };
+                            *right -= if *right > n { 1 } else { 0 };
+                        }
+                        SimplifiedExpression::Select(ref mut c, ref mut t, ref mut e) => {
+                            *c -= if *c > n { 1 } else { 0 };
+                            *t -= if *t > n { 1 } else { 0 };
+                            *e -= if *e > n { 1 } else { 0 };
+                        }
+                        SimplifiedExpression::Neg(ref mut x)
+                        | SimplifiedExpression::BitNot(ref mut x)
+                        | SimplifiedExpression::LogNot(ref mut x)
+                        | SimplifiedExpression::Cast(ref mut x, _)
+                        | SimplifiedExpression::Swizzle1(ref mut x, _)
+                        | SimplifiedExpression::Swizzle2(ref mut x, _, _)
+                        | SimplifiedExpression::Swizzle3(ref mut x, _, _, _)
+                        | SimplifiedExpression::Swizzle4(ref mut x, _, _, _, _)
+                        | SimplifiedExpression::StoreLocal(_, ref mut x)
+                        | SimplifiedExpression::InstantiateIntrinsicTypeClass(ref mut x, _) => {
+                            *x -= if *x > n { 1 } else { 0 };
+                        }
+                        SimplifiedExpression::Funcall(ref mut base, ref mut args) => {
+                            *base -= if *base > n { 1 } else { 0 };
+                            for a in args {
+                                *a -= if *a > n { 1 } else { 0 };
+                            }
+                        }
+                        SimplifiedExpression::MemberRef(ref mut base, _) => {
+                            *base -= if *base > n { 1 } else { 0 }
+                        }
+                        SimplifiedExpression::ConstructTuple(ref mut xs) => {
+                            for x in xs {
+                                *x -= if *x > n { 1 } else { 0 };
+                            }
+                        }
+                        SimplifiedExpression::ConstInt(_)
+                        | SimplifiedExpression::ConstNumber(_)
+                        | SimplifiedExpression::ConstUnit
+                        | SimplifiedExpression::ConstUInt(_, _)
+                        | SimplifiedExpression::ConstSInt(_, _)
+                        | SimplifiedExpression::ConstFloat(_, _)
+                        | SimplifiedExpression::LoadVar(_, _)
+                        | SimplifiedExpression::InitializeVar(_, _)
+                        | SimplifiedExpression::IntrinsicFunction(_)
+                        | SimplifiedExpression::IntrinsicTypeConstructor(_)
+                        | SimplifiedExpression::ScopedBlock { .. } => (),
+                    }
+                }
+
+                if let Some(ref mut ret) = block_returning_ref {
+                    **ret -= if **ret > n { 1 } else { 0 };
+                }
+
+                tree_modified = true;
+            } else {
+                n += 1;
+            }
+
+            org_expr_id += 1;
         }
     }
 }
@@ -1125,7 +1766,8 @@ impl IntrinsicType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConcreteType<'s> {
-    Inferred,
+    Generic(Vec<usize>, Box<ConcreteType<'s>>),
+    GenericVar(usize),
     Intrinsic(IntrinsicType),
     UnknownIntClass,
     UnknownNumberClass,
@@ -1139,6 +1781,7 @@ pub enum ConcreteType<'s> {
         output: Option<Box<ConcreteType<'s>>>,
     },
     IntrinsicTypeConstructor(IntrinsicType),
+    Never,
 }
 impl<'s> ConcreteType<'s> {
     pub fn build(
@@ -1151,10 +1794,10 @@ impl<'s> ConcreteType<'s> {
             "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
             "UInt3" => Self::Intrinsic(IntrinsicType::UInt3),
             "UInt4" => Self::Intrinsic(IntrinsicType::UInt4),
-            "SInt" => Self::Intrinsic(IntrinsicType::SInt),
-            "SInt2" => Self::Intrinsic(IntrinsicType::SInt2),
-            "SInt3" => Self::Intrinsic(IntrinsicType::SInt3),
-            "SInt4" => Self::Intrinsic(IntrinsicType::SInt4),
+            "SInt" | "Int" => Self::Intrinsic(IntrinsicType::SInt),
+            "SInt2" | "Int2" => Self::Intrinsic(IntrinsicType::SInt2),
+            "SInt3" | "Int3" => Self::Intrinsic(IntrinsicType::SInt3),
+            "SInt4" | "Int4" => Self::Intrinsic(IntrinsicType::SInt4),
             "Float" => Self::Intrinsic(IntrinsicType::Float),
             "Float2" => Self::Intrinsic(IntrinsicType::Float2),
             "Float3" => Self::Intrinsic(IntrinsicType::Float3),
@@ -1551,38 +2194,6 @@ const fn swizzle_index(x: u8, src_component_count: u8) -> Option<usize> {
 }
 
 #[derive(Debug)]
-pub struct Variable<'s> {
-    pub declaration_ref: SourceRef<'s>,
-    pub ty: ConcreteType<'s>,
-    pub init_expr: Option<TypedExpression<'s>>,
-}
-
-#[derive(Debug)]
-pub struct IntrinsicSymbolScope {
-    symbol_type_table: HashMap<&'static str, ConcreteType<'static>>,
-    type_constructors: HashMap<&'static str, IntrinsicType>,
-}
-impl IntrinsicSymbolScope {
-    pub fn new() -> Self {
-        let mut symbol_type_table = HashMap::new();
-        symbol_type_table.insert(
-            "subpassLoad",
-            ConcreteType::Function {
-                args: vec![ConcreteType::Intrinsic(IntrinsicType::SubpassInput)],
-                output: Some(Box::new(ConcreteType::Intrinsic(IntrinsicType::Float4))),
-            },
-        );
-        let mut type_constructors = HashMap::new();
-        type_constructors.insert("Float4", IntrinsicType::Float4);
-
-        Self {
-            symbol_type_table,
-            type_constructors,
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct UserDefinedStructMemberPartiallyTyped<'s> {
     pub name: SourceRef<'s>,
     pub ty: Type<'s>,
@@ -1604,505 +2215,6 @@ pub struct UserDefinedStructMember<'s> {
 #[derive(Debug)]
 pub enum UserDefinedType<'s> {
     Struct(Vec<UserDefinedStructMember<'s>>),
-}
-
-#[derive(Debug)]
-pub struct SymbolScope<'s> {
-    user_defined_type_symbols: HashMap<&'s str, (SourceRef<'s>, UserDefinedType<'s>)>,
-    function_inputs: Vec<Variable<'s>>,
-    local_vars: Vec<Variable<'s>>,
-    function_input_index_by_name: HashMap<&'s str, usize>,
-    local_var_index_by_name: HashMap<&'s str, usize>,
-}
-impl<'s> SymbolScope<'s> {
-    pub fn declare_function_input(
-        &mut self,
-        name_token: &Token<'s>,
-        ty: ConcreteType<'s>,
-    ) -> usize {
-        let var_index = self.function_inputs.len();
-        self.function_inputs.push(Variable {
-            declaration_ref: SourceRef {
-                slice: name_token.slice,
-                line: name_token.line,
-                col: name_token.col,
-            },
-            ty,
-            init_expr: None,
-        });
-        self.function_input_index_by_name
-            .insert(name_token.slice, var_index);
-
-        var_index
-    }
-
-    pub fn declare_local_var(
-        &mut self,
-        name_token: &Token<'s>,
-        ty: ConcreteType<'s>,
-        init_expr: TypedExpression<'s>,
-    ) -> usize {
-        let var_index = self.local_vars.len();
-        self.local_vars.push(Variable {
-            declaration_ref: SourceRef {
-                slice: name_token.slice,
-                line: name_token.line,
-                col: name_token.col,
-            },
-            ty,
-            init_expr: Some(init_expr),
-        });
-        self.local_var_index_by_name
-            .insert(name_token.slice, var_index);
-
-        var_index
-    }
-}
-
-#[derive(Debug)]
-pub enum SimplifiedStatement {
-    InitializeLocalVar { var_index: usize },
-}
-
-#[derive(Debug)]
-pub enum TypedExpression<'s> {
-    Block(Vec<SimplifiedStatement>, Box<TypedExpression<'s>>),
-    Tuple(Vec<TypedExpression<'s>>),
-    Add(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Sub(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Mul(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Div(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Mod(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    BitAnd(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    BitOr(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    BitXor(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Eq(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Ne(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Lt(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Le(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Gt(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    Ge(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    LogAnd(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    LogOr(Box<TypedExpression<'s>>, Box<TypedExpression<'s>>),
-    If(
-        Box<TypedExpression<'s>>,
-        Box<TypedExpression<'s>>,
-        Option<Box<TypedExpression<'s>>>,
-    ),
-    Neg(Box<TypedExpression<'s>>),
-    BitNot(Box<TypedExpression<'s>>),
-    LogNot(Box<TypedExpression<'s>>),
-    MemberRef(Box<TypedExpression<'s>>, SourceRef<'s>),
-    Funcall(Box<TypedExpression<'s>>, Vec<TypedExpression<'s>>),
-    LocalVar {
-        var_index: usize,
-        scope_ascending: usize,
-    },
-    InputVar(usize),
-    IntrinsicRef(&'s str),
-    IntrinsicTyConRef(IntrinsicType),
-    IntLiteral(&'s str),
-    FloatLiteral(&'s str),
-    NumberLiteral(&'s str),
-    Cast(Box<TypedExpression<'s>>, ConcreteType<'s>),
-}
-pub fn simplify_statement<'s>(
-    intrinsic_symbol_scope: &IntrinsicSymbolScope,
-    scope_stack: &mut [SymbolScope<'s>],
-    stmt: Statement<'s>,
-) -> SimplifiedStatement {
-    match stmt {
-        Statement::Let {
-            varname_token,
-            expr,
-            ..
-        } => {
-            let expr = transform_expression(intrinsic_symbol_scope, scope_stack, expr);
-
-            let Some(scope) = scope_stack.last_mut() else {
-                panic!("cannot declare variables outside of a function");
-            };
-
-            let var_index = scope.declare_local_var(&varname_token, ConcreteType::Inferred, expr);
-            SimplifiedStatement::InitializeLocalVar { var_index }
-        }
-    }
-}
-pub fn transform_expression<'s>(
-    intrinsic_symbol_scope: &IntrinsicSymbolScope,
-    scope_stack: &mut [SymbolScope<'s>],
-    expr: Expression<'s>,
-) -> TypedExpression<'s> {
-    match expr {
-        Expression::Lifted(_, x, _) => {
-            transform_expression(intrinsic_symbol_scope, scope_stack, *x)
-        }
-        Expression::Binary(left, op, right) => match op.slice {
-            "+" => TypedExpression::Add(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "-" => TypedExpression::Sub(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "*" => TypedExpression::Mul(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "/" => TypedExpression::Div(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "%" => TypedExpression::Mod(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "&" => TypedExpression::BitAnd(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "|" => TypedExpression::BitOr(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "^" => TypedExpression::BitXor(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "==" => TypedExpression::Eq(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "!=" => TypedExpression::Ne(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            ">=" => TypedExpression::Ge(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "<=" => TypedExpression::Le(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            ">" => TypedExpression::Gt(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "<" => TypedExpression::Lt(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "&&" => TypedExpression::LogAnd(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            "||" => TypedExpression::LogOr(
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *left,
-                )),
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *right,
-                )),
-            ),
-            _ => unreachable!("unknown op"),
-        },
-        Expression::Prefixed(op, x) => match op.slice {
-            "+" => transform_expression(intrinsic_symbol_scope, scope_stack, *x),
-            "-" => TypedExpression::Neg(Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *x,
-            ))),
-            "!" => TypedExpression::LogNot(Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *x,
-            ))),
-            "~" => TypedExpression::BitNot(Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *x,
-            ))),
-            _ => unreachable!("unknown op"),
-        },
-        Expression::Blocked(stmts, final_expr) => TypedExpression::Block(
-            stmts
-                .into_iter()
-                .map(|x| simplify_statement(intrinsic_symbol_scope, scope_stack, x))
-                .collect(),
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *final_expr,
-            )),
-        ),
-        Expression::If {
-            condition,
-            then_expr,
-            else_expr,
-            ..
-        } => TypedExpression::If(
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *condition,
-            )),
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *then_expr,
-            )),
-            else_expr.map(|x| {
-                Box::new(transform_expression(
-                    intrinsic_symbol_scope,
-                    scope_stack,
-                    *x,
-                ))
-            }),
-        ),
-        Expression::MemberRef(src, _, name) => TypedExpression::MemberRef(
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *src,
-            )),
-            SourceRef {
-                slice: name.slice,
-                line: name.line,
-                col: name.col,
-            },
-        ),
-        Expression::Funcall {
-            base_expr, args, ..
-        } => TypedExpression::Funcall(
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *base_expr,
-            )),
-            args.into_iter()
-                .map(|x| transform_expression(intrinsic_symbol_scope, scope_stack, x.0))
-                .collect(),
-        ),
-        Expression::FuncallSingle(base_expr, arg) => TypedExpression::Funcall(
-            Box::new(transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *base_expr,
-            )),
-            vec![transform_expression(
-                intrinsic_symbol_scope,
-                scope_stack,
-                *arg,
-            )],
-        ),
-        Expression::Number(t) => {
-            let has_fpart = t.slice.contains('.');
-            let has_float_suffix = t.slice.ends_with(['f', 'F']);
-            let has_hex_prefix = t.slice.starts_with("0x") || t.slice.starts_with("0X");
-
-            if has_hex_prefix {
-                TypedExpression::IntLiteral(t.slice)
-            } else if has_float_suffix {
-                TypedExpression::FloatLiteral(t.slice)
-            } else if has_fpart {
-                TypedExpression::NumberLiteral(t.slice)
-            } else {
-                TypedExpression::IntLiteral(t.slice)
-            }
-        }
-        Expression::Var(v) => {
-            match lookup_local_var(v.slice, scope_stack, intrinsic_symbol_scope) {
-                Some(LookupLocalVarResult::LocalVar(index, ascendants)) => {
-                    TypedExpression::LocalVar {
-                        var_index: index,
-                        scope_ascending: ascendants,
-                    }
-                }
-                Some(LookupLocalVarResult::Input(x)) => TypedExpression::InputVar(x),
-                Some(LookupLocalVarResult::Intrinsic) => TypedExpression::IntrinsicRef(v.slice),
-                Some(LookupLocalVarResult::IntrinsicTypeConstructor(t)) => {
-                    TypedExpression::IntrinsicTyConRef(t)
-                }
-                None => panic!("Error: referencing undefined variable: {} {v:?}", v.slice),
-            }
-        }
-        Expression::Tuple(_, elements, _) => TypedExpression::Tuple(
-            elements
-                .into_iter()
-                .map(|x| transform_expression(intrinsic_symbol_scope, scope_stack, x.0))
-                .collect(),
-        ),
-    }
-}
-
-enum LookupLocalVarResult {
-    LocalVar(usize, usize),
-    Input(usize),
-    Intrinsic,
-    IntrinsicTypeConstructor(IntrinsicType),
-}
-
-fn lookup_local_var(
-    name: &str,
-    scope_stack: &[SymbolScope],
-    intrinsic_symbol_scope: &IntrinsicSymbolScope,
-) -> Option<LookupLocalVarResult> {
-    fn rec(
-        name: &str,
-        scope_stack: &[SymbolScope],
-        ascendants: usize,
-    ) -> Option<LookupLocalVarResult> {
-        let Some(scope) = scope_stack.last() else {
-            return None;
-        };
-
-        if let Some(&x) = scope.local_var_index_by_name.get(name) {
-            return Some(LookupLocalVarResult::LocalVar(x, ascendants));
-        }
-
-        if let Some(&x) = scope.function_input_index_by_name.get(name) {
-            return Some(LookupLocalVarResult::Input(x));
-        }
-
-        rec(name, &scope_stack[..scope_stack.len() - 1], ascendants + 1)
-    }
-
-    if intrinsic_symbol_scope.symbol_type_table.contains_key(name) {
-        return Some(LookupLocalVarResult::Intrinsic);
-    }
-
-    if let Some(t) = intrinsic_symbol_scope.type_constructors.get(name) {
-        return Some(LookupLocalVarResult::IntrinsicTypeConstructor(t.clone()));
-    }
-
-    rec(name, scope_stack, 0)
 }
 
 #[derive(Debug)]
