@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use typed_arena::Arena;
 
@@ -29,8 +32,8 @@ fn main() {
         tlds.push(tld);
     }
 
-    let intrinsic_symbol_scope = IntrinsicSymbolScope::new();
-    let mut scope_stack = Vec::new();
+    let symbol_scope_arena = Arena::new();
+    let global_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new_intrinsics());
 
     let mut partially_typed_types = HashMap::new();
     for tld in tlds.iter() {
@@ -63,13 +66,8 @@ fn main() {
         }
     }
 
-    let mut top_scope = SymbolScope {
-        user_defined_type_symbols: HashMap::new(),
-        function_inputs: Vec::new(),
-        local_vars: Vec::new(),
-        function_input_index_by_name: HashMap::new(),
-        local_var_index_by_name: HashMap::new(),
-    };
+    let top_scope_opaque_types = partially_typed_types.keys().copied().collect();
+    let top_scope = symbol_scope_arena.alloc(SymbolScope2::new(Some(global_symbol_scope)));
     top_scope
         .user_defined_type_symbols
         .extend(partially_typed_types.into_iter().map(|(k, (org, v))| {
@@ -82,7 +80,11 @@ fn main() {
                             s.into_iter()
                                 .map(|x| UserDefinedStructMember {
                                     name: x.name,
-                                    ty: ConcreteType::build(&scope_stack, x.ty),
+                                    ty: ConcreteType::build(
+                                        global_symbol_scope,
+                                        &top_scope_opaque_types,
+                                        x.ty,
+                                    ),
                                     attributes: x.attributes,
                                 })
                                 .collect(),
@@ -92,29 +94,25 @@ fn main() {
             )
         }));
     println!("TopScopeSymbols: {top_scope:#?}");
-    scope_stack.push(top_scope);
 
     let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
         panic!("not a function?");
     };
-    let symbol_scope_arena = Arena::new();
-    let global_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new_intrinsics());
-    let function_symbol_scope =
-        symbol_scope_arena.alloc(SymbolScope2::new(Some(global_symbol_scope)));
+    let function_symbol_scope = symbol_scope_arena.alloc(SymbolScope2::new(Some(top_scope)));
     match f.input_args {
         FunctionDeclarationInputArguments::Single {
             varname_token, ty, ..
         } => {
             function_symbol_scope.declare_function_input(
                 SourceRef::from(&varname_token),
-                ConcreteType::build(&scope_stack, ty),
+                ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
             );
         }
         FunctionDeclarationInputArguments::Multiple { args, .. } => {
             for (_, n, _, ty, _) in args {
                 function_symbol_scope.declare_function_input(
                     SourceRef::from(&n),
-                    ConcreteType::build(&scope_stack, ty),
+                    ConcreteType::build(function_symbol_scope, &HashSet::new(), ty),
                 );
             }
         }
@@ -125,10 +123,10 @@ fn main() {
     };
     let last_var_id = simplify_expression(f.body, &mut simplify_context, &function_symbol_scope);
     println!("simplified exprs:");
-    for (n, x) in simplify_context.vars.iter().enumerate() {
-        print_simp_expr(x, n, 0);
+    for (n, (x, t)) in simplify_context.vars.iter().enumerate() {
+        print_simp_expr(x, t, n, 0);
     }
-    println!("last id: {last_var_id}");
+    println!("last id: {}(ty = {:?})", last_var_id.0, last_var_id.1);
 
     // let ToplevelDeclaration::Function(f) = tlds.remove(1) else {
     //     panic!("not a function decl?");
@@ -159,21 +157,39 @@ fn main() {
     // println!("scope: {scope_stack:#?}");
 }
 
-fn print_simp_expr(x: &SimplifiedExpression, vid: usize, nested: usize) {
+fn print_simp_expr(x: &SimplifiedExpression, ty: &ConcreteType, vid: usize, nested: usize) {
     match x {
         SimplifiedExpression::ScopedBlock {
             expressions,
             returning,
-            ..
+            symbol_scope,
         } => {
-            println!("  {}%{vid} = Scope {{", "  ".repeat(nested));
-            for (n, x) in expressions.iter().enumerate() {
-                print_simp_expr(x, n, nested + 1);
+            println!("  {}%{vid}: {ty:?} = Scope {{", "  ".repeat(nested));
+            println!("  {}Function Inputs:", "  ".repeat(nested + 1));
+            for (n, a) in symbol_scope.function_input_vars.iter().enumerate() {
+                println!(
+                    "  {}  {n} = {}: {:?}",
+                    "  ".repeat(nested + 1),
+                    a.occurence.slice,
+                    a.ty
+                );
+            }
+            println!("  {}Local Vars:", "  ".repeat(nested + 1));
+            for (n, a) in symbol_scope.local_vars.borrow().iter().enumerate() {
+                println!(
+                    "  {}  {n} = {}: {:?}",
+                    "  ".repeat(nested + 1),
+                    a.occurence.slice,
+                    a.ty
+                );
+            }
+            for (n, (x, t)) in expressions.iter().enumerate() {
+                print_simp_expr(x, t, n, nested + 1);
             }
             println!("  {}returning %{returning}", "  ".repeat(nested + 1));
             println!("  {}}}", "  ".repeat(nested));
         }
-        _ => println!("  {}%{vid} = {x:?}", "  ".repeat(nested)),
+        _ => println!("  {}%{vid}: {ty:?} = {x:?}", "  ".repeat(nested)),
     }
 }
 
@@ -200,7 +216,14 @@ pub struct LocalVariable<'s> {
 pub enum VarId {
     FunctionInput(usize),
     ScopeLocal(usize),
-    IntrinsicFunction(&'static str),
+    IntrinsicTypeConstructor(IntrinsicType),
+}
+
+#[derive(Debug, Clone)]
+pub enum VarLookupResult<'x, 's> {
+    FunctionInputVar(usize, &'x ConcreteType<'s>),
+    ScopeLocalVar(usize, ConcreteType<'s>),
+    IntrinsicFunction(&'x IntrinsicFunctionSymbol),
     IntrinsicTypeConstructor(IntrinsicType),
 }
 
@@ -208,6 +231,7 @@ pub enum VarId {
 pub struct SymbolScope2<'a, 's> {
     parent: Option<&'a SymbolScope2<'a, 's>>,
     intrinsic_symbols: HashMap<&'s str, IntrinsicFunctionSymbol>,
+    user_defined_type_symbols: HashMap<&'s str, (SourceRef<'s>, UserDefinedType<'s>)>,
     function_input_vars: Vec<FunctionInputVariable<'s>>,
     local_vars: RefCell<Vec<LocalVariable<'s>>>,
     var_id_by_name: RefCell<HashMap<&'s str, VarId>>,
@@ -217,6 +241,7 @@ impl<'a, 's> SymbolScope2<'a, 's> {
         Self {
             parent,
             intrinsic_symbols: HashMap::new(),
+            user_defined_type_symbols: HashMap::new(),
             function_input_vars: Vec::new(),
             local_vars: RefCell::new(Vec::new()),
             var_id_by_name: RefCell::new(HashMap::new()),
@@ -245,6 +270,7 @@ impl<'a, 's> SymbolScope2<'a, 's> {
         Self {
             parent: None,
             intrinsic_symbols,
+            user_defined_type_symbols: HashMap::new(),
             function_input_vars: Vec::new(),
             local_vars: RefCell::new(Vec::new()),
             var_id_by_name: RefCell::new(var_id_by_name),
@@ -284,15 +310,48 @@ impl<'a, 's> SymbolScope2<'a, 's> {
         vid
     }
 
-    pub fn lookup(&self, name: &'s str) -> Option<(&Self, VarId)> {
+    pub fn lookup_intrinsic_function(&self, name: &'s str) -> Option<&IntrinsicFunctionSymbol> {
+        match self.intrinsic_symbols.get(name) {
+            Some(t) => Some(t),
+            None => match self.parent {
+                Some(ref p) => p.lookup_intrinsic_function(name),
+                None => None,
+            },
+        }
+    }
+
+    pub fn lookup<'x>(&'x self, name: &str) -> Option<(&Self, VarLookupResult<'x, 's>)> {
         if let Some(x) = self.intrinsic_symbols.get(name) {
-            return Some((self, VarId::IntrinsicFunction(x.name)));
+            return Some((self, VarLookupResult::IntrinsicFunction(x)));
         }
 
         match self.var_id_by_name.borrow().get(name) {
-            Some(vid) => Some((self, *vid)),
+            Some(VarId::FunctionInput(x)) => Some((
+                self,
+                VarLookupResult::FunctionInputVar(*x, &self.function_input_vars[*x].ty),
+            )),
+            Some(VarId::ScopeLocal(x)) => Some((
+                self,
+                VarLookupResult::ScopeLocalVar(*x, self.local_vars.borrow()[*x].ty.clone()),
+            )),
+            Some(VarId::IntrinsicTypeConstructor(x)) => {
+                Some((self, VarLookupResult::IntrinsicTypeConstructor(*x)))
+            }
             None => match self.parent {
                 Some(ref p) => p.lookup(name),
+                None => None,
+            },
+        }
+    }
+
+    pub fn lookup_user_defined_type(
+        &self,
+        name: &'s str,
+    ) -> Option<(&Self, &(SourceRef<'s>, UserDefinedType<'s>))> {
+        match self.user_defined_type_symbols.get(name) {
+            Some(p) => Some((self, p)),
+            None => match self.parent {
+                Some(ref p) => p.lookup_user_defined_type(name),
                 None => None,
             },
         }
@@ -329,6 +388,11 @@ pub enum SimplifiedExpression<'a, 's> {
     IntrinsicTypeConstructor(IntrinsicType),
     Select(usize, usize, usize),
     Cast(usize, ConcreteType<'s>),
+    Swizzle1(usize, usize),
+    Swizzle2(usize, usize, usize),
+    Swizzle3(usize, usize, usize, usize),
+    Swizzle4(usize, usize, usize, usize, usize),
+    InstantiateIntrinsicTypeClass(usize, IntrinsicType),
     ConstInt(SourceRef<'s>),
     ConstFloat(SourceRef<'s>),
     ConstNumber(SourceRef<'s>),
@@ -336,60 +400,316 @@ pub enum SimplifiedExpression<'a, 's> {
     ConstructTuple(Vec<usize>),
     ScopedBlock {
         symbol_scope: &'a SymbolScope2<'a, 's>,
-        expressions: Vec<SimplifiedExpression<'a, 's>>,
+        expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
         returning: usize,
     },
 }
 pub struct SimplificationContext<'a, 's> {
     pub symbol_scope_arena: &'a Arena<SymbolScope2<'a, 's>>,
-    pub vars: Vec<SimplifiedExpression<'a, 's>>,
+    pub vars: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
 }
 impl<'a, 's> SimplificationContext<'a, 's> {
-    pub fn add(&mut self, expr: SimplifiedExpression<'a, 's>) -> usize {
-        self.vars.push(expr);
+    pub fn add(&mut self, expr: SimplifiedExpression<'a, 's>, ty: ConcreteType<'s>) -> usize {
+        self.vars.push((expr, ty));
 
         self.vars.len() - 1
+    }
+
+    pub fn type_of(&self, expr_id: usize) -> Option<&ConcreteType<'s>> {
+        self.vars.get(expr_id).map(|(_, t)| t)
     }
 }
 fn simplify_expression<'a, 's>(
     ast: Expression<'s>,
     ctx: &mut SimplificationContext<'a, 's>,
     symbol_scope: &'a SymbolScope2<'a, 's>,
-) -> usize {
+) -> (usize, ConcreteType<'s>) {
     match ast {
         Expression::Binary(left, op, right) => {
-            let left = simplify_expression(*left, ctx, symbol_scope);
-            let right = simplify_expression(*right, ctx, symbol_scope);
+            let (left, lt) = simplify_expression(*left, ctx, symbol_scope);
+            let (right, rt) = simplify_expression(*right, ctx, symbol_scope);
 
-            ctx.add(match op.slice {
-                "+" => SimplifiedExpression::Add(left, right),
-                "-" => SimplifiedExpression::Sub(left, right),
-                "*" => SimplifiedExpression::Mul(left, right),
-                "/" => SimplifiedExpression::Div(left, right),
-                "%" => SimplifiedExpression::Rem(left, right),
-                "&" => SimplifiedExpression::BitAnd(left, right),
-                "|" => SimplifiedExpression::BitOr(left, right),
-                "^" => SimplifiedExpression::BitXor(left, right),
-                "==" => SimplifiedExpression::Eq(left, right),
-                "!=" => SimplifiedExpression::Ne(left, right),
-                ">=" => SimplifiedExpression::Ge(left, right),
-                "<=" => SimplifiedExpression::Le(left, right),
-                ">" => SimplifiedExpression::Gt(left, right),
-                "<" => SimplifiedExpression::Lt(left, right),
-                "&&" => SimplifiedExpression::LogAnd(left, right),
-                "||" => SimplifiedExpression::LogOr(left, right),
-                _ => unreachable!("unknown binary op"),
-            })
+            let r = match op.slice {
+                "+" | "-" | "*" | "/" | "%" => lt.arithmetic_compare_op_type_conversion(rt),
+                // 比較演算の出力は必ずBoolになる
+                "==" | "!=" | "<=" | ">=" | "<" | ">" => lt
+                    .arithmetic_compare_op_type_conversion(rt)
+                    .map(|(conv, _)| (conv, IntrinsicType::Bool.into())),
+                "&" | "|" | "^" => lt.bitwise_op_type_conversion(rt),
+                "&&" | "||" => lt.logical_op_type_conversion(rt),
+                _ => None,
+            };
+            let (conv, res) = match r {
+                Some(x) => x,
+                None => {
+                    eprintln!("Error: cannot apply binary op {} between terms", op.slice);
+                    (BinaryOpTypeConversion::NoConversion, ConcreteType::Inferred)
+                }
+            };
+
+            // let Some((conv, res)) = (match op.slice {
+            //     "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">" => {
+            //         lt.arithmetic_compare_op_type_conversion(rt)
+            //     }
+            //     "&" | "|" | "^" => lt.bitwise_op_type_conversion(rt),
+            //     "&&" | "||" => lt.logical_op_type_conversion(rt),
+            //     _ => None,
+            // }) else {
+            //     panic!("Error: cannot apply binary op {} between terms", op.slice);
+            // };
+
+            let (left, right) = match conv {
+                BinaryOpTypeConversion::NoConversion => (left, right),
+                BinaryOpTypeConversion::CastLeftHand => {
+                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::CastRightHand => {
+                    let right =
+                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateAndCastLeftHand(it) => {
+                    let left = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
+                        it.into(),
+                    );
+                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateAndCastRightHand(it) => {
+                    let right = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
+                        it.into(),
+                    );
+                    let right =
+                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateLeftHand(it) => {
+                    let left = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
+                        it.into(),
+                    );
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateRightHand(it) => {
+                    let right = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
+                        it.into(),
+                    );
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(it) => {
+                    let left = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
+                        it.into(),
+                    );
+                    let right =
+                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(it) => {
+                    let right = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
+                        it.into(),
+                    );
+                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+
+                    (left, right)
+                }
+                BinaryOpTypeConversion::CastBoth => {
+                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+                    let right =
+                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+
+                    (left, right)
+                }
+            };
+
+            (
+                ctx.add(
+                    match op.slice {
+                        "+" => SimplifiedExpression::Add(left, right),
+                        "-" => SimplifiedExpression::Sub(left, right),
+                        "*" => SimplifiedExpression::Mul(left, right),
+                        "/" => SimplifiedExpression::Div(left, right),
+                        "%" => SimplifiedExpression::Rem(left, right),
+                        "&" => SimplifiedExpression::BitAnd(left, right),
+                        "|" => SimplifiedExpression::BitOr(left, right),
+                        "^" => SimplifiedExpression::BitXor(left, right),
+                        "==" => SimplifiedExpression::Eq(left, right),
+                        "!=" => SimplifiedExpression::Ne(left, right),
+                        ">=" => SimplifiedExpression::Ge(left, right),
+                        "<=" => SimplifiedExpression::Le(left, right),
+                        ">" => SimplifiedExpression::Gt(left, right),
+                        "<" => SimplifiedExpression::Lt(left, right),
+                        "&&" => SimplifiedExpression::LogAnd(left, right),
+                        "||" => SimplifiedExpression::LogOr(left, right),
+                        _ => unreachable!("unknown binary op"),
+                    },
+                    res.clone(),
+                ),
+                res,
+            )
         }
         Expression::Prefixed(op, expr) => {
-            let expr = simplify_expression(*expr, ctx, symbol_scope);
+            let (expr, et) = simplify_expression(*expr, ctx, symbol_scope);
 
             match op.slice {
-                "+" => expr,
-                "-" => ctx.add(SimplifiedExpression::Neg(expr)),
-                "!" => ctx.add(SimplifiedExpression::LogNot(expr)),
-                "~" => ctx.add(SimplifiedExpression::BitNot(expr)),
-                _ => unreachable!("unknown prefixed op"),
+                "+" if et.scalar_type().is_some() => (expr, et),
+                "-" => match et.scalar_type() {
+                    Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::UInt) => {
+                        let target_type: ConcreteType = IntrinsicScalarType::SInt
+                            .of_vector(et.vector_elements().unwrap())
+                            .unwrap()
+                            .into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::Cast(expr, target_type.clone()),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UnknownIntClass) => {
+                        let target_type: ConcreteType = IntrinsicType::SInt.into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                expr,
+                                IntrinsicType::SInt,
+                            ),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UnknownNumberClass) => {
+                        let target_type: ConcreteType = IntrinsicType::Float.into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                expr,
+                                IntrinsicType::Float,
+                            ),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(_) => (ctx.add(SimplifiedExpression::Neg(expr), et.clone()), et),
+                    None => panic!("Error: cannot apply prefixed - to the term"),
+                },
+                "!" => match et.scalar_type() {
+                    Some(IntrinsicScalarType::SInt)
+                    | Some(IntrinsicScalarType::UInt)
+                    | Some(IntrinsicScalarType::Float) => {
+                        let target_type: ConcreteType = IntrinsicScalarType::Bool
+                            .of_vector(et.vector_elements().unwrap())
+                            .unwrap()
+                            .into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::Cast(expr, target_type.clone()),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UnknownIntClass) => {
+                        let target_type: ConcreteType = IntrinsicType::Bool.into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                expr,
+                                IntrinsicType::UInt,
+                            ),
+                            target_type.clone(),
+                        );
+                        let expr = ctx.add(
+                            SimplifiedExpression::Cast(expr, IntrinsicType::Bool.into()),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UnknownNumberClass) => {
+                        let target_type: ConcreteType = IntrinsicType::Bool.into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                expr,
+                                IntrinsicType::Float,
+                            ),
+                            target_type.clone(),
+                        );
+                        let expr = ctx.add(
+                            SimplifiedExpression::Cast(expr, IntrinsicType::Bool.into()),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(_) => (ctx.add(SimplifiedExpression::LogNot(expr), et.clone()), et),
+                    None => panic!("Error: cannot apply prefixed ! to the term"),
+                },
+                "~" => match et.scalar_type() {
+                    Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::SInt) => {
+                        let target_type: ConcreteType = IntrinsicScalarType::UInt
+                            .of_vector(et.vector_elements().unwrap())
+                            .unwrap()
+                            .into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::Cast(expr, target_type.clone()),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::BitNot(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UnknownIntClass) => {
+                        let target_type: ConcreteType = IntrinsicType::UInt.into();
+                        let expr = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                expr,
+                                IntrinsicType::UInt,
+                            ),
+                            target_type.clone(),
+                        );
+
+                        (
+                            ctx.add(SimplifiedExpression::BitNot(expr), target_type.clone()),
+                            target_type,
+                        )
+                    }
+                    Some(IntrinsicScalarType::UInt) => {
+                        (ctx.add(SimplifiedExpression::BitNot(expr), et.clone()), et)
+                    }
+                    _ => panic!("Error: cannot apply prefixed ~ to the term"),
+                },
+                x => panic!("Error: cannot apply prefixed op {x} to the term"),
             }
         }
         Expression::Lifted(_, x, _) => simplify_expression(*x, ctx, symbol_scope),
@@ -409,86 +729,246 @@ fn simplify_expression<'a, 's>(
                         expr,
                         ..
                     } => {
-                        let res = simplify_expression(expr, &mut new_ctx, new_symbol_scope);
+                        let (res, ty) = simplify_expression(expr, &mut new_ctx, new_symbol_scope);
                         let vid = new_symbol_scope.declare_local_var(
                             SourceRef::from(&varname_token),
-                            ConcreteType::Inferred,
+                            ty.clone(),
                             res,
                         );
-                        new_ctx.add(SimplifiedExpression::InitializeVar(new_symbol_scope, vid));
+                        new_ctx.add(
+                            SimplifiedExpression::InitializeVar(new_symbol_scope, vid),
+                            ty,
+                        );
                     }
                 }
             }
 
-            let last_id = simplify_expression(*x, &mut new_ctx, new_symbol_scope);
-            ctx.add(SimplifiedExpression::ScopedBlock {
-                symbol_scope: new_symbol_scope,
-                expressions: new_ctx.vars,
-                returning: last_id,
-            })
+            let (last_id, last_ty) = simplify_expression(*x, &mut new_ctx, new_symbol_scope);
+            (
+                ctx.add(
+                    SimplifiedExpression::ScopedBlock {
+                        symbol_scope: new_symbol_scope,
+                        expressions: new_ctx.vars,
+                        returning: last_id,
+                    },
+                    last_ty.clone(),
+                ),
+                last_ty,
+            )
         }
         Expression::MemberRef(base, _, name) => {
-            let base = simplify_expression(*base, ctx, symbol_scope);
+            let (base, base_ty) = simplify_expression(*base, ctx, symbol_scope);
 
-            ctx.add(SimplifiedExpression::MemberRef(
-                base,
-                SourceRef::from(&name),
-            ))
+            match base_ty {
+                ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
+                    (None, _) | (_, None) => panic!("cannot member ref to complex data"),
+                    (_, Some(1)) => panic!("scalar value cannot be swizzled"),
+                    (Some(scalar), Some(count)) => match swizzle_indices(name.slice, count) {
+                        Some([Some(a), None, None, None]) => (
+                            ctx.add(SimplifiedExpression::Swizzle1(base, a), scalar.into()),
+                            scalar.into(),
+                        ),
+                        Some([Some(a), Some(b), None, None]) => (
+                            ctx.add(
+                                SimplifiedExpression::Swizzle2(base, a, b),
+                                scalar.of_vector(2).unwrap().into(),
+                            ),
+                            scalar.of_vector(2).unwrap().into(),
+                        ),
+                        Some([Some(a), Some(b), Some(c), None]) => (
+                            ctx.add(
+                                SimplifiedExpression::Swizzle3(base, a, b, c),
+                                scalar.of_vector(3).unwrap().into(),
+                            ),
+                            scalar.of_vector(3).unwrap().into(),
+                        ),
+                        Some([Some(a), Some(b), Some(c), Some(d)]) => (
+                            ctx.add(
+                                SimplifiedExpression::Swizzle4(base, a, b, c, d),
+                                scalar.of_vector(4).unwrap().into(),
+                            ),
+                            scalar.of_vector(4).unwrap().into(),
+                        ),
+                        Some(_) => panic!("invalid swizzle ref"),
+                        None => panic!("too many swizzle components"),
+                    },
+                },
+                ConcreteType::UserDefined {
+                    name: ty_name,
+                    generic_args,
+                } => {
+                    let (_, (_, ty)) = symbol_scope
+                        .lookup_user_defined_type(ty_name)
+                        .expect("No user defined type defined");
+
+                    match ty {
+                        UserDefinedType::Struct(members) => {
+                            let target_member = members.iter().find(|x| x.name.slice == name.slice);
+                            match target_member {
+                                Some(x) => (
+                                    ctx.add(
+                                        SimplifiedExpression::MemberRef(
+                                            base,
+                                            SourceRef::from(&name),
+                                        ),
+                                        x.ty.clone(),
+                                    ),
+                                    x.ty.clone(),
+                                ),
+                                None => {
+                                    panic!("Struct {ty_name} has no member named '{}'", name.slice);
+                                }
+                            }
+                        }
+                        _ => {
+                            unreachable!("unsupported member ref op for type");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("unsupported member ref op for type {base_ty:?}");
+
+                    (
+                        ctx.add(
+                            SimplifiedExpression::MemberRef(base, SourceRef::from(&name)),
+                            ConcreteType::Inferred,
+                        ),
+                        ConcreteType::Inferred,
+                    )
+                }
+            }
         }
         Expression::Funcall {
             base_expr, args, ..
         } => {
-            let base_expr = simplify_expression(*base_expr, ctx, symbol_scope);
-            let args = args
+            let (base_expr, base_ty) = simplify_expression(*base_expr, ctx, symbol_scope);
+            let (args, arg_types): (Vec<_>, Vec<_>) = args
                 .into_iter()
                 .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
-                .collect();
+                .unzip();
 
-            ctx.add(SimplifiedExpression::Funcall(base_expr, args))
+            let res_ty = match base_ty {
+                ConcreteType::IntrinsicTypeConstructor(t) => t.into(),
+                ConcreteType::Function { args, output }
+                    if args.iter().zip(arg_types.iter()).all(|(a, b)| a == b) =>
+                {
+                    output.map_or(IntrinsicType::Unit.into(), |x| *x)
+                }
+                ConcreteType::Function { args, .. } => {
+                    eprintln!("Error: argument types mismatched({args:?} and {arg_types:?})");
+                    ConcreteType::Inferred
+                }
+                _ => panic!("Error: not applyable type"),
+            };
+
+            (
+                ctx.add(
+                    SimplifiedExpression::Funcall(base_expr, args),
+                    res_ty.clone(),
+                ),
+                res_ty,
+            )
         }
         Expression::FuncallSingle(base_expr, arg) => {
-            let base_expr = simplify_expression(*base_expr, ctx, symbol_scope);
-            let arg = simplify_expression(*arg, ctx, symbol_scope);
+            let (base_expr, base_ty) = simplify_expression(*base_expr, ctx, symbol_scope);
+            let (arg, arg_ty) = simplify_expression(*arg, ctx, symbol_scope);
 
-            ctx.add(SimplifiedExpression::Funcall(base_expr, vec![arg]))
+            let res_ty = match base_ty {
+                ConcreteType::IntrinsicTypeConstructor(t) => t.into(),
+                ConcreteType::Function { args, output } if args.len() == 1 && args[0] == arg_ty => {
+                    output.map_or(IntrinsicType::Unit.into(), |x| *x)
+                }
+                ConcreteType::Function { args, .. } => {
+                    eprintln!("Error: argument types mismatched({args:?} and [{arg_ty:?}])");
+                    ConcreteType::Inferred
+                }
+                _ => panic!("Error: not applyable type"),
+            };
+
+            (
+                ctx.add(
+                    SimplifiedExpression::Funcall(base_expr, vec![arg]),
+                    res_ty.clone(),
+                ),
+                res_ty,
+            )
         }
         Expression::Number(t) => {
             let has_hex_prefix = t.slice.starts_with("0x") || t.slice.starts_with("0X");
             let has_float_suffix = t.slice.ends_with(['f', 'F']);
             let has_fpart = t.slice.contains('.');
 
-            ctx.add(if has_hex_prefix {
-                SimplifiedExpression::ConstInt(SourceRef::from(&t))
+            let (expr, ty) = if has_hex_prefix {
+                (
+                    SimplifiedExpression::ConstInt(SourceRef::from(&t)),
+                    ConcreteType::UnknownIntClass,
+                )
             } else if has_float_suffix {
-                SimplifiedExpression::ConstFloat(SourceRef::from(&t))
+                (
+                    SimplifiedExpression::ConstFloat(SourceRef::from(&t)),
+                    IntrinsicType::Float.into(),
+                )
             } else if has_fpart {
-                SimplifiedExpression::ConstNumber(SourceRef::from(&t))
+                (
+                    SimplifiedExpression::ConstNumber(SourceRef::from(&t)),
+                    ConcreteType::UnknownNumberClass,
+                )
             } else {
-                SimplifiedExpression::ConstInt(SourceRef::from(&t))
-            })
+                (
+                    SimplifiedExpression::ConstInt(SourceRef::from(&t)),
+                    ConcreteType::UnknownIntClass,
+                )
+            };
+
+            (ctx.add(expr, ty.clone()), ty)
         }
         Expression::Var(x) => {
-            let Some((scope, vid)) = symbol_scope.lookup(x.slice) else {
+            let Some((scope, v)) = symbol_scope.lookup(x.slice) else {
                 panic!("Error: referencing undefined symbol '{}' {x:?}", x.slice);
             };
 
-            match vid {
-                VarId::IntrinsicFunction(name) => {
-                    ctx.add(SimplifiedExpression::IntrinsicFunction(name))
-                }
-                VarId::IntrinsicTypeConstructor(t) => {
-                    ctx.add(SimplifiedExpression::IntrinsicTypeConstructor(t))
-                }
-                _ => ctx.add(SimplifiedExpression::LoadVar(scope, vid)),
+            match v {
+                VarLookupResult::IntrinsicFunction(t) => (
+                    ctx.add(
+                        SimplifiedExpression::IntrinsicFunction(t.name),
+                        t.ty.clone(),
+                    ),
+                    t.ty.clone(),
+                ),
+                VarLookupResult::IntrinsicTypeConstructor(t) => (
+                    ctx.add(
+                        SimplifiedExpression::IntrinsicTypeConstructor(t),
+                        ConcreteType::IntrinsicTypeConstructor(t),
+                    ),
+                    ConcreteType::IntrinsicTypeConstructor(t),
+                ),
+                VarLookupResult::ScopeLocalVar(vid, ty) => (
+                    ctx.add(
+                        SimplifiedExpression::LoadVar(scope, VarId::ScopeLocal(vid)),
+                        ty.clone(),
+                    ),
+                    ty,
+                ),
+                VarLookupResult::FunctionInputVar(vid, ty) => (
+                    ctx.add(
+                        SimplifiedExpression::LoadVar(scope, VarId::FunctionInput(vid)),
+                        ty.clone(),
+                    ),
+                    ty.clone(),
+                ),
             }
         }
         Expression::Tuple(_, xs, _) => {
-            let xs = xs
+            let (xs, xs_types): (Vec<_>, Vec<_>) = xs
                 .into_iter()
                 .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
-                .collect();
+                .unzip();
 
-            ctx.add(SimplifiedExpression::ConstructTuple(xs))
+            let ty = ConcreteType::Tuple(xs_types);
+            (
+                ctx.add(SimplifiedExpression::ConstructTuple(xs), ty.clone()),
+                ty,
+            )
         }
         Expression::If {
             condition,
@@ -496,16 +976,40 @@ fn simplify_expression<'a, 's>(
             else_expr,
             ..
         } => {
-            let condition = simplify_expression(*condition, ctx, symbol_scope);
-            let then_expr = simplify_expression(*then_expr, ctx, symbol_scope);
-            let else_expr = match else_expr {
-                None => ctx.add(SimplifiedExpression::ConstUnit),
+            let (condition, cty) = simplify_expression(*condition, ctx, symbol_scope);
+            let (then_expr, tty) = simplify_expression(*then_expr, ctx, symbol_scope);
+            let (else_expr, ety) = match else_expr {
+                None => (
+                    ctx.add(SimplifiedExpression::ConstUnit, IntrinsicType::Unit.into()),
+                    IntrinsicType::Unit.into(),
+                ),
                 Some(x) => simplify_expression(*x, ctx, symbol_scope),
             };
 
-            ctx.add(SimplifiedExpression::Select(
-                condition, then_expr, else_expr,
-            ))
+            let condition = match cty {
+                ConcreteType::Intrinsic(IntrinsicType::Bool) => condition,
+                _ => ctx.add(
+                    SimplifiedExpression::Cast(condition, IntrinsicType::Bool.into()),
+                    IntrinsicType::Bool.into(),
+                ),
+            };
+
+            let res_ty = match (tty, ety) {
+                (ConcreteType::Inferred, _) | (_, ConcreteType::Inferred) => ConcreteType::Inferred,
+                (a, b) if a == b => a,
+                _ => {
+                    eprintln!("Error: if then block and else block has different result type");
+                    ConcreteType::Inferred
+                }
+            };
+
+            (
+                ctx.add(
+                    SimplifiedExpression::Select(condition, then_expr, else_expr),
+                    res_ty.clone(),
+                ),
+                res_ty,
+            )
         }
     }
 }
@@ -527,8 +1031,42 @@ impl<'s> From<&'_ Token<'s>> for SourceRef<'s> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntrinsicScalarType {
+    Unit,
+    Bool,
+    UInt,
+    SInt,
+    Float,
+    UnknownIntClass,
+    UnknownNumberClass,
+}
+impl IntrinsicScalarType {
+    #[inline(always)]
+    pub const fn of_vector(self, count: u8) -> Option<IntrinsicType> {
+        match (self, count) {
+            (Self::Unit, 0) => Some(IntrinsicType::Unit),
+            (Self::Bool, 1) => Some(IntrinsicType::Bool),
+            (Self::UInt, 1) => Some(IntrinsicType::UInt),
+            (Self::SInt, 1) => Some(IntrinsicType::SInt),
+            (Self::Float, 1) => Some(IntrinsicType::Float),
+            (Self::UInt, 2) => Some(IntrinsicType::UInt2),
+            (Self::SInt, 2) => Some(IntrinsicType::SInt2),
+            (Self::Float, 2) => Some(IntrinsicType::Float2),
+            (Self::UInt, 3) => Some(IntrinsicType::UInt3),
+            (Self::SInt, 3) => Some(IntrinsicType::SInt3),
+            (Self::Float, 3) => Some(IntrinsicType::Float3),
+            (Self::UInt, 4) => Some(IntrinsicType::UInt4),
+            (Self::SInt, 4) => Some(IntrinsicType::SInt4),
+            (Self::Float, 4) => Some(IntrinsicType::Float4),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntrinsicType {
+    Unit,
     Bool,
     UInt,
     UInt2,
@@ -559,8 +1097,33 @@ pub enum IntrinsicType {
     Texture3D,
     SubpassInput,
 }
+impl IntrinsicType {
+    pub const fn scalar_type(&self) -> Option<IntrinsicScalarType> {
+        match self {
+            Self::Unit => Some(IntrinsicScalarType::Unit),
+            Self::Bool => Some(IntrinsicScalarType::Bool),
+            Self::UInt | Self::UInt2 | Self::UInt3 | Self::UInt4 => Some(IntrinsicScalarType::UInt),
+            Self::SInt | Self::SInt2 | Self::SInt3 | Self::SInt4 => Some(IntrinsicScalarType::SInt),
+            Self::Float | Self::Float2 | Self::Float3 | Self::Float4 => {
+                Some(IntrinsicScalarType::Float)
+            }
+            _ => None,
+        }
+    }
 
-#[derive(Debug, Clone)]
+    pub const fn vector_elements(&self) -> Option<u8> {
+        match self {
+            Self::Unit => Some(0),
+            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(1),
+            Self::UInt2 | Self::SInt2 | Self::Float2 => Some(2),
+            Self::UInt3 | Self::SInt3 | Self::Float3 => Some(3),
+            Self::UInt4 | Self::SInt4 | Self::Float4 => Some(4),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConcreteType<'s> {
     Inferred,
     Intrinsic(IntrinsicType),
@@ -578,25 +1141,11 @@ pub enum ConcreteType<'s> {
     IntrinsicTypeConstructor(IntrinsicType),
 }
 impl<'s> ConcreteType<'s> {
-    pub fn build(scope_stack: &[SymbolScope], t: Type<'s>) -> Self {
-        fn rec_lookup<'s>(t: Type<'s>, scope_stack: &[SymbolScope]) -> ConcreteType<'s> {
-            match scope_stack.last() {
-                None => panic!("Error: referencing undefined type: {}", t.name_token.slice),
-                Some(x) => match x.user_defined_type_symbols.get(t.name_token.slice) {
-                    Some(_) => ConcreteType::UserDefined {
-                        name: t.name_token.slice,
-                        generic_args: t
-                            .generic_args
-                            .map_or_else(Vec::new, |x| x.args)
-                            .into_iter()
-                            .map(|x| ConcreteType::build(scope_stack, x.0))
-                            .collect(),
-                    },
-                    None => rec_lookup(t, &scope_stack[..scope_stack.len() - 1]),
-                },
-            }
-        }
-
+    pub fn build(
+        symbol_scope: &SymbolScope2<'_, 's>,
+        sibling_scope_opaque_symbols: &HashSet<&'s str>,
+        t: Type<'s>,
+    ) -> Self {
         match t.name_token.slice {
             "UInt" => Self::Intrinsic(IntrinsicType::UInt),
             "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
@@ -626,8 +1175,378 @@ impl<'s> ConcreteType<'s> {
             "Texture2D" => Self::Intrinsic(IntrinsicType::Texture2D),
             "Texture3D" => Self::Intrinsic(IntrinsicType::Texture3D),
             "SubpassInput" => Self::Intrinsic(IntrinsicType::SubpassInput),
-            _ => rec_lookup(t, scope_stack),
+            name => {
+                if sibling_scope_opaque_symbols.contains(name) {
+                    ConcreteType::UserDefined {
+                        name: t.name_token.slice,
+                        generic_args: t
+                            .generic_args
+                            .map_or_else(Vec::new, |x| x.args)
+                            .into_iter()
+                            .map(|x| {
+                                ConcreteType::build(symbol_scope, sibling_scope_opaque_symbols, x.0)
+                            })
+                            .collect(),
+                    }
+                } else {
+                    match symbol_scope.lookup_user_defined_type(name) {
+                        Some(_) => ConcreteType::UserDefined {
+                            name: t.name_token.slice,
+                            generic_args: t
+                                .generic_args
+                                .map_or_else(Vec::new, |x| x.args)
+                                .into_iter()
+                                .map(|x| {
+                                    ConcreteType::build(
+                                        symbol_scope,
+                                        sibling_scope_opaque_symbols,
+                                        x.0,
+                                    )
+                                })
+                                .collect(),
+                        },
+                        None => panic!("Error: referencing undefined type: {}", t.name_token.slice),
+                    }
+                }
+            }
         }
+    }
+
+    pub const fn scalar_type(&self) -> Option<IntrinsicScalarType> {
+        match self {
+            Self::Intrinsic(x) => x.scalar_type(),
+            Self::UnknownIntClass => Some(IntrinsicScalarType::UnknownIntClass),
+            Self::UnknownNumberClass => Some(IntrinsicScalarType::UnknownNumberClass),
+            _ => None,
+        }
+    }
+
+    pub const fn vector_elements(&self) -> Option<u8> {
+        match self {
+            Self::Intrinsic(x) => x.vector_elements(),
+            Self::UnknownIntClass | Self::UnknownNumberClass => Some(1),
+            _ => None,
+        }
+    }
+}
+impl From<IntrinsicType> for ConcreteType<'_> {
+    #[inline(always)]
+    fn from(value: IntrinsicType) -> Self {
+        Self::Intrinsic(value)
+    }
+}
+impl From<IntrinsicScalarType> for ConcreteType<'_> {
+    #[inline(always)]
+    fn from(value: IntrinsicScalarType) -> Self {
+        match value {
+            IntrinsicScalarType::Unit => Self::Intrinsic(IntrinsicType::Unit),
+            IntrinsicScalarType::Bool => Self::Intrinsic(IntrinsicType::Bool),
+            IntrinsicScalarType::UInt => Self::Intrinsic(IntrinsicType::UInt),
+            IntrinsicScalarType::SInt => Self::Intrinsic(IntrinsicType::SInt),
+            IntrinsicScalarType::Float => Self::Intrinsic(IntrinsicType::Float),
+            IntrinsicScalarType::UnknownIntClass => Self::UnknownIntClass,
+            IntrinsicScalarType::UnknownNumberClass => Self::UnknownNumberClass,
+        }
+    }
+}
+
+pub enum BinaryOpTypeConversion {
+    NoConversion,
+    CastLeftHand,
+    CastRightHand,
+    CastBoth,
+    InstantiateAndCastLeftHand(IntrinsicType),
+    InstantiateAndCastRightHand(IntrinsicType),
+    InstantiateRightAndCastLeftHand(IntrinsicType),
+    InstantiateLeftAndCastRightHand(IntrinsicType),
+    InstantiateLeftHand(IntrinsicType),
+    InstantiateRightHand(IntrinsicType),
+}
+impl<'s> ConcreteType<'s> {
+    pub fn arithmetic_compare_op_type_conversion(
+        self,
+        rhs: Self,
+    ) -> Option<(BinaryOpTypeConversion, Self)> {
+        match (self, rhs) {
+            // between same type
+            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
+            // between same length vectors
+            (a, b) if a.vector_elements()? == b.vector_elements()? => {
+                match (a.scalar_type()?, b.scalar_type()?) {
+                    // simple casting
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::Float) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Float) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Float) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::Float, IntrinsicScalarType::UInt) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::Float, IntrinsicScalarType::SInt) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::Float, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    // instantiate left
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::SInt),
+                        b,
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::UInt),
+                        b,
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Float) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::SInt),
+                        b,
+                    )),
+                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::SInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Float) => {
+                        Some((
+                            BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::Float),
+                            b,
+                        ))
+                    }
+                    // instantiate right
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::SInt),
+                        a,
+                    )),
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::UInt),
+                        a,
+                    )),
+                    (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::SInt),
+                        a,
+                    )),
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownNumberClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownNumberClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    )),
+                    (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownNumberClass) => {
+                        Some((
+                            BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
+                            a,
+                        ))
+                    }
+                    // never
+                    _ => None,
+                }
+            }
+            // never
+            _ => None,
+        }
+    }
+
+    pub fn bitwise_op_type_conversion(self, rhs: Self) -> Option<(BinaryOpTypeConversion, Self)> {
+        match (self, rhs) {
+            // between same type
+            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
+            // between same length vectors
+            (a, b) if a.vector_elements()? == b.vector_elements()? => {
+                match (a.scalar_type()?, b.scalar_type()?) {
+                    // simple casting
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    // instantiate left
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt) => Some((
+                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::UInt),
+                        b,
+                    )),
+                    // instantiate right
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
+                            IntrinsicType::UInt,
+                        ),
+                        IntrinsicType::UInt.into(),
+                    )),
+                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::UInt),
+                        a,
+                    )),
+                    // never
+                    _ => None,
+                }
+            }
+            // never
+            _ => None,
+        }
+    }
+
+    pub fn logical_op_type_conversion(self, rhs: Self) -> Option<(BinaryOpTypeConversion, Self)> {
+        match (self, rhs) {
+            // between same type
+            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
+            // between same length vectors
+            (a, b) if a.vector_elements()? == b.vector_elements()? => {
+                match (a.scalar_type()?, b.scalar_type()?) {
+                    // instantiate and cast
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::UInt),
+                        a,
+                    )),
+                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::UInt),
+                        a,
+                    )),
+                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::Float),
+                        a,
+                    )),
+                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
+                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::Float),
+                        a,
+                    )),
+                    // simple casting
+                    (IntrinsicScalarType::Bool, _) => {
+                        Some((BinaryOpTypeConversion::CastRightHand, a))
+                    }
+                    (_, IntrinsicScalarType::Bool) => {
+                        Some((BinaryOpTypeConversion::CastLeftHand, b))
+                    }
+                    // never
+                    _ => None,
+                }
+            }
+            // never
+            _ => None,
+        }
+    }
+}
+
+const fn swizzle_indices(x: &str, src_component_count: u8) -> Option<[Option<usize>; 4]> {
+    match x.as_bytes() {
+        &[a] => Some([swizzle_index(a, src_component_count), None, None, None]),
+        &[a, b] => Some([
+            swizzle_index(a, src_component_count),
+            swizzle_index(b, src_component_count),
+            None,
+            None,
+        ]),
+        &[a, b, c] => Some([
+            swizzle_index(a, src_component_count),
+            swizzle_index(b, src_component_count),
+            swizzle_index(c, src_component_count),
+            None,
+        ]),
+        &[a, b, c, d] => Some([
+            swizzle_index(a, src_component_count),
+            swizzle_index(b, src_component_count),
+            swizzle_index(c, src_component_count),
+            swizzle_index(d, src_component_count),
+        ]),
+        _ => None,
+    }
+}
+
+const fn swizzle_index(x: u8, src_component_count: u8) -> Option<usize> {
+    match x {
+        b'r' | b'R' | b'x' | b'X' if src_component_count >= 1 => Some(0),
+        b'g' | b'G' | b'y' | b'Y' if src_component_count >= 2 => Some(1),
+        b'b' | b'B' | b'z' | b'Z' if src_component_count >= 3 => Some(2),
+        b'a' | b'A' | b'w' | b'W' if src_component_count >= 4 => Some(3),
+        _ => None,
     }
 }
 
