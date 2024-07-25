@@ -1109,7 +1109,7 @@ fn emit_expr_spv_ops(
 
             let result_type = module_ctx.request_type_id(spv::Type::Bool);
             let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::LogicalAnd {
+            ctx.ops.push(spv::Instruction::LogicalOr {
                 result_type,
                 result: result_id,
                 operand1: l,
