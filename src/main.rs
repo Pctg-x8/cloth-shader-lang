@@ -941,47 +941,52 @@ fn emit_entry_point_spv_ops<'s>(
             }));
     }
 
-    let push_constant_uniform_block = spv::Type::Struct {
-        member_types: ep
-            .push_constant_variables
-            .iter()
-            .map(|x| spv::TypeStructMember {
-                offset: x.offset,
-                ty: x.ty.clone(),
-                decorations: vec![spv::Decorate::Offset(x.offset)],
-            })
-            .collect(),
-    };
-    let push_constant_uniform_block_tid = ctx.request_type_id(push_constant_uniform_block.clone());
-    let push_constant_uniform_block_var_type = spv::Type::Pointer {
-        storage_class: spv::StorageClass::PushConstant,
-        base_type: Box::new(push_constant_uniform_block.clone()),
-    };
-    let push_constant_uniform_block_var_tid =
-        ctx.request_type_id(push_constant_uniform_block_var_type);
-    let push_constant_uniform_block_var_id = ctx.new_global_variable_id();
-    ctx.global_variable_ops.push(spv::Instruction::Variable {
-        result_type: push_constant_uniform_block_var_tid,
-        result: push_constant_uniform_block_var_id,
-        storage_class: spv::StorageClass::PushConstant,
-        initializer: None,
-    });
-    ctx.annotation_ops.push(spv::Instruction::Decorate {
-        target: push_constant_uniform_block_tid,
-        decoration: spv::Decoration::Block,
-        args: vec![],
-    });
-    for (n, a) in ep.push_constant_variables.iter().enumerate() {
-        entry_point_maps.refpath_to_global_var.insert(
-            a.original_refpath.clone(),
-            GlobalAccessType::PushConstantStruct {
-                struct_var: push_constant_uniform_block_var_id,
-                member_index: n as _,
-                member_ty: a.ty.clone(),
-            },
-        );
+    if !ep.push_constant_variables.is_empty() {
+        let push_constant_uniform_block = spv::Type::Struct {
+            member_types: ep
+                .push_constant_variables
+                .iter()
+                .map(|x| spv::TypeStructMember {
+                    offset: x.offset,
+                    ty: x.ty.clone(),
+                    decorations: vec![spv::Decorate::Offset(x.offset)],
+                })
+                .collect(),
+        };
+        let push_constant_uniform_block_tid =
+            ctx.request_type_id(push_constant_uniform_block.clone());
+        let push_constant_uniform_block_var_type = spv::Type::Pointer {
+            storage_class: spv::StorageClass::PushConstant,
+            base_type: Box::new(push_constant_uniform_block.clone()),
+        };
+        let push_constant_uniform_block_var_tid =
+            ctx.request_type_id(push_constant_uniform_block_var_type);
+        let push_constant_uniform_block_var_id = ctx.new_global_variable_id();
+        ctx.global_variable_ops.push(spv::Instruction::Variable {
+            result_type: push_constant_uniform_block_var_tid,
+            result: push_constant_uniform_block_var_id,
+            storage_class: spv::StorageClass::PushConstant,
+            initializer: None,
+        });
+        ctx.annotation_ops.push(spv::Instruction::Decorate {
+            target: push_constant_uniform_block_tid,
+            decoration: spv::Decoration::Block,
+            args: vec![],
+        });
+        for (n, a) in ep.push_constant_variables.iter().enumerate() {
+            entry_point_maps.refpath_to_global_var.insert(
+                a.original_refpath.clone(),
+                GlobalAccessType::PushConstantStruct {
+                    struct_var: push_constant_uniform_block_var_id,
+                    member_index: n as _,
+                    member_ty: a.ty.clone(),
+                },
+            );
+        }
+        entry_point_maps
+            .interface_global_vars
+            .push(push_constant_uniform_block_var_id);
     }
-    entry_point_maps.interface_global_vars.push(push_constant_uniform_block_var_id);
 
     entry_point_maps
 }
