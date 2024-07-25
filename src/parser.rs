@@ -34,6 +34,11 @@ impl IndentContext {
     }
 }
 
+pub struct ParseStateSavepoint {
+    token_ptr: usize,
+    indent_context_stack: Vec<IndentContext>,
+}
+
 pub struct ParseState<'s> {
     pub token_list: Vec<Token<'s>>,
     pub token_ptr: usize,
@@ -46,6 +51,20 @@ impl<'s> ParseState<'s> {
             token_ptr: 0,
             indent_context_stack: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn save(&self) -> ParseStateSavepoint {
+        ParseStateSavepoint {
+            token_ptr: self.token_ptr,
+            indent_context_stack: self.indent_context_stack.clone(),
+        }
+    }
+
+    #[inline]
+    pub fn restore(&mut self, savepoint: ParseStateSavepoint) {
+        self.token_ptr = savepoint.token_ptr;
+        self.indent_context_stack = savepoint.indent_context_stack;
     }
 
     #[inline]
@@ -387,7 +406,7 @@ fn parse_struct_member<'s>(state: &mut ParseState<'s>) -> ParseResult<StructMemb
 pub struct StructDeclaration<'s> {
     pub decl_token: Token<'s>,
     pub name_token: Token<'s>,
-    pub with_token: Option<Token<'s>>,
+    pub members_starter_token: Option<Token<'s>>,
     pub member_list: Vec<StructMember<'s>>,
 }
 fn parse_struct_declaration<'s>(
@@ -395,16 +414,27 @@ fn parse_struct_declaration<'s>(
 ) -> Result<StructDeclaration<'s>, ParseError> {
     let decl_token = state.consume_keyword("struct")?.clone();
     let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
-    let Some(with_token) = state.consume_keyword("with").ok().cloned() else {
-        return Ok(StructDeclaration {
-            decl_token,
-            name_token,
-            with_token: None,
-            member_list: Vec::new(),
-        });
+    let members_starter_token;
+    match state.current_token() {
+        Some(t) if t.kind == TokenKind::Keyword && t.slice == "with" => {
+            members_starter_token = t.clone();
+            state.consume_token();
+        }
+        Some(t) if t.kind == TokenKind::Colon => {
+            members_starter_token = t.clone();
+            state.consume_token();
+        }
+        _ => {
+            return Ok(StructDeclaration {
+                decl_token,
+                name_token,
+                members_starter_token: None,
+                member_list: Vec::new(),
+            })
+        }
     };
 
-    state.push_indent_context(IndentContext::Exclusive(with_token.line_indent));
+    state.push_indent_context(IndentContext::Exclusive(members_starter_token.line_indent));
     let mut member_list = Vec::new();
     while state.check_indent_requirements() {
         member_list.push(parse_struct_member(state)?);
@@ -414,7 +444,7 @@ fn parse_struct_declaration<'s>(
     Ok(StructDeclaration {
         decl_token,
         name_token,
-        with_token: Some(with_token),
+        members_starter_token: Some(members_starter_token),
         member_list,
     })
 }
@@ -671,6 +701,12 @@ pub enum ExpressionNode<'s> {
     FuncallSingle(Box<ExpressionNode<'s>>, Box<ExpressionNode<'s>>),
     Number(Token<'s>),
     Var(Token<'s>),
+    StructValue {
+        ty: TypeSyntax<'s>,
+        open_brace_token: Token<'s>,
+        initializers: Vec<(Token<'s>, Token<'s>, ExpressionNode<'s>, Option<Token<'s>>)>,
+        close_brace_token: Token<'s>,
+    },
     Tuple(
         Token<'s>,
         Vec<(ExpressionNode<'s>, Option<Token<'s>>)>,
@@ -715,7 +751,12 @@ fn parse_block<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>
     Ok(ExpressionNode::Blocked(statements, Box::new(final_expr)))
 }
 fn parse_expression<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
-    parse_expression_if(state)
+    state.push_indent_context(IndentContext::Exclusive(
+        state.current_token().map_or(0, |t| t.line_indent),
+    ));
+    let res = parse_expression_if(state);
+    state.pop_indent_context();
+    res
 }
 fn parse_expression_if<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
     let Some(if_token) = state.consume_keyword("if").ok().cloned() else {
@@ -723,6 +764,7 @@ fn parse_expression_if<'s>(state: &mut ParseState<'s>) -> ParseResult<Expression
     };
     state.push_indent_context(IndentContext::Inclusive(if_token.line_indent));
 
+    state.require_in_block_next()?;
     let condition = parse_expression_logical_ops(state)?;
     let then_token = state.consume_in_block_keyword("then")?.clone();
     state.push_indent_context(IndentContext::Exclusive(then_token.line_indent));
@@ -752,7 +794,7 @@ fn parse_expression_if<'s>(state: &mut ParseState<'s>) -> ParseResult<Expression
 fn parse_expression_logical_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_compare_ops(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "||" => {
                 let op_token = t.clone();
@@ -766,14 +808,16 @@ fn parse_expression_logical_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<E
                 let right_expr = parse_expression_compare_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_compare_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_bitwise_ops(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "==" => {
                 let op_token = t.clone();
@@ -811,14 +855,16 @@ fn parse_expression_compare_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<E
                 let right_expr = parse_expression_bitwise_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_bitwise_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_arithmetic_ops_1(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "|" => {
                 let op_token = t.clone();
@@ -838,16 +884,18 @@ fn parse_expression_bitwise_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<E
                 let right_expr = parse_expression_arithmetic_ops_1(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_arithmetic_ops_1<'s>(
     state: &mut ParseState<'s>,
 ) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_arithmetic_ops_2(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "+" => {
                 let op_token = t.clone();
@@ -861,38 +909,61 @@ fn parse_expression_arithmetic_ops_1<'s>(
                 let right_expr = parse_expression_arithmetic_ops_2(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_arithmetic_ops_2<'s>(
     state: &mut ParseState<'s>,
 ) -> ParseResult<ExpressionNode<'s>> {
-    let mut expr = parse_expression_prefixed_ops(state)?;
+    let mut expr = parse_expression_arithmetic_ops_3(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "*" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_prefixed_ops(state)?;
+                let right_expr = parse_expression_arithmetic_ops_3(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::Op && t.slice == "/" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_prefixed_ops(state)?;
+                let right_expr = parse_expression_arithmetic_ops_3(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::Op && t.slice == "%" => {
                 let op_token = t.clone();
                 state.consume_token();
+                let right_expr = parse_expression_arithmetic_ops_3(state)?;
+                expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
+            }
+            _ => break,
+        }
+    }
+
+    Ok(expr)
+}
+fn parse_expression_arithmetic_ops_3<'s>(
+    state: &mut ParseState<'s>,
+) -> ParseResult<ExpressionNode<'s>> {
+    let mut expr = parse_expression_prefixed_ops(state)?;
+
+    while state.check_indent_requirements() {
+        match state.current_token() {
+            Some(t) if t.kind == TokenKind::Op && t.slice == "^^" => {
+                let op_token = t.clone();
+                state.consume_token();
                 let right_expr = parse_expression_prefixed_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_prefixed_ops<'s>(
     state: &mut ParseState<'s>,
@@ -934,7 +1005,7 @@ fn parse_expression_suffixed_ops<'s>(
 ) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_prime(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "." => {
                 let dot_token = t.clone();
@@ -971,24 +1042,30 @@ fn parse_expression_suffixed_ops<'s>(
                     close_parenthese_token,
                 }
             }
-            _ => {
-                break Ok(
-                    if let Ok(arg) = parse_expression_funcall_single_arg(state) {
-                        ExpressionNode::FuncallSingle(Box::new(expr), Box::new(arg))
-                    } else {
-                        expr
-                    },
-                );
+            _ if state.check_indent_requirements() => {
+                let save = state.save();
+                println!("funcall single: {:?}", state.current_token());
+                if let Ok(arg) = parse_expression_funcall_single_arg(state) {
+                    println!("funcall single ok");
+                    expr = ExpressionNode::FuncallSingle(Box::new(expr), Box::new(arg));
+                } else {
+                    println!("funcall single fail");
+                    state.restore(save);
+                }
+                break;
             }
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_funcall_single_arg<'s>(
     state: &mut ParseState<'s>,
 ) -> ParseResult<ExpressionNode<'s>> {
     let mut expr = parse_expression_prime(state)?;
 
-    loop {
+    while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "." => {
                 let dot_token = t.clone();
@@ -1025,9 +1102,11 @@ fn parse_expression_funcall_single_arg<'s>(
                     close_parenthese_token,
                 }
             }
-            _ => break Ok(expr),
+            _ => break,
         }
     }
+
+    Ok(expr)
 }
 fn parse_expression_prime<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
     match state.current_token() {
@@ -1039,6 +1118,47 @@ fn parse_expression_prime<'s>(state: &mut ParseState<'s>) -> ParseResult<Express
         }
         Some(t) if t.kind == TokenKind::Identifier => {
             let tok = t.clone();
+            'alt: {
+                let savepoint = state.save();
+
+                let Ok(ty) = parse_type(state) else {
+                    state.restore(savepoint);
+                    break 'alt;
+                };
+                let Ok(open_brace_token) = state.consume_by_kind(TokenKind::OpenBrace) else {
+                    state.restore(savepoint);
+                    break 'alt;
+                };
+                let open_brace_token = open_brace_token.clone();
+
+                let mut initializers = Vec::new();
+                let mut can_continue = true;
+                while state
+                    .current_token()
+                    .is_some_and(|t| t.kind != TokenKind::CloseBrace)
+                {
+                    if !can_continue {
+                        return Err(state.err(ParseErrorKind::ListNotPunctuated(TokenKind::Comma)));
+                    }
+
+                    let member_name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+                    let equal_token = state.consume_by_kind(TokenKind::Eq)?.clone();
+                    let init_value = parse_expression(state)?;
+                    let opt_comma_expr = state.consume_by_kind(TokenKind::Comma).ok().cloned();
+
+                    can_continue = opt_comma_expr.is_some();
+                    initializers.push((member_name_token, equal_token, init_value, opt_comma_expr));
+                }
+
+                let close_brace_token = state.consume_by_kind(TokenKind::CloseBrace)?.clone();
+
+                return Ok(ExpressionNode::StructValue {
+                    ty,
+                    open_brace_token,
+                    initializers,
+                    close_brace_token,
+                });
+            }
             state.consume_token();
 
             Ok(ExpressionNode::Var(tok))
@@ -1160,7 +1280,7 @@ impl<'s> Tokenizer<'s> {
         let double_byte_tok = if self.source.as_bytes().len() >= 2 {
             match &self.source.as_bytes()[..2] {
                 b"->" => Some(TokenKind::ArrowToRight),
-                b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" => Some(TokenKind::Op),
+                b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"^^" => Some(TokenKind::Op),
                 _ => None,
             }
         } else {
@@ -1185,6 +1305,8 @@ impl<'s> Tokenizer<'s> {
             b']' => Some(TokenKind::CloseBracket),
             b'(' => Some(TokenKind::OpenParenthese),
             b')' => Some(TokenKind::CloseParenthese),
+            b'{' => Some(TokenKind::OpenBrace),
+            b'}' => Some(TokenKind::CloseBrace),
             b'<' => Some(TokenKind::OpenAngleBracket),
             b'>' => Some(TokenKind::CloseAngleBracket),
             b',' => Some(TokenKind::Comma),
@@ -1305,6 +1427,8 @@ pub enum TokenKind {
     CloseParenthese,
     OpenAngleBracket,
     CloseAngleBracket,
+    OpenBrace,
+    CloseBrace,
     Comma,
     Colon,
     ArrowToRight,

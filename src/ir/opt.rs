@@ -500,6 +500,9 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::DistributeOutputTuple(x, _) => {
                     referenced_expr.insert(x);
                 }
+                &mut SimplifiedExpression::ConstructStructValue(ref xs) => {
+                    referenced_expr.extend(xs.iter().copied());
+                }
                 SimplifiedExpression::ScopedBlock {
                     ref mut expressions,
                     ref mut returning,

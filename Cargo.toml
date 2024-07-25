@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 bitflags = "2.6.0"
+clap = { version = "4.5.10", features = ["derive"] }
 typed-arena = "2.0.2"

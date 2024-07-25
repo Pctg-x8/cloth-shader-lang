@@ -1,5 +1,6 @@
 use std::{collections::HashSet, io::Write};
 
+use clap::Parser;
 use codegen::{
     emit_entry_point_spv_ops, emit_function_body_spv_ops, entrypoint::ShaderEntryPointDescription,
     SpvFunctionBodyEmissionContext, SpvModuleEmissionContext, SpvSectionLocalId,
@@ -34,8 +35,15 @@ mod source_ref;
 mod symbol;
 mod utils;
 
+#[derive(Parser)]
+pub struct Args {
+    pub file_name: std::path::PathBuf,
+}
+
 fn main() {
-    let src = std::fs::read_to_string("./sample_bloom_extract.csh").expect("Failed to load source");
+    let args = Args::parse();
+
+    let src = std::fs::read_to_string(&args.file_name).expect("Failed to load source");
     let mut tokenizer = Tokenizer::new(&src);
     let mut tokens = Vec::new();
     while let Some(t) = tokenizer.next_token().unwrap() {

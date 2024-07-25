@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use typed_arena::Arena;
 
 use crate::{
@@ -57,6 +59,7 @@ pub enum SimplifiedExpression<'a, 's> {
     ConstSInt(SourceRefSliceEq<'s>, ConstModifiers),
     ConstFloat(SourceRefSliceEq<'s>, ConstModifiers),
     ConstructTuple(Vec<ExprRef>),
+    ConstructStructValue(Vec<ExprRef>),
     ConstructIntrinsicComposite(IntrinsicType, Vec<ExprRef>),
     ScopedBlock {
         symbol_scope: PtrEq<'a, SymbolScope<'a, 's>>,
@@ -144,7 +147,8 @@ impl SimplifiedExpression<'_, '_> {
             }
             Self::ConstructTuple(ref mut xs)
             | Self::ConstructIntrinsicComposite(_, ref mut xs)
-            | Self::IntrinsicFuncall(_, _, ref mut xs) => {
+            | Self::IntrinsicFuncall(_, _, ref mut xs)
+            | Self::ConstructStructValue(ref mut xs) => {
                 let mut dirty = false;
                 for x in xs {
                     let x1 = x.0;
@@ -756,6 +760,41 @@ pub fn simplify_expression<'a, 's>(
             let ty = ConcreteType::Tuple(xs_types);
             (
                 ctx.add(SimplifiedExpression::ConstructTuple(xs), ty.clone()),
+                ty,
+            )
+        }
+        ExpressionNode::StructValue {
+            ty,
+            mut initializers,
+            ..
+        } => {
+            let ty = ConcreteType::build(symbol_scope, &HashSet::new(), ty.clone())
+                .instantiate(symbol_scope);
+            let ConcreteType::Struct(ref members) = ty else {
+                panic!("Error: cannot construct a structure of this type");
+            };
+
+            let initializers = members
+                .iter()
+                .map(|m| {
+                    let initializer_pos = initializers
+                        .iter()
+                        .position(|i| i.0.slice == m.name.0.slice)
+                        .expect("initializers have extra member");
+                    let initializer = initializers.remove(initializer_pos);
+                    let (ix, it) = simplify_expression(initializer.2, ctx, symbol_scope);
+                    if it != m.ty {
+                        panic!("initializer value type mismatched with member type");
+                    }
+
+                    ix
+                })
+                .collect::<Vec<_>>();
+            (
+                ctx.add(
+                    SimplifiedExpression::ConstructStructValue(initializers),
+                    ty.clone(),
+                ),
                 ty,
             )
         }
