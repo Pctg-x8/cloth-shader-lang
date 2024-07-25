@@ -225,6 +225,39 @@ pub enum Constant {
         result_type: Type,
     },
 }
+impl Constant {
+    #[inline]
+    pub fn i32vec2(x: i32, y: i32) -> Self {
+        Self::Composite {
+            result_type: Type::sint(32).of_vector(2),
+            constituents: vec![x.into(), y.into()],
+        }
+    }
+}
+impl From<u32> for Constant {
+    fn from(value: u32) -> Self {
+        Self::Constant {
+            result_type: Type::uint(32),
+            value_bits: value,
+        }
+    }
+}
+impl From<i32> for Constant {
+    fn from(value: i32) -> Self {
+        Self::Constant {
+            result_type: Type::sint(32),
+            value_bits: unsafe { core::mem::transmute(value) },
+        }
+    }
+}
+impl From<f32> for Constant {
+    fn from(value: f32) -> Self {
+        Self::Constant {
+            result_type: Type::float(32),
+            value_bits: unsafe { core::mem::transmute(value) },
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum TypeArrayLength {
@@ -234,7 +267,6 @@ pub enum TypeArrayLength {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct TypeStructMember {
-    pub offset: u32,
     pub ty: Type,
     pub decorations: Vec<Decorate>,
 }
@@ -310,6 +342,55 @@ impl Type {
             sampled: TypeImageSampled::WithReadWriteOps,
             image_format: ImageFormat::Unknown,
             access_qualifier: None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn sint(width: u32) -> Self {
+        Self::Int {
+            width,
+            signedness: true,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn uint(width: u32) -> Self {
+        Self::Int {
+            width,
+            signedness: false,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn float(width: u32) -> Self {
+        Self::Float { width }
+    }
+
+    #[inline(always)]
+    pub fn of_vector(self, component_count: u32) -> Self {
+        if component_count == 1 {
+            self
+        } else {
+            Self::Vector {
+                component_type: Box::new(self),
+                component_count,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn of_matrix(self, row_count: u32, column_count: u32) -> Self {
+        Self::Matrix {
+            column_type: Box::new(self.of_vector(row_count)),
+            column_count,
+        }
+    }
+
+    #[inline(always)]
+    pub fn of_pointer(self, storage: StorageClass) -> Self {
+        Self::Pointer {
+            storage_class: storage,
+            base_type: Box::new(self),
         }
     }
 }

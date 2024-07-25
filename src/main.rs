@@ -339,18 +339,20 @@ fn main() {
     });
     for (n, f) in top_scope.user_defined_function_body.0.borrow().iter() {
         let entry_point_maps = emit_entry_point_spv_ops(&entry_points[n], &mut spv_context);
-        let mut body_context = SpvFunctionBodyEmissionContext::new(entry_point_maps);
+        let mut body_context =
+            SpvFunctionBodyEmissionContext::new(&mut spv_context, entry_point_maps);
         let main_label_id = body_context.new_id();
         body_context.ops.push(spv::Instruction::Label {
             result: main_label_id,
         });
-        emit_function_body_spv_ops(
-            &f.expressions,
-            f.returning,
-            &mut spv_context,
-            &mut body_context,
-        );
+        emit_function_body_spv_ops(&f.expressions, f.returning, &mut body_context);
         body_context.ops.push(spv::Instruction::Return);
+        let SpvFunctionBodyEmissionContext {
+            latest_id: body_latest_id,
+            ops: body_ops,
+            entry_point_maps,
+            ..
+        } = body_context;
 
         let fn_result_ty = spv_context.request_type_id(spv::Type::Void);
         let fnty = spv_context.request_type_id(spv::Type::Function {
@@ -365,10 +367,10 @@ fn main() {
             function_type: fnty,
         });
         let fnid_offset = spv_context.latest_function_id;
-        spv_context.latest_function_id += body_context.latest_id;
+        spv_context.latest_function_id += body_latest_id;
         spv_context
             .function_ops
-            .extend(body_context.ops.into_iter().map(|x| {
+            .extend(body_ops.into_iter().map(|x| {
                 x.relocate(|id| match id {
                     SpvSectionLocalId::CurrentFunction(x) => {
                         SpvSectionLocalId::Function(x + fnid_offset)
@@ -383,8 +385,7 @@ fn main() {
                 execution_model: entry_points[n].execution_model,
                 entry_point: fnid,
                 name: (*n).into(),
-                interface: body_context
-                    .entry_point_maps
+                interface: entry_point_maps
                     .interface_global_vars
                     .iter()
                     .copied()
@@ -625,9 +626,8 @@ fn process_entry_point_inputs<'s>(
                                     .expect("this type cannot be a member of an uniform struct");
 
                             Some(spv::TypeStructMember {
-                                offset: offset as _,
                                 ty: x.ty.make_spv_type(scope),
-                                decorations: Vec::new(),
+                                decorations: vec![spv::Decorate::Offset(offset as _)],
                             })
                         })
                         .collect(),
@@ -791,15 +791,20 @@ pub enum SpvSectionLocalId {
     CurrentFunction(spv::Id),
 }
 
-pub struct SpvFunctionBodyEmissionContext<'s> {
+pub struct SpvFunctionBodyEmissionContext<'s, 'm> {
+    pub module_ctx: &'m mut SpvModuleEmissionContext,
     pub entry_point_maps: ShaderEntryPointMaps<'s>,
     pub ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub latest_id: spv::Id,
     pub emitted_expression_id: HashMap<usize, Option<(SpvSectionLocalId, spv::Type)>>,
 }
-impl<'s> SpvFunctionBodyEmissionContext<'s> {
-    pub fn new(maps: ShaderEntryPointMaps<'s>) -> Self {
+impl<'s, 'm> SpvFunctionBodyEmissionContext<'s, 'm> {
+    pub fn new(
+        module_ctx: &'m mut SpvModuleEmissionContext,
+        maps: ShaderEntryPointMaps<'s>,
+    ) -> Self {
         Self {
+            module_ctx,
             entry_point_maps: maps,
             ops: Vec::new(),
             latest_id: 0,
@@ -811,6 +816,658 @@ impl<'s> SpvFunctionBodyEmissionContext<'s> {
         self.latest_id += 1;
 
         SpvSectionLocalId::CurrentFunction(self.latest_id - 1)
+    }
+
+    #[inline(always)]
+    fn issue_typed_ids(&mut self, ty: spv::Type) -> (SpvSectionLocalId, SpvSectionLocalId) {
+        (self.module_ctx.request_type_id(ty), self.new_id())
+    }
+
+    #[inline]
+    pub fn select(
+        &mut self,
+        output_type: spv::Type,
+        condition: SpvSectionLocalId,
+        object1: SpvSectionLocalId,
+        object2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let (result_type, result) = self.issue_typed_ids(output_type.clone());
+        self.ops.push(spv::Instruction::Select {
+            result_type,
+            result,
+            condition,
+            object1,
+            object2,
+        });
+        (result, output_type)
+    }
+
+    #[inline]
+    pub fn log_and(
+        &mut self,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::LogicalAnd {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn log_or(
+        &mut self,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::LogicalOr {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn equal(
+        &mut self,
+        operand_class: EqCompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            EqCompareOperandClass::Bool => spv::Instruction::LogicalEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            EqCompareOperandClass::Int => spv::Instruction::IEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            EqCompareOperandClass::Float => spv::Instruction::FOrdEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn not_equal(
+        &mut self,
+        operand_class: EqCompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            EqCompareOperandClass::Bool => spv::Instruction::LogicalNotEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            EqCompareOperandClass::Int => spv::Instruction::INotEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            EqCompareOperandClass::Float => spv::Instruction::FOrdNotEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn less_than(
+        &mut self,
+        operand_class: CompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            CompareOperandClass::SInt => spv::Instruction::SLessThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::UInt => spv::Instruction::ULessThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::Float => spv::Instruction::FOrdLessThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn less_than_eq(
+        &mut self,
+        operand_class: CompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            CompareOperandClass::SInt => spv::Instruction::SLessThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::UInt => spv::Instruction::ULessThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::Float => spv::Instruction::FOrdLessThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn greater_than(
+        &mut self,
+        operand_class: CompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            CompareOperandClass::SInt => spv::Instruction::SGreaterThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::UInt => spv::Instruction::UGreaterThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::Float => spv::Instruction::FOrdGreaterThan {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn greater_than_eq(
+        &mut self,
+        operand_class: CompareOperandClass,
+        component_count: u32,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::Bool.of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        let op = match operand_class {
+            CompareOperandClass::SInt => spv::Instruction::SGreaterThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::UInt => spv::Instruction::UGreaterThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+            CompareOperandClass::Float => spv::Instruction::FOrdGreaterThanEqual {
+                result_type,
+                result,
+                operand1,
+                operand2,
+            },
+        };
+        self.ops.push(op);
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn iadd(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::IAdd {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn fadd(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FAdd {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn isub(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::ISub {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn fsub(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FSub {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn imul(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::IMul {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn fmul(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FMul {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn sdiv(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::SDiv {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn udiv(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::UDiv {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn fdiv(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FDiv {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn srem(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::SRem {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn umod(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::UMod {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn frem(
+        &mut self,
+        output_ty: spv::Type,
+        operand1: SpvSectionLocalId,
+        operand2: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FRem {
+            result_type,
+            result,
+            operand1,
+            operand2,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn convert_sint_to_float(
+        &mut self,
+        component_count: u32,
+        input: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::float(32).of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::ConvertSToF {
+            result_type,
+            result,
+            signed_value: input,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn convert_uint_to_float(
+        &mut self,
+        component_count: u32,
+        input: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::float(32).of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::ConvertUToF {
+            result_type,
+            result,
+            unsigned_value: input,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn convert_float_to_sint(
+        &mut self,
+        component_count: u32,
+        input: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::sint(32).of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::ConvertFToS {
+            result_type,
+            result,
+            float_value: input,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn convert_float_to_uint(
+        &mut self,
+        component_count: u32,
+        input: SpvSectionLocalId,
+    ) -> (SpvSectionLocalId, spv::Type) {
+        let rt = spv::Type::uint(32).of_vector(component_count);
+        let (result_type, result) = self.issue_typed_ids(rt.clone());
+        self.ops.push(spv::Instruction::ConvertFToU {
+            result_type,
+            result,
+            float_value: input,
+        });
+        (result, rt)
+    }
+
+    #[inline]
+    pub fn composite_extract(
+        &mut self,
+        output_type: spv::Type,
+        source: SpvSectionLocalId,
+        indices: Vec<u32>,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_type);
+        self.ops.push(spv::Instruction::CompositeExtract {
+            result_type,
+            result,
+            composite: source,
+            indexes: indices,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn vector_shuffle_1(
+        &mut self,
+        output_type: spv::Type,
+        source: SpvSectionLocalId,
+        components: Vec<u32>,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_type);
+        self.ops.push(spv::Instruction::VectorShuffle {
+            result_type,
+            result,
+            vector1: source,
+            vector2: source,
+            components,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn load(
+        &mut self,
+        output_type: spv::Type,
+        pointer: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_type);
+        self.ops.push(spv::Instruction::Load {
+            result_type,
+            result,
+            pointer,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn access_chain(
+        &mut self,
+        output_type: spv::Type,
+        root_ptr: SpvSectionLocalId,
+        indices: Vec<SpvSectionLocalId>,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_type);
+        self.ops.push(spv::Instruction::AccessChain {
+            result_type,
+            result,
+            base: root_ptr,
+            indexes: indices,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn chained_load(
+        &mut self,
+        output_type: spv::Type,
+        storage_class: spv::StorageClass,
+        root_ptr: SpvSectionLocalId,
+        indices: Vec<SpvSectionLocalId>,
+    ) -> SpvSectionLocalId {
+        let ptr = self.access_chain(
+            output_type.clone().of_pointer(storage_class),
+            root_ptr,
+            indices,
+        );
+        self.load(output_type, ptr)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum EqCompareOperandClass {
+    Bool,
+    Int,
+    Float,
+}
+impl EqCompareOperandClass {
+    pub const fn of(t: &spv::Type) -> Self {
+        match t {
+            spv::Type::Bool => Self::Bool,
+            spv::Type::Int { .. } => Self::Int,
+            spv::Type::Float { .. } => Self::Float,
+            _ => unreachable!(),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub enum CompareOperandClass {
+    UInt,
+    SInt,
+    Float,
+}
+impl CompareOperandClass {
+    pub const fn of(t: &spv::Type) -> Self {
+        match t {
+            spv::Type::Int {
+                signedness: true, ..
+            } => Self::SInt,
+            spv::Type::Int {
+                signedness: false, ..
+            } => Self::UInt,
+            spv::Type::Float { .. } => Self::Float,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -839,153 +1496,60 @@ fn emit_entry_point_spv_ops<'s>(
     };
 
     for a in ep.output_variables.iter() {
-        let type_id = ctx.request_type_id(spv::Type::Pointer {
-            storage_class: spv::StorageClass::Output,
-            base_type: Box::new(a.ty.clone()),
-        });
-        let gvid = ctx.new_global_variable_id();
-        ctx.global_variable_ops.push(spv::Instruction::Variable {
-            result_type: type_id,
-            result: gvid,
-            storage_class: spv::StorageClass::Output,
-            initializer: None,
-        });
-        ctx.annotation_ops
-            .extend(a.decorations.iter().map(|d| match d {
-                spv::Decorate::Location(loc) => spv::Instruction::Decorate {
-                    target: gvid,
-                    decoration: spv::Decoration::Location,
-                    args: vec![*loc],
-                },
-                spv::Decorate::Builtin(b) => spv::Instruction::Decorate {
-                    target: gvid,
-                    decoration: spv::Decoration::Builtin,
-                    args: vec![*b as _],
-                },
-                _ => unimplemented!(),
-            }));
+        let gvid = ctx.declare_global_variable(a.ty.clone(), spv::StorageClass::Output);
+        ctx.decorate(gvid, &a.decorations);
+
         entry_point_maps.output_global_vars.push(gvid);
         entry_point_maps.interface_global_vars.push(gvid);
     }
 
     for a in ep.input_variables.iter() {
-        let type_id = ctx.request_type_id(spv::Type::Pointer {
-            storage_class: spv::StorageClass::Input,
-            base_type: Box::new(a.ty.clone()),
-        });
-        let result_id = ctx.new_global_variable_id();
+        let vid = ctx.declare_global_variable(a.ty.clone(), spv::StorageClass::Input);
+        ctx.decorate(vid, &a.decorations);
 
-        ctx.global_variable_ops.push(spv::Instruction::Variable {
-            result_type: type_id,
-            result: result_id,
-            storage_class: spv::StorageClass::Input,
-            initializer: None,
-        });
         entry_point_maps.refpath_to_global_var.insert(
             a.original_refpath.clone(),
-            GlobalAccessType::Direct(result_id, a.ty.clone()),
+            GlobalAccessType::Direct(vid, a.ty.clone()),
         );
-        entry_point_maps.interface_global_vars.push(result_id);
-        ctx.annotation_ops
-            .extend(a.decorations.iter().map(|d| match d {
-                spv::Decorate::Location(loc) => spv::Instruction::Decorate {
-                    target: result_id,
-                    decoration: spv::Decoration::Location,
-                    args: vec![*loc],
-                },
-                spv::Decorate::Builtin(b) => spv::Instruction::Decorate {
-                    target: result_id,
-                    decoration: spv::Decoration::Builtin,
-                    args: vec![*b as _],
-                },
-                _ => unimplemented!(),
-            }));
+        entry_point_maps.interface_global_vars.push(vid);
     }
 
     for a in ep.uniform_variables.iter() {
-        let type_id = ctx.request_type_id(spv::Type::Pointer {
-            storage_class: spv::StorageClass::Uniform,
-            base_type: Box::new(a.ty.clone()),
-        });
-        let result_id = ctx.new_global_variable_id();
+        let vid = ctx.declare_global_variable(a.ty.clone(), spv::StorageClass::Uniform);
+        ctx.decorate(vid, &a.decorations);
 
-        ctx.global_variable_ops.push(spv::Instruction::Variable {
-            result_type: type_id,
-            result: result_id,
-            storage_class: spv::StorageClass::Uniform,
-            initializer: None,
-        });
         entry_point_maps.refpath_to_global_var.insert(
             a.original_refpath.clone(),
-            GlobalAccessType::Direct(result_id, a.ty.clone()),
+            GlobalAccessType::Direct(vid, a.ty.clone()),
         );
-        entry_point_maps.interface_global_vars.push(result_id);
-        ctx.annotation_ops
-            .extend(a.decorations.iter().map(|d| match d {
-                spv::Decorate::DescriptorSet(loc) => spv::Instruction::Decorate {
-                    target: result_id,
-                    decoration: spv::Decoration::DescriptorSet,
-                    args: vec![*loc],
-                },
-                spv::Decorate::Binding(b) => spv::Instruction::Decorate {
-                    target: result_id,
-                    decoration: spv::Decoration::Binding,
-                    args: vec![*b],
-                },
-                spv::Decorate::InputAttachmentIndex(b) => spv::Instruction::Decorate {
-                    target: result_id,
-                    decoration: spv::Decoration::InputAttachmentIndex,
-                    args: vec![*b],
-                },
-                _ => unimplemented!(),
-            }));
+        entry_point_maps.interface_global_vars.push(vid);
     }
 
     if !ep.push_constant_variables.is_empty() {
-        let push_constant_uniform_block = spv::Type::Struct {
+        let block_ty = spv::Type::Struct {
             member_types: ep
                 .push_constant_variables
                 .iter()
                 .map(|x| spv::TypeStructMember {
-                    offset: x.offset,
                     ty: x.ty.clone(),
                     decorations: vec![spv::Decorate::Offset(x.offset)],
                 })
                 .collect(),
         };
-        let push_constant_uniform_block_tid =
-            ctx.request_type_id(push_constant_uniform_block.clone());
-        let push_constant_uniform_block_var_type = spv::Type::Pointer {
-            storage_class: spv::StorageClass::PushConstant,
-            base_type: Box::new(push_constant_uniform_block.clone()),
-        };
-        let push_constant_uniform_block_var_tid =
-            ctx.request_type_id(push_constant_uniform_block_var_type);
-        let push_constant_uniform_block_var_id = ctx.new_global_variable_id();
-        ctx.global_variable_ops.push(spv::Instruction::Variable {
-            result_type: push_constant_uniform_block_var_tid,
-            result: push_constant_uniform_block_var_id,
-            storage_class: spv::StorageClass::PushConstant,
-            initializer: None,
-        });
-        ctx.annotation_ops.push(spv::Instruction::Decorate {
-            target: push_constant_uniform_block_tid,
-            decoration: spv::Decoration::Block,
-            args: vec![],
-        });
+        let block_tid = ctx.request_type_id(block_ty.clone());
+        ctx.decorate(block_tid, &[spv::Decorate::Block]);
+        let block_var = ctx.declare_global_variable(block_ty, spv::StorageClass::PushConstant);
         for (n, a) in ep.push_constant_variables.iter().enumerate() {
             entry_point_maps.refpath_to_global_var.insert(
                 a.original_refpath.clone(),
                 GlobalAccessType::PushConstantStruct {
-                    struct_var: push_constant_uniform_block_var_id,
+                    struct_var: block_var,
                     member_index: n as _,
                     member_ty: a.ty.clone(),
                 },
             );
         }
-        entry_point_maps
-            .interface_global_vars
-            .push(push_constant_uniform_block_var_id);
+        entry_point_maps.interface_global_vars.push(block_var);
     }
 
     entry_point_maps
@@ -994,16 +1558,14 @@ fn emit_entry_point_spv_ops<'s>(
 fn emit_function_body_spv_ops(
     body: &[(SimplifiedExpression, ConcreteType)],
     returning: ExprRef,
-    module_ctx: &mut SpvModuleEmissionContext,
     ctx: &mut SpvFunctionBodyEmissionContext,
 ) {
-    let _ = emit_expr_spv_ops(body, returning.0, module_ctx, ctx);
+    let _ = emit_expr_spv_ops(body, returning.0, ctx);
 }
 
 fn emit_expr_spv_ops(
     body: &[(SimplifiedExpression, ConcreteType)],
     expr_id: usize,
-    module_ctx: &mut SpvModuleEmissionContext,
     ctx: &mut SpvFunctionBodyEmissionContext,
 ) -> Option<(SpvSectionLocalId, spv::Type)> {
     if let Some(r) = ctx.emitted_expression_id.get(&expr_id) {
@@ -1012,7 +1574,7 @@ fn emit_expr_spv_ops(
 
     let result = match &body[expr_id].0 {
         SimplifiedExpression::Select(c, t, e) => {
-            let (c, ct) = emit_expr_spv_ops(body, c.0, module_ctx, ctx).unwrap();
+            let (c, ct) = emit_expr_spv_ops(body, c.0, ctx).unwrap();
 
             let requires_control_flow_branching = ct != spv::Type::Bool
                 || matches!(
@@ -1025,46 +1587,34 @@ fn emit_expr_spv_ops(
                 // impure select
                 unimplemented!("Control Flow Branching strategy");
             } else {
-                let (t, tt) = emit_expr_spv_ops(body, t.0, module_ctx, ctx).unwrap();
-                let (e, et) = emit_expr_spv_ops(body, e.0, module_ctx, ctx).unwrap();
+                let (t, tt) = emit_expr_spv_ops(body, t.0, ctx).unwrap();
+                let (e, et) = emit_expr_spv_ops(body, e.0, ctx).unwrap();
                 assert_eq!(tt, et);
 
-                let result_type = module_ctx.request_type_id(tt.clone());
-                let result_id = ctx.new_id();
-                ctx.ops.push(spv::Instruction::Select {
-                    result_type,
-                    result: result_id,
-                    condition: c,
-                    object1: t,
-                    object2: e,
-                });
-                Some((result_id, tt.clone()))
+                Some(ctx.select(tt.clone(), c, t, e))
             }
         }
         SimplifiedExpression::ConstructIntrinsicComposite(it, args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|&x| emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap())
+                .map(|&x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
                 .unzip();
 
             match it {
                 IntrinsicType::Float4 => {
                     assert_eq!(args.len(), 4);
-                    assert!(arg_ty.iter().all(|x| *x == spv::Type::Float { width: 32 }));
+                    assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
 
-                    let result_ty = spv::Type::Vector {
-                        component_type: Box::new(spv::Type::Float { width: 32 }),
-                        component_count: 4,
-                    };
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
+                    let rt = spv::Type::float(32).of_vector(4);
+                    let result_type = ctx.module_ctx.request_type_id(rt.clone());
                     let is_constant = args
                         .iter()
                         .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
 
                     let result_id;
                     if is_constant {
-                        result_id = module_ctx.new_type_const_id();
-                        module_ctx
+                        result_id = ctx.module_ctx.new_type_const_id();
+                        ctx.module_ctx
                             .type_const_ops
                             .push(spv::Instruction::ConstantComposite {
                                 result_type,
@@ -1080,1647 +1630,500 @@ fn emit_expr_spv_ops(
                         });
                     };
 
-                    Some((result_id, result_ty))
+                    Some((result_id, rt))
                 }
                 _ => unimplemented!("Composite construction for {it:?}"),
             }
         }
         SimplifiedExpression::LogAnd(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-            assert_eq!(lt, spv::Type::Bool);
 
-            let result_type = module_ctx.request_type_id(spv::Type::Bool);
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::LogicalAnd {
-                result_type,
-                result: result_id,
-                operand1: l,
-                operand2: r,
-            });
-            Some((result_id, spv::Type::Bool))
+            let component_count = match lt {
+                spv::Type::Bool => 1,
+                spv::Type::Vector {
+                    component_type,
+                    component_count,
+                } => match *component_type {
+                    spv::Type::Bool => component_count,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            Some(ctx.log_and(component_count, l, r))
         }
         SimplifiedExpression::LogOr(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-            assert_eq!(lt, spv::Type::Bool);
 
-            let result_type = module_ctx.request_type_id(spv::Type::Bool);
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::LogicalOr {
+            let component_count = match lt {
+                spv::Type::Bool => 1,
+                spv::Type::Vector {
+                    component_type,
+                    component_count,
+                } => match *component_type {
+                    spv::Type::Bool => component_count,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            Some(ctx.log_or(component_count, l, r))
+        }
+        SimplifiedExpression::Eq(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (EqCompareOperandClass::of(component_type), component_count),
+                ref x => (EqCompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.equal(cls, cc, l, r))
+        }
+        SimplifiedExpression::Ne(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (EqCompareOperandClass::of(component_type), component_count),
+                ref x => (EqCompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.not_equal(cls, cc, l, r))
+        }
+        SimplifiedExpression::Lt(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (CompareOperandClass::of(component_type), component_count),
+                ref x => (CompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.less_than(cls, cc, l, r))
+        }
+        SimplifiedExpression::Le(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (CompareOperandClass::of(component_type), component_count),
+                ref x => (CompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.less_than_eq(cls, cc, l, r))
+        }
+        SimplifiedExpression::Gt(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (CompareOperandClass::of(component_type), component_count),
+                ref x => (CompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.greater_than(cls, cc, l, r))
+        }
+        SimplifiedExpression::Ge(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let (cls, cc) = match lt {
+                spv::Type::Vector {
+                    ref component_type,
+                    component_count,
+                } => (CompareOperandClass::of(component_type), component_count),
+                ref x => (CompareOperandClass::of(x), 1),
+            };
+
+            Some(ctx.greater_than_eq(cls, cc, l, r))
+        }
+        SimplifiedExpression::BitAnd(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+            assert!(
+                matches!(lt, spv::Type::Int { .. })
+                    || matches!(lt, spv::Type::Vector { ref component_type, .. } if matches!(&**component_type, spv::Type::Int {..}))
+            );
+
+            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+            ctx.ops.push(spv::Instruction::BitwiseAnd {
                 result_type,
-                result: result_id,
+                result,
                 operand1: l,
                 operand2: r,
             });
-            Some((result_id, spv::Type::Bool))
-        }
-        SimplifiedExpression::Eq(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Bool => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::LogicalEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::IEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Bool => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::LogicalEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::IEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::Ne(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Bool => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::LogicalNotEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::INotEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdNotEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Bool => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::LogicalNotEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::INotEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdNotEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::Lt(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Int {
-                    signedness: true, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SLessThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int {
-                    signedness: false, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ULessThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdLessThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int {
-                        signedness: true, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SLessThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int {
-                        signedness: false, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ULessThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdLessThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::Le(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Int {
-                    signedness: true, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SLessThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int {
-                    signedness: false, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ULessThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdLessThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int {
-                        signedness: true, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SLessThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int {
-                        signedness: false, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ULessThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdLessThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::Gt(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Int {
-                    signedness: true, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SGreaterThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int {
-                    signedness: false, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::UGreaterThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdGreaterThan {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int {
-                        signedness: true, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SGreaterThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int {
-                        signedness: false, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::UGreaterThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdGreaterThan {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::Ge(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Int {
-                    signedness: true, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SGreaterThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Int {
-                    signedness: false, ..
-                } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::UGreaterThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Float { .. } => {
-                    let result_ty = spv::Type::Bool;
-                    let result_type = module_ctx.request_type_id(result_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FOrdGreaterThanEqual {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, result_ty))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int {
-                        signedness: true, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SGreaterThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Int {
-                        signedness: false, ..
-                    } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::UGreaterThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    spv::Type::Float { .. } => {
-                        let result_ty = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Bool),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(result_ty.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FOrdGreaterThanEqual {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, result_ty))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
-        }
-        SimplifiedExpression::BitAnd(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::BitwiseAnd {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::BitwiseAnd {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
+            Some((result, lt))
         }
         SimplifiedExpression::BitOr(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
+            assert!(
+                matches!(lt, spv::Type::Int { .. })
+                    || matches!(lt, spv::Type::Vector { ref component_type, .. } if matches!(&**component_type, spv::Type::Int {..}))
+            );
 
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::BitwiseOr {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::BitwiseOr {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
+            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+            ctx.ops.push(spv::Instruction::BitwiseOr {
+                result_type,
+                result,
+                operand1: l,
+                operand2: r,
+            });
+            Some((result, lt))
         }
         SimplifiedExpression::BitXor(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
+            assert!(
+                matches!(lt, spv::Type::Int { .. })
+                    || matches!(lt, spv::Type::Vector { ref component_type, .. } if matches!(&**component_type, spv::Type::Int {..}))
+            );
 
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::BitwiseXor {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::BitwiseXor {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            }
+            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+            ctx.ops.push(spv::Instruction::BitwiseXor {
+                result_type,
+                result,
+                operand1: l,
+                operand2: r,
+            });
+            Some((result, lt))
         }
         SimplifiedExpression::Add(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
 
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::IAdd {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Float { width } => {
-                    let rt = spv::Type::Float { width };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FAdd {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::IAdd {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    spv::Type::Float { width } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FAdd {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+            Some((
+                match lt {
+                    spv::Type::Int { .. } => ctx.iadd(lt.clone(), l, r),
+                    spv::Type::Float { .. } => ctx.fadd(lt.clone(), l, r),
+                    spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        spv::Type::Int { .. } => ctx.iadd(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.fadd(lt.clone(), l, r),
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 },
-                _ => unreachable!(),
-            }
+                lt,
+            ))
         }
         SimplifiedExpression::Sub(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
 
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ISub {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Float { width } => {
-                    let rt = spv::Type::Float { width };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FSub {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ISub {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    spv::Type::Float { width } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FSub {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+            Some((
+                match lt {
+                    spv::Type::Int { .. } => ctx.isub(lt.clone(), l, r),
+                    spv::Type::Float { .. } => ctx.fsub(lt.clone(), l, r),
+                    spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        spv::Type::Int { .. } => ctx.isub(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.fsub(lt.clone(), l, r),
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 },
-                _ => unreachable!(),
-            }
+                lt,
+            ))
         }
         SimplifiedExpression::Mul(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
 
-            match lt {
-                spv::Type::Int { width, signedness } => {
-                    let rt = spv::Type::Int { width, signedness };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::IMul {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Float { width } => {
-                    let rt = spv::Type::Float { width };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FMul {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
-                    spv::Type::Int { width, signedness } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int { width, signedness }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::IMul {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    spv::Type::Float { width } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FMul {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+            Some((
+                match lt {
+                    spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
+                    spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+                    spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 },
-                _ => unreachable!(),
-            }
+                lt,
+            ))
         }
         SimplifiedExpression::Div(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
 
-            match lt {
-                spv::Type::Int {
-                    width,
-                    signedness: true,
-                } => {
-                    let rt = spv::Type::Int {
-                        width,
-                        signedness: true,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SDiv {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Int {
-                    width,
-                    signedness: false,
-                } => {
-                    let rt = spv::Type::Int {
-                        width,
-                        signedness: false,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::UDiv {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Float { width } => {
-                    let rt = spv::Type::Float { width };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FDiv {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Vector {
-                    component_type,
-                    component_count,
-                } => match *component_type {
+            Some((
+                match lt {
                     spv::Type::Int {
-                        width,
-                        signedness: true,
-                    } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width,
-                                signedness: true,
-                            }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SDiv {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+                        signedness: true, ..
+                    } => ctx.sdiv(lt.clone(), l, r),
                     spv::Type::Int {
-                        width,
-                        signedness: false,
-                    } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width,
-                                signedness: false,
-                            }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::UDiv {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    spv::Type::Float { width } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FDiv {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+                        signedness: false, ..
+                    } => ctx.udiv(lt.clone(), l, r),
+                    spv::Type::Float { .. } => ctx.fdiv(lt.clone(), l, r),
+                    spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        spv::Type::Int {
+                            signedness: true, ..
+                        } => ctx.sdiv(lt.clone(), l, r),
+                        spv::Type::Int {
+                            signedness: false, ..
+                        } => ctx.udiv(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.fdiv(lt.clone(), l, r),
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 },
-                _ => unreachable!(),
-            }
+                lt,
+            ))
         }
         SimplifiedExpression::Rem(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, module_ctx, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, module_ctx, ctx).unwrap();
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
 
-            match lt {
+            Some((
+                match lt {
+                    spv::Type::Int {
+                        signedness: true, ..
+                    } => ctx.srem(lt.clone(), l, r),
+                    spv::Type::Int {
+                        signedness: false, ..
+                    } => ctx.umod(lt.clone(), l, r),
+                    spv::Type::Float { .. } => ctx.frem(lt.clone(), l, r),
+                    spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        spv::Type::Int {
+                            signedness: true, ..
+                        } => ctx.srem(lt.clone(), l, r),
+                        spv::Type::Int {
+                            signedness: false, ..
+                        } => ctx.umod(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.frem(lt.clone(), l, r),
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                lt,
+            ))
+        }
+        SimplifiedExpression::Cast(x, t) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+
+            Some(match xt {
                 spv::Type::Int {
-                    width,
+                    width: 32,
                     signedness: true,
-                } => {
-                    let rt = spv::Type::Int {
-                        width,
-                        signedness: true,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::SRem {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
+                } => match t {
+                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
+                        ctx.convert_sint_to_float(1, x)
+                    }
+                    _ => unreachable!(),
+                },
                 spv::Type::Int {
-                    width,
+                    width: 32,
                     signedness: false,
-                } => {
-                    let rt = spv::Type::Int {
-                        width,
-                        signedness: false,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::UMod {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
-                spv::Type::Float { width } => {
-                    let rt = spv::Type::Float { width };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::FRem {
-                        result_type,
-                        result: result_id,
-                        operand1: l,
-                        operand2: r,
-                    });
-                    Some((result_id, rt))
-                }
+                } => match t {
+                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
+                        ctx.convert_uint_to_float(1, x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Float { width: 32 } => match t {
+                    ConcreteType::Intrinsic(IntrinsicType::SInt) => ctx.convert_float_to_sint(1, x),
+                    ConcreteType::Intrinsic(IntrinsicType::UInt) => ctx.convert_float_to_uint(1, x),
+                    _ => unreachable!(),
+                },
                 spv::Type::Vector {
                     component_type,
-                    component_count,
+                    component_count: 2,
                 } => match *component_type {
                     spv::Type::Int {
-                        width,
+                        width: 32,
                         signedness: true,
-                    } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width,
-                                signedness: true,
-                            }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::SRem {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float2) => {
+                            ctx.convert_sint_to_float(2, x)
+                        }
+                        _ => unreachable!(),
+                    },
                     spv::Type::Int {
-                        width,
+                        width: 32,
                         signedness: false,
-                    } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width,
-                                signedness: false,
-                            }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::UMod {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
-                    spv::Type::Float { width } => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width }),
-                            component_count,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::FRem {
-                            result_type,
-                            result: result_id,
-                            operand1: l,
-                            operand2: r,
-                        });
-                        Some((result_id, rt))
-                    }
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float2) => {
+                            ctx.convert_uint_to_float(2, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    spv::Type::Float { width: 32 } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::SInt2) => {
+                            ctx.convert_float_to_sint(2, x)
+                        }
+                        ConcreteType::Intrinsic(IntrinsicType::UInt2) => {
+                            ctx.convert_float_to_uint(2, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                spv::Type::Vector {
+                    component_type,
+                    component_count: 3,
+                } => match *component_type {
+                    spv::Type::Int {
+                        width: 32,
+                        signedness: true,
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float3) => {
+                            ctx.convert_sint_to_float(3, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    spv::Type::Int {
+                        width: 32,
+                        signedness: false,
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float3) => {
+                            ctx.convert_uint_to_float(3, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    spv::Type::Float { width: 32 } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::SInt3) => {
+                            ctx.convert_float_to_sint(3, x)
+                        }
+                        ConcreteType::Intrinsic(IntrinsicType::UInt3) => {
+                            ctx.convert_float_to_uint(3, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                spv::Type::Vector {
+                    component_type,
+                    component_count: 4,
+                } => match *component_type {
+                    spv::Type::Int {
+                        width: 32,
+                        signedness: true,
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float4) => {
+                            ctx.convert_sint_to_float(4, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    spv::Type::Int {
+                        width: 32,
+                        signedness: false,
+                    } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::Float4) => {
+                            ctx.convert_uint_to_float(4, x)
+                        }
+                        _ => unreachable!(),
+                    },
+                    spv::Type::Float { width: 32 } => match t {
+                        ConcreteType::Intrinsic(IntrinsicType::SInt4) => {
+                            ctx.convert_float_to_sint(4, x)
+                        }
+                        ConcreteType::Intrinsic(IntrinsicType::UInt4) => {
+                            ctx.convert_float_to_uint(4, x)
+                        }
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
-            }
+            })
         }
-        SimplifiedExpression::Cast(x, t) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
-
-            match (xt, t) {
-                (
-                    spv::Type::Int {
-                        width: 32,
-                        signedness: true,
-                    },
-                    &ConcreteType::Intrinsic(IntrinsicType::Float),
-                ) => {
-                    let rt = spv::Type::Float { width: 32 };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ConvertSToF {
-                        result_type,
-                        result: result_id,
-                        signed_value: x,
-                    });
-                    Some((result_id, rt))
-                }
-                (
-                    spv::Type::Int {
-                        width: 32,
-                        signedness: false,
-                    },
-                    &ConcreteType::Intrinsic(IntrinsicType::Float),
-                ) => {
-                    let rt = spv::Type::Float { width: 32 };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ConvertUToF {
-                        result_type,
-                        result: result_id,
-                        unsigned_value: x,
-                    });
-                    Some((result_id, rt))
-                }
-                (spv::Type::Float { width: 32 }, &ConcreteType::Intrinsic(IntrinsicType::SInt)) => {
-                    let rt = spv::Type::Int {
-                        width: 32,
-                        signedness: true,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ConvertFToS {
-                        result_type,
-                        result: result_id,
-                        float_value: x,
-                    });
-                    Some((result_id, rt))
-                }
-                (spv::Type::Float { width: 32 }, &ConcreteType::Intrinsic(IntrinsicType::UInt)) => {
-                    let rt = spv::Type::Int {
-                        width: 32,
-                        signedness: false,
-                    };
-                    let result_type = module_ctx.request_type_id(rt.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::ConvertFToU {
-                        result_type,
-                        result: result_id,
-                        float_value: x,
-                    });
-                    Some((result_id, rt))
-                }
-                (
-                    spv::Type::Vector {
-                        component_type,
-                        component_count,
-                    },
-                    to,
-                ) => match (*component_type, component_count, to) {
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: true,
-                        },
-                        2,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float2),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 2,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertSToF {
-                            result_type,
-                            result: result_id,
-                            signed_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: true,
-                        },
-                        3,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float3),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 3,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertSToF {
-                            result_type,
-                            result: result_id,
-                            signed_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: true,
-                        },
-                        4,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float4),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 4,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertSToF {
-                            result_type,
-                            result: result_id,
-                            signed_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: false,
-                        },
-                        2,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float2),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 2,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertUToF {
-                            result_type,
-                            result: result_id,
-                            unsigned_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: false,
-                        },
-                        3,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float3),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 3,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertUToF {
-                            result_type,
-                            result: result_id,
-                            unsigned_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Int {
-                            width: 32,
-                            signedness: false,
-                        },
-                        4,
-                        &ConcreteType::Intrinsic(IntrinsicType::Float4),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Float { width: 32 }),
-                            component_count: 4,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertUToF {
-                            result_type,
-                            result: result_id,
-                            unsigned_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        2,
-                        &ConcreteType::Intrinsic(IntrinsicType::SInt2),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: true,
-                            }),
-                            component_count: 2,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToS {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        3,
-                        &ConcreteType::Intrinsic(IntrinsicType::SInt3),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: true,
-                            }),
-                            component_count: 3,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToS {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        4,
-                        &ConcreteType::Intrinsic(IntrinsicType::SInt4),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: true,
-                            }),
-                            component_count: 4,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToS {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        2,
-                        &ConcreteType::Intrinsic(IntrinsicType::UInt2),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: false,
-                            }),
-                            component_count: 2,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToU {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        3,
-                        &ConcreteType::Intrinsic(IntrinsicType::UInt3),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: false,
-                            }),
-                            component_count: 3,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToU {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    (
-                        spv::Type::Float { width: 32 },
-                        4,
-                        &ConcreteType::Intrinsic(IntrinsicType::UInt4),
-                    ) => {
-                        let rt = spv::Type::Vector {
-                            component_type: Box::new(spv::Type::Int {
-                                width: 32,
-                                signedness: false,
-                            }),
-                            component_count: 4,
-                        };
-                        let result_type = module_ctx.request_type_id(rt.clone());
-                        let result_id = ctx.new_id();
-                        ctx.ops.push(spv::Instruction::ConvertFToU {
-                            result_type,
-                            result: result_id,
-                            float_value: x,
-                        });
-                        Some((result_id, rt))
-                    }
-                    _ => unreachable!(),
-                },
-                (xt, t) => unreachable!("undefined cast: {xt:?} -> {t:?}"),
-            }
-        }
-        SimplifiedExpression::Swizzle1(x, a) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
+        &SimplifiedExpression::Swizzle1(x, a) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
             let spv::Type::Vector { component_type, .. } = xt else {
                 unreachable!()
             };
 
-            let rt = *component_type;
-            let result_type = module_ctx.request_type_id(rt.clone());
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::CompositeExtract {
-                result_type,
-                result: result_id,
-                composite: x,
-                indexes: vec![*a as _],
-            });
-            Some((result_id, rt))
+            Some((
+                ctx.composite_extract(*component_type.clone(), x, vec![a as _]),
+                *component_type,
+            ))
         }
-        SimplifiedExpression::Swizzle2(x, a, b) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
+        &SimplifiedExpression::Swizzle2(x, a, b) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
             let spv::Type::Vector { component_type, .. } = xt else {
                 unreachable!()
             };
 
-            let rt = spv::Type::Vector {
-                component_type,
-                component_count: 2,
-            };
-            let result_type = module_ctx.request_type_id(rt.clone());
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::VectorShuffle {
-                result_type,
-                result: result_id,
-                vector1: x,
-                vector2: x,
-                components: vec![*a as _, *b as _],
-            });
-            Some((result_id, rt))
+            let rt = component_type.of_vector(2);
+            Some((
+                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _]),
+                rt,
+            ))
         }
-        SimplifiedExpression::Swizzle3(x, a, b, c) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
+        &SimplifiedExpression::Swizzle3(x, a, b, c) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
             let spv::Type::Vector { component_type, .. } = xt else {
                 unreachable!()
             };
 
-            let rt = spv::Type::Vector {
-                component_type,
-                component_count: 3,
-            };
-            let result_type = module_ctx.request_type_id(rt.clone());
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::VectorShuffle {
-                result_type,
-                result: result_id,
-                vector1: x,
-                vector2: x,
-                components: vec![*a as _, *b as _, *c as _],
-            });
-            Some((result_id, rt))
+            let rt = component_type.of_vector(3);
+            Some((
+                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _]),
+                rt,
+            ))
         }
-        SimplifiedExpression::Swizzle4(x, a, b, c, d) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
+        &SimplifiedExpression::Swizzle4(x, a, b, c, d) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
             let spv::Type::Vector { component_type, .. } = xt else {
                 unreachable!()
             };
 
-            let rt = spv::Type::Vector {
-                component_type,
-                component_count: 4,
-            };
-            let result_type = module_ctx.request_type_id(rt.clone());
-            let result_id = ctx.new_id();
-            ctx.ops.push(spv::Instruction::VectorShuffle {
-                result_type,
-                result: result_id,
-                vector1: x,
-                vector2: x,
-                components: vec![*a as _, *b as _, *c as _, *d as _],
-            });
-            Some((result_id, rt))
+            let rt = component_type.of_vector(4);
+            Some((
+                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _, d as _]),
+                rt,
+            ))
         }
         SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
                 Some(GlobalAccessType::Direct(gv, vty)) => {
                     let (gv, vty) = (gv.clone(), vty.clone());
 
-                    let result_type = module_ctx.request_type_id(vty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::Load {
-                        result_type,
-                        result: result_id,
-                        pointer: gv,
-                    });
-                    Some((result_id, vty))
+                    Some((ctx.load(vty.clone(), gv), vty))
                 }
                 Some(&GlobalAccessType::PushConstantStruct {
                     struct_var,
@@ -2729,33 +2132,16 @@ fn emit_expr_spv_ops(
                 }) => {
                     let member_ty = member_ty.clone();
 
-                    let ac_result_type = module_ctx.request_type_id(spv::Type::Pointer {
-                        storage_class: spv::StorageClass::PushConstant,
-                        base_type: Box::new(member_ty.clone()),
-                    });
-                    let ac_result_id = ctx.new_id();
-                    let ac_index_id = module_ctx.request_const_id(spv::Constant::Constant {
-                        result_type: spv::Type::Int {
-                            width: 32,
-                            signedness: false,
-                        },
-                        value_bits: member_index,
-                    });
-                    ctx.ops.push(spv::Instruction::AccessChain {
-                        result_type: ac_result_type,
-                        result: ac_result_id,
-                        base: struct_var,
-                        indexes: vec![ac_index_id],
-                    });
-
-                    let result_type = module_ctx.request_type_id(member_ty.clone());
-                    let result_id = ctx.new_id();
-                    ctx.ops.push(spv::Instruction::Load {
-                        result_type,
-                        result: result_id,
-                        pointer: ac_result_id,
-                    });
-                    Some((result_id, member_ty))
+                    let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
+                    Some((
+                        ctx.chained_load(
+                            member_ty.clone(),
+                            spv::StorageClass::PushConstant,
+                            struct_var,
+                            vec![ac_index_id],
+                        ),
+                        member_ty,
+                    ))
                 }
                 None => panic!("no corresponding canonical refpath found? {rp:?}"),
             }
@@ -2780,19 +2166,9 @@ fn emit_expr_spv_ops(
                 x = if x == 0 { 1 } else { 0 };
             }
 
-            let result_id = module_ctx.request_const_id(spv::Constant::Constant {
-                result_type: spv::Type::Int {
-                    width: 32,
-                    signedness: true,
-                },
-                value_bits: unsafe { core::mem::transmute(x) },
-            });
             Some((
-                result_id,
-                spv::Type::Int {
-                    width: 32,
-                    signedness: true,
-                },
+                ctx.module_ctx.request_const_id(x.into()),
+                spv::Type::sint(32),
             ))
         }
         SimplifiedExpression::ConstUInt(s, mods) => {
@@ -2815,19 +2191,9 @@ fn emit_expr_spv_ops(
                 x = if x == 0 { 1 } else { 0 };
             }
 
-            let result_id = module_ctx.request_const_id(spv::Constant::Constant {
-                result_type: spv::Type::Int {
-                    width: 32,
-                    signedness: false,
-                },
-                value_bits: unsafe { core::mem::transmute(x) },
-            });
             Some((
-                result_id,
-                spv::Type::Int {
-                    width: 32,
-                    signedness: false,
-                },
+                ctx.module_ctx.request_const_id(x.into()),
+                spv::Type::uint(32),
             ))
         }
         SimplifiedExpression::ConstFloat(s, mods) => {
@@ -2847,50 +2213,24 @@ fn emit_expr_spv_ops(
                 x = if x != 0.0 { 0.0 } else { 1.0 };
             }
 
-            let result_id = module_ctx.request_const_id(spv::Constant::Constant {
-                result_type: spv::Type::Float { width: 32 },
-                value_bits: unsafe { core::mem::transmute(x) },
-            });
-            Some((result_id, spv::Type::Float { width: 32 }))
+            Some((
+                ctx.module_ctx.request_const_id(x.into()),
+                spv::Type::float(32),
+            ))
         }
         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SubpassLoad", _, args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap())
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
                 .unzip();
             assert!(arg_ty.len() == 1 && arg_ty[0] == spv::Type::subpass_data_image_type());
 
-            let rt = spv::Type::Vector {
-                component_type: Box::new(spv::Type::Float { width: 32 }),
-                component_count: 4,
-            };
-            let result_type = module_ctx.request_type_id(rt.clone());
+            let rt = spv::Type::float(32).of_vector(4);
+            let result_type = ctx.module_ctx.request_type_id(rt.clone());
             let result_id = ctx.new_id();
-            let coordinate_const = module_ctx.request_const_id(spv::Constant::Composite {
-                result_type: spv::Type::Vector {
-                    component_type: Box::new(spv::Type::Int {
-                        width: 32,
-                        signedness: true,
-                    }),
-                    component_count: 2,
-                },
-                constituents: vec![
-                    spv::Constant::Constant {
-                        result_type: spv::Type::Int {
-                            width: 32,
-                            signedness: true,
-                        },
-                        value_bits: 0,
-                    },
-                    spv::Constant::Constant {
-                        result_type: spv::Type::Int {
-                            width: 32,
-                            signedness: true,
-                        },
-                        value_bits: 0,
-                    },
-                ],
-            });
+            let coordinate_const = ctx
+                .module_ctx
+                .request_const_id(spv::Constant::i32vec2(0, 0));
             ctx.ops.push(spv::Instruction::ImageRead {
                 result_type,
                 result: result_id,
@@ -2900,7 +2240,7 @@ fn emit_expr_spv_ops(
             Some((result_id, rt))
         }
         SimplifiedExpression::StoreOutput(x, o) => {
-            let (x, _xt) = emit_expr_spv_ops(body, x.0, module_ctx, ctx).unwrap();
+            let (x, _xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
             ctx.ops.push(spv::Instruction::Store {
                 pointer: ctx.entry_point_maps.output_global_vars[*o],
                 object: x,
@@ -2912,7 +2252,7 @@ fn emit_expr_spv_ops(
             expressions,
             returning,
             ..
-        } => emit_expr_spv_ops(expressions, returning.0, module_ctx, ctx),
+        } => emit_expr_spv_ops(expressions, returning.0, ctx),
         x => unimplemented!("{x:?}"),
     };
 
@@ -2999,6 +2339,64 @@ impl SpvModuleEmissionContext {
         self.latest_function_id += 1;
 
         SpvSectionLocalId::Function(self.latest_function_id - 1)
+    }
+
+    pub fn decorate(&mut self, target: SpvSectionLocalId, decorations: &[spv::Decorate]) {
+        self.annotation_ops
+            .extend(decorations.iter().map(|d| match d {
+                spv::Decorate::DescriptorSet(loc) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::DescriptorSet,
+                    args: vec![*loc],
+                },
+                spv::Decorate::Binding(b) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::Binding,
+                    args: vec![*b],
+                },
+                spv::Decorate::InputAttachmentIndex(b) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::InputAttachmentIndex,
+                    args: vec![*b],
+                },
+                spv::Decorate::Block => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::Block,
+                    args: vec![],
+                },
+                spv::Decorate::Location(loc) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::Location,
+                    args: vec![*loc],
+                },
+                spv::Decorate::Builtin(b) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::Builtin,
+                    args: vec![*b as _],
+                },
+                spv::Decorate::Offset(o) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::Offset,
+                    args: vec![*o],
+                },
+            }));
+    }
+
+    pub fn declare_global_variable(
+        &mut self,
+        ty: spv::Type,
+        storage_class: spv::StorageClass,
+    ) -> SpvSectionLocalId {
+        let ptr_ty = self.request_type_id(ty.of_pointer(storage_class));
+        let id = self.new_global_variable_id();
+        self.global_variable_ops.push(spv::Instruction::Variable {
+            result_type: ptr_ty,
+            result: id,
+            storage_class,
+            initializer: None,
+        });
+
+        id
     }
 
     pub fn request_const_id(&mut self, c: spv::Constant) -> SpvSectionLocalId {
@@ -5398,87 +4796,27 @@ impl IntrinsicType {
         match self {
             Self::Unit => spv::Type::Void,
             Self::Bool => spv::Type::Bool,
-            Self::UInt => spv::Type::Int {
-                width: 32,
-                signedness: false,
-            },
-            Self::SInt => spv::Type::Int {
-                width: 32,
-                signedness: true,
-            },
-            Self::Float => spv::Type::Float { width: 32 },
-            Self::UInt2 => spv::Type::Vector {
-                component_type: Box::new(Self::UInt.make_spv_type()),
-                component_count: 2,
-            },
-            Self::UInt3 => spv::Type::Vector {
-                component_type: Box::new(Self::UInt.make_spv_type()),
-                component_count: 3,
-            },
-            Self::UInt4 => spv::Type::Vector {
-                component_type: Box::new(Self::UInt.make_spv_type()),
-                component_count: 4,
-            },
-            Self::SInt2 => spv::Type::Vector {
-                component_type: Box::new(Self::SInt.make_spv_type()),
-                component_count: 2,
-            },
-            Self::SInt3 => spv::Type::Vector {
-                component_type: Box::new(Self::SInt.make_spv_type()),
-                component_count: 3,
-            },
-            Self::SInt4 => spv::Type::Vector {
-                component_type: Box::new(Self::SInt.make_spv_type()),
-                component_count: 4,
-            },
-            Self::Float2 => spv::Type::Vector {
-                component_type: Box::new(Self::Float.make_spv_type()),
-                component_count: 2,
-            },
-            Self::Float3 => spv::Type::Vector {
-                component_type: Box::new(Self::Float.make_spv_type()),
-                component_count: 3,
-            },
-            Self::Float4 => spv::Type::Vector {
-                component_type: Box::new(Self::Float.make_spv_type()),
-                component_count: 4,
-            },
-            Self::Float2x2 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float2.make_spv_type()),
-                column_count: 2,
-            },
-            Self::Float2x3 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float2.make_spv_type()),
-                column_count: 3,
-            },
-            Self::Float2x4 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float2.make_spv_type()),
-                column_count: 4,
-            },
-            Self::Float3x2 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float3.make_spv_type()),
-                column_count: 2,
-            },
-            Self::Float3x3 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float3.make_spv_type()),
-                column_count: 3,
-            },
-            Self::Float3x4 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float3.make_spv_type()),
-                column_count: 4,
-            },
-            Self::Float4x2 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float4.make_spv_type()),
-                column_count: 2,
-            },
-            Self::Float4x3 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float4.make_spv_type()),
-                column_count: 3,
-            },
-            Self::Float4x4 => spv::Type::Matrix {
-                column_type: Box::new(Self::Float4.make_spv_type()),
-                column_count: 4,
-            },
+            Self::UInt => spv::Type::uint(32),
+            Self::SInt => spv::Type::sint(32),
+            Self::Float => spv::Type::float(32),
+            Self::UInt2 => Self::UInt.make_spv_type().of_vector(2),
+            Self::UInt3 => Self::UInt.make_spv_type().of_vector(3),
+            Self::UInt4 => Self::UInt.make_spv_type().of_vector(4),
+            Self::SInt2 => Self::SInt.make_spv_type().of_vector(2),
+            Self::SInt3 => Self::SInt.make_spv_type().of_vector(3),
+            Self::SInt4 => Self::SInt.make_spv_type().of_vector(4),
+            Self::Float2 => Self::Float.make_spv_type().of_vector(2),
+            Self::Float3 => Self::Float.make_spv_type().of_vector(3),
+            Self::Float4 => Self::Float.make_spv_type().of_vector(4),
+            Self::Float2x2 => Self::Float.make_spv_type().of_matrix(2, 2),
+            Self::Float2x3 => Self::Float.make_spv_type().of_matrix(2, 3),
+            Self::Float2x4 => Self::Float.make_spv_type().of_matrix(2, 4),
+            Self::Float3x2 => Self::Float.make_spv_type().of_matrix(3, 2),
+            Self::Float3x3 => Self::Float.make_spv_type().of_matrix(3, 3),
+            Self::Float3x4 => Self::Float.make_spv_type().of_matrix(3, 4),
+            Self::Float4x2 => Self::Float.make_spv_type().of_matrix(4, 2),
+            Self::Float4x3 => Self::Float.make_spv_type().of_matrix(4, 3),
+            Self::Float4x4 => Self::Float.make_spv_type().of_matrix(4, 4),
             Self::Sampler1D => unreachable!("deprecated"),
             Self::Sampler2D => unreachable!("deprecated"),
             Self::Sampler3D => unreachable!("deprecated"),
@@ -5660,8 +4998,7 @@ impl<'s> ConcreteType<'s> {
 
                         Some(spv::TypeStructMember {
                             ty: x.make_spv_type(scope),
-                            offset: offs as _,
-                            decorations: vec![],
+                            decorations: vec![spv::Decorate::Offset(offs as _)],
                         })
                     })
                     .collect(),
@@ -5687,8 +5024,7 @@ impl<'s> ConcreteType<'s> {
 
                         Some(spv::TypeStructMember {
                             ty: x.ty.make_spv_type(scope),
-                            offset: offs as _,
-                            decorations: vec![],
+                            decorations: vec![spv::Decorate::Offset(offs as _)],
                         })
                     })
                     .collect(),
@@ -5710,8 +5046,7 @@ impl<'s> ConcreteType<'s> {
 
                             Some(spv::TypeStructMember {
                                 ty: x.ty.make_spv_type(scope),
-                                offset: offs as _,
-                                decorations: vec![],
+                                decorations: vec![spv::Decorate::Offset(offs as _)],
                             })
                         })
                         .collect(),
