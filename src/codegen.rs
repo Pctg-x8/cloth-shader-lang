@@ -1590,127 +1590,102 @@ fn emit_expr_spv_ops(
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let component_count = match lt {
-                spv::Type::Scalar(spv::ScalarType::Bool) => None,
-                spv::Type::Vector(spv::ScalarType::Bool, component_count) => Some(component_count),
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
+            assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
 
-            Some(ctx.log_and(component_count, l, r))
+            Some(ctx.log_and(sv.vector_size(), l, r))
         }
         SimplifiedExpression::LogOr(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let component_count = match lt {
-                spv::Type::Scalar(spv::ScalarType::Bool) => None,
-                spv::Type::Vector(spv::ScalarType::Bool, component_count) => Some(component_count),
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
+            assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
 
-            Some(ctx.log_or(component_count, l, r))
+            Some(ctx.log_or(sv.vector_size(), l, r))
         }
         SimplifiedExpression::Eq(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.equal(EqCompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.equal(
+                EqCompareOperandClass::of(sv.scalar()),
+                sv.vector_size(),
+                l,
+                r,
+            ))
         }
         SimplifiedExpression::Ne(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.not_equal(EqCompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.not_equal(
+                EqCompareOperandClass::of(sv.scalar()),
+                sv.vector_size(),
+                l,
+                r,
+            ))
         }
         SimplifiedExpression::Lt(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.less_than(CompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.less_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
         }
         SimplifiedExpression::Le(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.less_than_eq(CompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.less_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
         }
         SimplifiedExpression::Gt(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.greater_than(CompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.greater_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
         }
         SimplifiedExpression::Ge(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-
-            let (scalar, cc) = match lt {
-                spv::Type::Scalar(ref scalar) => (scalar, None),
-                spv::Type::Vector(ref component_type, component_count) => {
-                    (component_type, Some(component_count))
-                }
-                _ => unreachable!(),
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
             };
 
-            Some(ctx.greater_than_eq(CompareOperandClass::of(scalar), cc, l, r))
+            Some(ctx.greater_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
         }
         SimplifiedExpression::BitAnd(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-            assert!(matches!(
-                lt,
-                spv::Type::Scalar(spv::ScalarType::Int(_, _))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, _), _)
-            ));
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
+            };
+            assert!(matches!(sv.scalar(), &spv::ScalarType::Int(_, _)));
 
             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
             ctx.ops.push(spv::Instruction::BitwiseAnd {
@@ -1725,11 +1700,10 @@ fn emit_expr_spv_ops(
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-            assert!(matches!(
-                lt,
-                spv::Type::Scalar(spv::ScalarType::Int(_, _))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, _), _)
-            ));
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
+            };
+            assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
 
             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
             ctx.ops.push(spv::Instruction::BitwiseOr {
@@ -1744,11 +1718,10 @@ fn emit_expr_spv_ops(
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
-            assert!(matches!(
-                lt,
-                spv::Type::Scalar(spv::ScalarType::Int(_, _))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, _), _)
-            ));
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
+            };
+            assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
 
             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
             ctx.ops.push(spv::Instruction::BitwiseXor {
@@ -1763,13 +1736,14 @@ fn emit_expr_spv_ops(
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
+            };
 
             Some((
-                match lt {
-                    spv::Type::Scalar(spv::ScalarType::Int(_, _)) => ctx.iadd(lt.clone(), l, r),
-                    spv::Type::Scalar(spv::ScalarType::Float(_)) => ctx.fadd(lt.clone(), l, r),
-                    spv::Type::Vector(spv::ScalarType::Int(_, _), _) => ctx.iadd(lt.clone(), l, r),
-                    spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.fadd(lt.clone(), l, r),
+                match sv.scalar() {
+                    spv::ScalarType::Int(_, _) => ctx.iadd(lt.clone(), l, r),
+                    spv::ScalarType::Float(_) => ctx.fadd(lt.clone(), l, r),
                     _ => unreachable!(),
                 },
                 lt,
@@ -1779,13 +1753,14 @@ fn emit_expr_spv_ops(
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
             assert_eq!(lt, rt);
+            let Some(sv) = lt.scalar_or_vector_view() else {
+                unreachable!();
+            };
 
             Some((
-                match lt {
-                    spv::Type::Scalar(spv::ScalarType::Int(_, _)) => ctx.isub(lt.clone(), l, r),
-                    spv::Type::Scalar(spv::ScalarType::Float(_)) => ctx.fsub(lt.clone(), l, r),
-                    spv::Type::Vector(spv::ScalarType::Int(_, _), _) => ctx.isub(lt.clone(), l, r),
-                    spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.fsub(lt.clone(), l, r),
+                match sv.scalar() {
+                    spv::ScalarType::Int(_, _) => ctx.isub(lt.clone(), l, r),
+                    spv::ScalarType::Float(_) => ctx.fsub(lt.clone(), l, r),
                     _ => unreachable!(),
                 },
                 lt,

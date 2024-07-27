@@ -211,6 +211,34 @@ impl ScalarOrVectorType {
             Self::Vector(x, _) => x,
         }
     }
+
+    pub const fn vector_size(&self) -> Option<VectorSize> {
+        match self {
+            &Self::Scalar(_) => None,
+            &Self::Vector(_, x) => Some(x),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum ScalarOrVectorTypeView<'s> {
+    Scalar(&'s ScalarType),
+    Vector(&'s ScalarType, VectorSize),
+}
+impl<'s> ScalarOrVectorTypeView<'s> {
+    pub const fn scalar(&self) -> &'s ScalarType {
+        match self {
+            Self::Scalar(x) => x,
+            Self::Vector(x, _) => x,
+        }
+    }
+
+    pub const fn vector_size(&self) -> Option<VectorSize> {
+        match self {
+            &Self::Scalar(_) => None,
+            &Self::Vector(_, x) => Some(x),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -366,6 +394,15 @@ impl Type {
         match self {
             Self::Scalar(x) => Some(ScalarOrVectorType::Scalar(x)),
             Self::Vector(x, c) => Some(ScalarOrVectorType::Vector(x, c)),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn scalar_or_vector_view(&self) -> Option<ScalarOrVectorTypeView> {
+        match self {
+            Self::Scalar(x) => Some(ScalarOrVectorTypeView::Scalar(x)),
+            Self::Vector(x, c) => Some(ScalarOrVectorTypeView::Vector(x, *c)),
             _ => None,
         }
     }

@@ -561,21 +561,21 @@ pub fn optimize_pure_expr<'a, 's>(
                     let intrinsic_constructor =
                         match unsafe { &(&*expressions_head_ptr.add(base.0)).1 } {
                             ConcreteType::IntrinsicTypeConstructor(it) => match it {
-                                IntrinsicType::Float2 => Some((IntrinsicType::Float2, 2)),
-                                IntrinsicType::Float3 => Some((IntrinsicType::Float3, 3)),
-                                IntrinsicType::Float4 => Some((IntrinsicType::Float4, 4)),
-                                IntrinsicType::UInt2 => Some((IntrinsicType::UInt2, 2)),
-                                IntrinsicType::UInt3 => Some((IntrinsicType::UInt3, 3)),
-                                IntrinsicType::UInt4 => Some((IntrinsicType::UInt4, 4)),
-                                IntrinsicType::SInt2 => Some((IntrinsicType::SInt2, 2)),
-                                IntrinsicType::SInt3 => Some((IntrinsicType::SInt3, 3)),
-                                IntrinsicType::SInt4 => Some((IntrinsicType::SInt4, 4)),
+                                IntrinsicType::Float2 => Some(IntrinsicType::Float2),
+                                IntrinsicType::Float3 => Some(IntrinsicType::Float3),
+                                IntrinsicType::Float4 => Some(IntrinsicType::Float4),
+                                IntrinsicType::UInt2 => Some(IntrinsicType::UInt2),
+                                IntrinsicType::UInt3 => Some(IntrinsicType::UInt3),
+                                IntrinsicType::UInt4 => Some(IntrinsicType::UInt4),
+                                IntrinsicType::SInt2 => Some(IntrinsicType::SInt2),
+                                IntrinsicType::SInt3 => Some(IntrinsicType::SInt3),
+                                IntrinsicType::SInt4 => Some(IntrinsicType::SInt4),
                                 _ => None,
                             },
                             _ => None,
                         };
 
-                    if let Some((it, count)) = intrinsic_constructor {
+                    if let Some(it) = intrinsic_constructor {
                         let args = args.clone();
                         referenced_expr.extend(args.iter().copied());
 
