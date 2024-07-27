@@ -333,11 +333,13 @@ impl<'a, 's> SymbolScope<'a, 's> {
         name: SourceRef<'s>,
         ty: ConcreteType<'s>,
         init_expr: ExprRef,
+        mutable: bool,
     ) -> VarId {
         self.local_vars.borrow_mut().push(LocalVariable {
             occurence: name.clone(),
             ty,
             init_expr_id: init_expr,
+            mutable,
         });
         let vid = VarId::ScopeLocal(self.local_vars.borrow().len() - 1);
         self.var_id_by_name.borrow_mut().insert(name.slice, vid);
@@ -360,7 +362,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
             )),
             Some(VarId::ScopeLocal(x)) => Some((
                 self,
-                VarLookupResult::ScopeLocalVar(*x, self.local_vars.borrow()[*x].ty.clone()),
+                VarLookupResult::ScopeLocalVar(
+                    *x,
+                    self.local_vars.borrow()[*x].ty.clone(),
+                    self.local_vars.borrow()[*x].mutable,
+                ),
             )),
             Some(VarId::IntrinsicTypeConstructor(x)) => {
                 Some((self, VarLookupResult::IntrinsicTypeConstructor(*x)))
@@ -396,7 +402,7 @@ pub enum VarId {
 #[derive(Debug, Clone)]
 pub enum VarLookupResult<'x, 's> {
     FunctionInputVar(usize, &'x ConcreteType<'s>),
-    ScopeLocalVar(usize, ConcreteType<'s>),
+    ScopeLocalVar(usize, ConcreteType<'s>, bool),
     IntrinsicFunctions(&'x [IntrinsicFunctionSymbol]),
     IntrinsicTypeConstructor(IntrinsicType),
     UserDefinedFunction(&'x UserDefinedFunctionSymbol<'s>),

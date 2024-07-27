@@ -422,6 +422,7 @@ pub fn simplify_expression<'a, 's>(
                     StatementNode::Let {
                         varname_token,
                         expr,
+                        mut_token,
                         ..
                     } => {
                         let (res, ty) = simplify_expression(expr, &mut new_ctx, new_symbol_scope);
@@ -429,6 +430,7 @@ pub fn simplify_expression<'a, 's>(
                             SourceRef::from(&varname_token),
                             ty.clone(),
                             res,
+                            mut_token.is_some(),
                         );
                         new_ctx.add(
                             SimplifiedExpression::InitializeVar(PtrEq(new_symbol_scope), vid),
@@ -445,7 +447,10 @@ pub fn simplify_expression<'a, 's>(
                             panic!("Error: assigning to undefined variable");
                         };
                         let (vid, vty) = match vid {
-                            VarLookupResult::ScopeLocalVar(x, vty) => (x, vty),
+                            VarLookupResult::ScopeLocalVar(x, vty, true) => (x, vty),
+                            VarLookupResult::ScopeLocalVar(_, _, false) => {
+                                panic!("Error: cannot assign to immutable variable")
+                            }
                             VarLookupResult::FunctionInputVar(_, _) => {
                                 panic!("Error: cannot assign to function input")
                             }
@@ -846,7 +851,7 @@ fn emit_varref<'a, 's>(
             ),
             ConcreteType::IntrinsicTypeConstructor(t),
         ),
-        VarLookupResult::ScopeLocalVar(vid, ty) => {
+        VarLookupResult::ScopeLocalVar(vid, ty, _) => {
             let ty = ty.clone().instantiate(scope);
 
             (
