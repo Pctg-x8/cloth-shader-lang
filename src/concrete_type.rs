@@ -160,9 +160,8 @@ impl IntrinsicType {
             Self::Unit => None,
             Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(4),
             Self::UInt2 | Self::SInt2 | Self::Float2 => Some(8),
-            Self::UInt3 | Self::SInt3 | Self::Float3 | Self::UInt4 | Self::SInt4 | Self::Float4 => {
-                Some(16)
-            }
+            Self::UInt3 | Self::SInt3 | Self::Float3 => Some(12),
+            Self::UInt4 | Self::SInt4 | Self::Float4 => Some(16),
             Self::Float2x2 | Self::Float2x3 | Self::Float2x4 => Some(16),
             Self::Float3x2
             | Self::Float3x3

@@ -1360,7 +1360,7 @@ impl CompareOperandClass {
 }
 
 enum GlobalAccessType {
-    Direct(SpvSectionLocalId, spv::Type),
+    Direct(SpvSectionLocalId, spv::Type, spv::StorageClass),
     PushConstantStruct {
         struct_var: SpvSectionLocalId,
         member_index: u32,
@@ -1404,18 +1404,22 @@ pub fn emit_entry_point_spv_ops<'s>(
 
         entry_point_maps.refpath_to_global_var.insert(
             a.original_refpath.clone(),
-            GlobalAccessType::Direct(vid, a.ty.clone()),
+            GlobalAccessType::Direct(vid, a.ty.clone(), spv::StorageClass::Input),
         );
         entry_point_maps.interface_global_vars.push(vid);
     }
 
     for a in ep.uniform_variables.iter() {
-        let vid = ctx.declare_global_variable(a.ty.clone(), spv::StorageClass::Uniform);
+        let storage_class = match a.ty {
+            spv::Type::Image { .. } => spv::StorageClass::UniformConstant,
+            _ => spv::StorageClass::Uniform,
+        };
+        let vid = ctx.declare_global_variable(a.ty.clone(), storage_class);
         ctx.decorate(vid, &a.decorations);
 
         entry_point_maps.refpath_to_global_var.insert(
             a.original_refpath.clone(),
-            GlobalAccessType::Direct(vid, a.ty.clone()),
+            GlobalAccessType::Direct(vid, a.ty.clone(), storage_class),
         );
         entry_point_maps.interface_global_vars.push(vid);
     }
@@ -2240,7 +2244,7 @@ fn emit_expr_spv_ops(
         }
         SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
-                Some(GlobalAccessType::Direct(gv, vty)) => {
+                Some(GlobalAccessType::Direct(gv, vty, _)) => {
                     let (gv, vty) = (gv.clone(), vty.clone());
 
                     Some((ctx.load(vty.clone(), gv), vty))
@@ -2267,7 +2271,7 @@ fn emit_expr_spv_ops(
                 None => match rp {
                     RefPath::Member(root, index) => {
                         Some(match ctx.entry_point_maps.refpath_to_global_var.get(root) {
-                            Some(GlobalAccessType::Direct(gv, vty)) => {
+                            Some(GlobalAccessType::Direct(gv, vty, storage_class)) => {
                                 let (gv, vty) = (gv.clone(), vty.clone());
                                 let member_ty = match vty {
                                     spv::Type::Struct { member_types, .. } => {
@@ -2278,11 +2282,10 @@ fn emit_expr_spv_ops(
 
                                 let ac_index_id =
                                     ctx.module_ctx.request_const_id((*index as u32).into());
-                                // TODO: Uniform決め打ちは後で何とかする（Storage Bufferサポートするときに詰む）
                                 (
                                     ctx.chained_load(
                                         member_ty.clone(),
-                                        spv::StorageClass::Uniform,
+                                        *storage_class,
                                         gv,
                                         vec![ac_index_id],
                                     ),
