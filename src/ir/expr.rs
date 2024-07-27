@@ -1066,16 +1066,86 @@ fn emit_varref<'a, 's>(
 fn funcall<'a, 's>(
     base_expr: ExprRef,
     base_ty: ConcreteType<'s>,
-    args: Vec<ExprRef>,
+    mut args: Vec<ExprRef>,
     arg_types: Vec<ConcreteType<'s>>,
     ctx: &mut SimplificationContext<'a, 's>,
 ) -> (ExprRef, ConcreteType<'s>) {
     let res_ty = match base_ty {
         ConcreteType::IntrinsicTypeConstructor(t) => t.into(),
-        ConcreteType::Function { args, output }
-            if args.iter().zip(arg_types.iter()).all(|(a, b)| a == b) =>
-        {
-            output.map_or(IntrinsicType::Unit.into(), |x| *x)
+        ConcreteType::Function {
+            args: def_arg_types,
+            output,
+        } if def_arg_types.len() == arg_types.len() => {
+            let mut matches = true;
+            for ((dt, t), a) in def_arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .zip(args.iter_mut())
+            {
+                matches = matches
+                    && match (t, &dt) {
+                        (
+                            ConcreteType::UnknownIntClass,
+                            ConcreteType::Intrinsic(IntrinsicType::SInt),
+                        ) => {
+                            *a = ctx.add(
+                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                    *a,
+                                    IntrinsicType::SInt,
+                                ),
+                                IntrinsicType::SInt.into(),
+                            );
+                            true
+                        }
+                        (
+                            ConcreteType::UnknownIntClass,
+                            ConcreteType::Intrinsic(IntrinsicType::UInt),
+                        ) => {
+                            *a = ctx.add(
+                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                    *a,
+                                    IntrinsicType::UInt,
+                                ),
+                                IntrinsicType::UInt.into(),
+                            );
+                            true
+                        }
+                        (
+                            ConcreteType::UnknownIntClass,
+                            ConcreteType::Intrinsic(IntrinsicType::Float),
+                        ) => {
+                            *a = ctx.add(
+                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                    *a,
+                                    IntrinsicType::Float,
+                                ),
+                                IntrinsicType::Float.into(),
+                            );
+                            true
+                        }
+                        (
+                            ConcreteType::UnknownNumberClass,
+                            ConcreteType::Intrinsic(IntrinsicType::Float),
+                        ) => {
+                            *a = ctx.add(
+                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                    *a,
+                                    IntrinsicType::Float,
+                                ),
+                                IntrinsicType::Float.into(),
+                            );
+                            true
+                        }
+                        (t, _) => t == dt,
+                    };
+            }
+
+            if !matches {
+                eprintln!("Error: argument types mismatched");
+                ConcreteType::Never
+            } else {
+                output.map_or(IntrinsicType::Unit.into(), |x| *x)
+            }
         }
         ConcreteType::Function { args, .. } => {
             eprintln!("Error: argument types mismatched({args:?} and {arg_types:?})");
