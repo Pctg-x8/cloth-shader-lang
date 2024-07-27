@@ -176,7 +176,30 @@ fn process_entry_point_inputs<'s>(
                     ],
                 });
             }
-            _ => panic!("Error: descriptor buffer binding can be done only for struct types"),
+            ConcreteType::Intrinsic(IntrinsicType::Texture2D) => {
+                let spv_ty = spv::Type::SampledImage {
+                    image_type: Box::new(spv::Type::Image {
+                        sampled_type: Box::new(spv::Type::float(32)),
+                        dim: spv::Dim::Dim2,
+                        depth: Some(false),
+                        arrayed: false,
+                        multisampled: false,
+                        sampled: spv::TypeImageSampled::WithSamplingOps,
+                        image_format: spv::ImageFormat::Rgba8,
+                        access_qualifier: None,
+                    }),
+                };
+
+                uniform_variables.push(ShaderInterfaceUniformVariable {
+                    ty: spv_ty,
+                    original_refpath: refpath.clone(),
+                    decorations: vec![
+                        spv::Decorate::DescriptorSet(*set),
+                        spv::Decorate::Binding(*binding),
+                    ],
+                })
+            }
+            _ => panic!("Error: descriptor binding can be done only for struct or texture types"),
         },
         SymbolAttribute {
             descriptor_set_location: Some(set),

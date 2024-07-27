@@ -1411,7 +1411,9 @@ pub fn emit_entry_point_spv_ops<'s>(
 
     for a in ep.uniform_variables.iter() {
         let storage_class = match a.ty {
-            spv::Type::Image { .. } => spv::StorageClass::UniformConstant,
+            spv::Type::Image { .. } | spv::Type::SampledImage { .. } => {
+                spv::StorageClass::UniformConstant
+            }
             _ => spv::StorageClass::Uniform,
         };
         let vid = ctx.declare_global_variable(a.ty.clone(), storage_class);
@@ -1588,6 +1590,44 @@ fn emit_expr_spv_ops(
                             constituents: match args.len() {
                                 1 => args.repeat(3),
                                 3 => args,
+                                _ => panic!("Error: component count mismatching"),
+                            },
+                        });
+                    };
+
+                    Some((result_id, rt))
+                }
+                IntrinsicType::Float2 => {
+                    assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
+
+                    let rt = spv::Type::float(32).of_vector(2);
+                    let result_type = ctx.module_ctx.request_type_id(rt.clone());
+                    let is_constant = args
+                        .iter()
+                        .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
+
+                    let result_id;
+                    if is_constant {
+                        result_id = ctx.module_ctx.new_type_const_id();
+                        ctx.module_ctx
+                            .type_const_ops
+                            .push(spv::Instruction::ConstantComposite {
+                                result_type,
+                                result: result_id,
+                                constituents: match args.len() {
+                                    1 => args.repeat(2),
+                                    2 => args,
+                                    _ => panic!("Error: component count mismatching"),
+                                },
+                            });
+                    } else {
+                        result_id = ctx.new_id();
+                        ctx.ops.push(spv::Instruction::CompositeConstruct {
+                            result_type,
+                            result: result_id,
+                            constituents: match args.len() {
+                                1 => args.repeat(2),
+                                2 => args,
                                 _ => panic!("Error: component count mismatching"),
                             },
                         });
@@ -2476,6 +2516,25 @@ fn emit_expr_spv_ops(
                 result_type,
                 result,
                 matrix: args[0],
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SampleAt#Texture2D", _, args) => {
+            let (args, arg_ty): (Vec<_>, Vec<_>) = args
+                .iter()
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .unzip();
+            assert_eq!(arg_ty.len(), 2);
+            assert!(matches!(arg_ty[0], spv::Type::SampledImage { .. }));
+            assert_eq!(arg_ty[1], spv::Type::float(32).of_vector(2));
+
+            let rt = spv::Type::float(32).of_vector(4);
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::ImageSampleImplicitLod {
+                result_type,
+                result,
+                sampled_image: args[0],
+                coordinate: args[1],
             });
             Some((result, rt))
         }

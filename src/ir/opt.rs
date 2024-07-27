@@ -249,10 +249,10 @@ pub fn optimize_pure_expr<'a, 's>(
     let mut least_one_tree_modified = false;
     let mut tree_modified = true;
 
-    // println!("input:");
-    // for (n, (x, t)) in expressions.iter().enumerate() {
-    //     super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
-    // }
+    println!("opt input:");
+    for (n, (x, t)) in expressions.iter().enumerate() {
+        super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+    }
 
     while tree_modified {
         tree_modified = false;
@@ -370,30 +370,37 @@ pub fn optimize_pure_expr<'a, 's>(
         tree_modified |= flatten_composite_outputs(expressions, scope, scope_arena);
 
         // inlining loadvar until dirtified / resolving expression aliases
-        let mut last_loadvar_expr_id = HashMap::new();
+        let mut localvar_equivalent_expr_id = HashMap::new();
         let mut expr_id_alias = HashMap::new();
         let mut last_expr_ids = HashMap::new();
         for n in 0..expressions.len() {
             match &mut expressions[n].0 {
                 &mut SimplifiedExpression::LoadVar(vscope, vid) => {
                     if let Some(x) =
-                        last_loadvar_expr_id.get(&(vscope.0 as *const SymbolScope, vid))
+                        localvar_equivalent_expr_id.get(&(vscope.0 as *const SymbolScope, vid))
                     {
                         expr_id_alias.insert(n, *x);
                         scope.relocate_local_var_init_expr(
                             |r| if r.0 == n { ExprRef(*x) } else { r },
                         );
-                    } else {
-                        last_loadvar_expr_id.insert((vscope.0 as *const SymbolScope, vid), n);
                     }
+
+                    localvar_equivalent_expr_id.insert((vscope.0 as *const SymbolScope, vid), n);
                 }
                 &mut SimplifiedExpression::InitializeVar(vscope, VarId::ScopeLocal(vx)) => {
                     let init_expr_id = vscope.0.init_expr_id(vx).unwrap();
 
                     expr_id_alias.insert(n, init_expr_id.0);
                     scope.relocate_local_var_init_expr(|r| if r.0 == n { init_expr_id } else { r });
-                    last_loadvar_expr_id
+                    localvar_equivalent_expr_id
                         .insert((vscope.as_ptr(), VarId::ScopeLocal(vx)), init_expr_id.0);
+                }
+                &mut SimplifiedExpression::StoreVar(vscope, vx, store) => {
+                    let last_load_id = localvar_equivalent_expr_id
+                        .insert((vscope.as_ptr(), VarId::ScopeLocal(vx)), store.0);
+                    if let Some(lld) = last_load_id {
+                        expr_id_alias.retain(|_, v| *v != lld);
+                    }
                 }
                 &mut SimplifiedExpression::Alias(x) => {
                     expr_id_alias.insert(n, x.0);
@@ -664,6 +671,8 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::InitializeVar(vscope, VarId::ScopeLocal(vx))
                     if vscope == PtrEq(scope) =>
                 {
+                    let init_expr = vscope.0.init_expr_id(vx).unwrap();
+                    referenced_expr.insert(init_expr);
                     current_scope_var_usages
                         .entry(vx)
                         .or_insert(LocalVarUsage::Unaccessed)
@@ -671,7 +680,14 @@ pub fn optimize_pure_expr<'a, 's>(
                 }
                 &mut SimplifiedExpression::InitializeVar(_, _) => (),
                 &mut SimplifiedExpression::LoadByCanonicalRefPath(_) => (),
-                &mut SimplifiedExpression::StoreLocal(_, v) => {
+                &mut SimplifiedExpression::StoreVar(vscope, vx, v) if vscope == PtrEq(scope) => {
+                    referenced_expr.insert(v);
+                    current_scope_var_usages
+                        .entry(vx)
+                        .or_insert(LocalVarUsage::Unaccessed)
+                        .mark_write(ExprRef(n));
+                }
+                &mut SimplifiedExpression::StoreVar(_, _, v) => {
                     referenced_expr.insert(v);
                 }
                 &mut SimplifiedExpression::RefFunction(_, _) => (),
@@ -760,6 +776,13 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::ConstUInt(_, _) => (),
                 &mut SimplifiedExpression::ConstSInt(_, _) => (),
                 &mut SimplifiedExpression::ConstFloat(_, _) => (),
+                &mut SimplifiedExpression::ConstIntToNumber(x) => {
+                    if let &SimplifiedExpression::ConstInt(ref t) = &expressions[x.0].0 {
+                        expressions[n].0 = SimplifiedExpression::ConstNumber(t.clone());
+                    } else {
+                        referenced_expr.insert(x);
+                    }
+                }
                 &mut SimplifiedExpression::ConstructTuple(ref xs) => {
                     referenced_expr.extend(xs.iter().copied());
                 }
@@ -954,6 +977,11 @@ pub fn optimize_pure_expr<'a, 's>(
                         vscope,
                         VarId::ScopeLocal(ref mut vx),
                     ) if vscope == PtrEq(scope) => {
+                        *vx -= if *vx > n { 1 } else { 0 };
+                    }
+                    &mut SimplifiedExpression::StoreVar(vscope, ref mut vx, _)
+                        if vscope == PtrEq(scope) =>
+                    {
                         *vx -= if *vx > n { 1 } else { 0 };
                     }
                     _ => (),

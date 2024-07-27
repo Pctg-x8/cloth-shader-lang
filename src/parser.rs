@@ -679,8 +679,14 @@ fn parse_function_declaration<'s>(
 pub enum StatementNode<'s> {
     Let {
         let_token: Token<'s>,
+        mut_token: Option<Token<'s>>,
         varname_token: Token<'s>,
         eq_token: Token<'s>,
+        expr: ExpressionNode<'s>,
+    },
+    OpEq {
+        varname_token: Token<'s>,
+        opeq_token: Token<'s>,
         expr: ExpressionNode<'s>,
     },
 }
@@ -730,6 +736,7 @@ fn parse_block<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>
             Some(t) if t.kind == TokenKind::Keyword && t.slice == "let" => {
                 let let_token = t.clone();
                 state.consume_token();
+                let mut_token = state.consume_keyword("mut").ok().cloned();
                 let varname_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
                 let eq_token = state.consume_by_kind(TokenKind::Eq)?.clone();
                 state.push_indent_context(IndentContext::Exclusive(eq_token.line_indent));
@@ -738,12 +745,43 @@ fn parse_block<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>
 
                 statements.push(StatementNode::Let {
                     let_token,
+                    mut_token,
                     varname_token,
                     eq_token,
                     expr,
                 })
             }
-            _ => break,
+            _ => {
+                let save = state.save();
+
+                let Some(varname_token) =
+                    state.consume_by_kind(TokenKind::Identifier).ok().cloned()
+                else {
+                    state.restore(save);
+                    break;
+                };
+                let opeq_token;
+                match state.current_token() {
+                    Some(t) if t.kind == TokenKind::Eq || t.kind == TokenKind::OpEq => {
+                        opeq_token = t.clone();
+                        state.consume_token();
+                    }
+                    _ => {
+                        state.restore(save);
+                        break;
+                    }
+                }
+
+                state.push_indent_context(IndentContext::Exclusive(opeq_token.line_indent));
+                let expr = parse_block(state)?;
+                state.pop_indent_context();
+
+                statements.push(StatementNode::OpEq {
+                    varname_token,
+                    opeq_token,
+                    expr,
+                });
+            }
         }
     }
 
@@ -1294,10 +1332,35 @@ impl<'s> Tokenizer<'s> {
             return self.next_token();
         }
 
+        let triple_byte_tok = if self.source.as_bytes().len() >= 3 {
+            match &self.source.as_bytes()[..3] {
+                b"&&=" | b"||=" | b"^^=" => Some(TokenKind::OpEq),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(k) = triple_byte_tok {
+            let tk = Token {
+                slice: &self.source[..3],
+                kind: k,
+                line: self.line,
+                col: self.col,
+                line_indent: self.current_line_indent,
+            };
+            self.source = &self.source[3..];
+            self.col += 3;
+            return Ok(Some(tk));
+        }
+
         let double_byte_tok = if self.source.as_bytes().len() >= 2 {
             match &self.source.as_bytes()[..2] {
                 b"->" => Some(TokenKind::ArrowToRight),
                 b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"^^" => Some(TokenKind::Op),
+                b"+=" | b"-=" | b"*=" | b"/=" | b"%=" | b"&=" | b"|=" | b"^=" => {
+                    Some(TokenKind::OpEq)
+                }
                 _ => None,
             }
         } else {
@@ -1448,7 +1511,9 @@ impl<'s> Tokenizer<'s> {
         let tk = Token {
             slice: &self.source[..ident_byte_count],
             kind: match &self.source[..ident_byte_count] {
-                "struct" | "with" | "if" | "else" | "then" | "do" | "let" => TokenKind::Keyword,
+                "struct" | "with" | "if" | "else" | "then" | "do" | "let" | "mut" => {
+                    TokenKind::Keyword
+                }
                 _ => TokenKind::Identifier,
             },
             line: self.line,
@@ -1467,6 +1532,7 @@ pub enum TokenKind {
     InfixIdentifier,
     Keyword,
     Op,
+    OpEq,
     Number,
     OpenBracket,
     CloseBracket,

@@ -50,7 +50,7 @@ pub enum SimplifiedExpression<'a, 's> {
     TupleRef(ExprRef, usize),
     LoadVar(PtrEq<'a, SymbolScope<'a, 's>>, VarId),
     InitializeVar(PtrEq<'a, SymbolScope<'a, 's>>, VarId),
-    StoreLocal(SourceRefSliceEq<'s>, ExprRef),
+    StoreVar(PtrEq<'a, SymbolScope<'a, 's>>, usize, ExprRef),
     LoadByCanonicalRefPath(RefPath),
     RefFunction(PtrEq<'a, SymbolScope<'a, 's>>, &'s str),
     IntrinsicFunctions(Vec<IntrinsicFunctionSymbol>),
@@ -70,6 +70,7 @@ pub enum SimplifiedExpression<'a, 's> {
     ConstUInt(SourceRefSliceEq<'s>, ConstModifiers),
     ConstSInt(SourceRefSliceEq<'s>, ConstModifiers),
     ConstFloat(SourceRefSliceEq<'s>, ConstModifiers),
+    ConstIntToNumber(ExprRef),
     ConstructTuple(Vec<ExprRef>),
     ConstructStructValue(Vec<ExprRef>),
     ConstructIntrinsicComposite(IntrinsicType, Vec<ExprRef>),
@@ -89,7 +90,7 @@ impl SimplifiedExpression<'_, '_> {
         match self {
             Self::Funcall(_, _)
             | Self::InitializeVar(_, _)
-            | Self::StoreLocal(_, _)
+            | Self::StoreVar(_, _, _)
             | Self::ScopedBlock { .. }
             | Self::StoreOutput(_, _)
             | Self::FlattenAndDistributeOutputComposite(_, _) => false,
@@ -140,13 +141,14 @@ impl SimplifiedExpression<'_, '_> {
             | Self::Swizzle2(ref mut x, _, _)
             | Self::Swizzle3(ref mut x, _, _, _)
             | Self::Swizzle4(ref mut x, _, _, _, _)
-            | Self::StoreLocal(_, ref mut x)
+            | Self::StoreVar(_, _, ref mut x)
             | Self::InstantiateIntrinsicTypeClass(ref mut x, _)
             | Self::MemberRef(ref mut x, _)
             | Self::TupleRef(ref mut x, _)
             | Self::StoreOutput(ref mut x, _)
             | Self::FlattenAndDistributeOutputComposite(ref mut x, _)
-            | Self::Alias(ref mut x) => {
+            | Self::Alias(ref mut x)
+            | Self::ConstIntToNumber(ref mut x) => {
                 let x1 = x.0;
 
                 x.0 = relocator(x.0);
@@ -201,75 +203,7 @@ impl SimplifiedExpression<'_, '_> {
             | Self::RefFunction(_, _)
             | Self::IntrinsicFunctions(_)
             | Self::IntrinsicTypeConstructor(_)
-            | Self::AliasScopeCapture(_)
-            | Self::ScopedBlock { .. } => false,
-        }
-    }
-
-    pub fn is_referential_transparent(env: &[(Self, ConcreteType)], id: usize) -> bool {
-        match env[id].0 {
-            Self::Add(l, r)
-            | Self::Sub(l, r)
-            | Self::Mul(l, r)
-            | Self::Div(l, r)
-            | Self::Rem(l, r)
-            | Self::BitAnd(l, r)
-            | Self::BitOr(l, r)
-            | Self::BitXor(l, r)
-            | Self::Eq(l, r)
-            | Self::Ne(l, r)
-            | Self::Gt(l, r)
-            | Self::Lt(l, r)
-            | Self::Ge(l, r)
-            | Self::Le(l, r)
-            | Self::LogAnd(l, r)
-            | Self::LogOr(l, r)
-            | Self::Pow(l, r)
-            | Self::VectorShuffle4(l, r, _, _, _, _) => {
-                Self::is_referential_transparent(env, l.0)
-                    && Self::is_referential_transparent(env, r.0)
-            }
-            Self::Select(c, t, e) => {
-                Self::is_referential_transparent(env, c.0)
-                    && Self::is_referential_transparent(env, t.0)
-                    && Self::is_referential_transparent(env, e.0)
-            }
-            Self::Neg(x)
-            | Self::BitNot(x)
-            | Self::LogNot(x)
-            | Self::Cast(x, _)
-            | Self::Swizzle1(x, _)
-            | Self::Swizzle2(x, _, _)
-            | Self::Swizzle3(x, _, _, _)
-            | Self::Swizzle4(x, _, _, _, _)
-            | Self::StoreLocal(_, x)
-            | Self::InstantiateIntrinsicTypeClass(x, _)
-            | Self::MemberRef(x, _)
-            | Self::TupleRef(x, _)
-            | Self::StoreOutput(x, _)
-            | Self::FlattenAndDistributeOutputComposite(x, _)
-            | Self::Alias(x) => Self::is_referential_transparent(env, x.0),
-            Self::Funcall(_, _) => false,
-            // TODO: 組み込み関数が参照透過かどうかのフラグを追加しないといけなさそう
-            Self::IntrinsicFuncall(_, _, _) => false,
-            Self::ConstructTuple(ref xs)
-            | Self::ConstructIntrinsicComposite(_, ref xs)
-            | Self::ConstructStructValue(ref xs) => xs
-                .iter()
-                .all(|x| Self::is_referential_transparent(env, x.0)),
-            Self::LoadByCanonicalRefPath(ref rp) => rp.is_referential_transparent(),
-            Self::ConstInt(_)
-            | Self::ConstNumber(_)
-            | Self::ConstUnit
-            | Self::ConstUInt(_, _)
-            | Self::ConstSInt(_, _)
-            | Self::ConstFloat(_, _)
-            | Self::RefFunction(_, _)
-            | Self::IntrinsicFunctions(_)
-            | Self::IntrinsicTypeConstructor(_)
-            // TODO: AliasScopeCaptureは参照先が参照透過かどうか見ないといけないかも（ただそもそもis_referential_transparent使うのかすら不明）
-            | Self::AliasScopeCapture(_) => true,
-            Self::LoadVar(_, _) | Self::InitializeVar(_, _) | Self::ScopedBlock { .. } => false,
+            | Self::AliasScopeCapture(_) => false,
         }
     }
 }
@@ -319,230 +253,7 @@ pub fn simplify_expression<'a, 's>(
                 return funcall(f, ft, vec![left, right], vec![lt, rt], ctx);
             }
 
-            if op.slice == "^^" {
-                // pow(gen2 conversion)
-                let (left_conv, right_conv, result_ty) =
-                    match lt.clone().pow_op_type_conversion(rt.clone()) {
-                        Some(x) => x,
-                        None => {
-                            eprintln!(
-                            "Error: cannot apply binary op {} between terms ({lt:?} and {rt:?})",
-                            op.slice
-                        );
-
-                            (
-                                BinaryOpTermConversion::NoConversion,
-                                BinaryOpTermConversion::NoConversion,
-                                ConcreteType::Never,
-                            )
-                        }
-                    };
-
-                let left = match left_conv {
-                    BinaryOpTermConversion::NoConversion => left,
-                    BinaryOpTermConversion::Cast(to) => {
-                        ctx.add(SimplifiedExpression::Cast(left, to.into()), to.into())
-                    }
-                    BinaryOpTermConversion::Instantiate(it) => ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
-                        it.into(),
-                    ),
-                    BinaryOpTermConversion::Distribute(to, count) => ctx.add(
-                        SimplifiedExpression::ConstructIntrinsicComposite(to, vec![left]),
-                        to.into(),
-                    ),
-                    BinaryOpTermConversion::CastAndDistribute(to, count) => {
-                        let last_type = to.of_vector(count as _).unwrap();
-                        let left = ctx.add(SimplifiedExpression::Cast(left, to.into()), to.into());
-                        ctx.add(
-                            SimplifiedExpression::ConstructIntrinsicComposite(
-                                last_type,
-                                vec![left],
-                            ),
-                            last_type.into(),
-                        )
-                    }
-                    BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
-                        let last_type = it.of_vector(count as _).unwrap();
-                        let left = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
-                            it.into(),
-                        );
-                        ctx.add(
-                            SimplifiedExpression::ConstructIntrinsicComposite(
-                                last_type,
-                                vec![left],
-                            ),
-                            last_type.into(),
-                        )
-                    }
-                };
-                let right = match right_conv {
-                    BinaryOpTermConversion::NoConversion => right,
-                    BinaryOpTermConversion::Cast(to) => {
-                        ctx.add(SimplifiedExpression::Cast(right, to.into()), to.into())
-                    }
-                    BinaryOpTermConversion::Instantiate(it) => ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
-                        it.into(),
-                    ),
-                    BinaryOpTermConversion::Distribute(to, count) => ctx.add(
-                        SimplifiedExpression::ConstructIntrinsicComposite(to, vec![right]),
-                        to.into(),
-                    ),
-                    BinaryOpTermConversion::CastAndDistribute(to, count) => {
-                        let last_type = to.of_vector(count as _).unwrap();
-                        let x = ctx.add(SimplifiedExpression::Cast(right, to.into()), to.into());
-                        ctx.add(
-                            SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
-                            last_type.into(),
-                        )
-                    }
-                    BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
-                        let last_type = it.of_vector(count as _).unwrap();
-                        let x = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
-                            it.into(),
-                        );
-                        ctx.add(
-                            SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
-                            last_type.into(),
-                        )
-                    }
-                };
-
-                return (
-                    ctx.add(SimplifiedExpression::Pow(left, right), result_ty.clone()),
-                    result_ty,
-                );
-            }
-
-            let r = match op.slice {
-                // 行列とかの掛け算があるので特別扱い
-                "*" => lt.clone().multiply_op_type_conversion(rt.clone()),
-                "+" | "-" | "/" | "%" => {
-                    lt.clone().arithmetic_compare_op_type_conversion(rt.clone())
-                }
-                // 比較演算の出力は必ずBoolになる
-                "==" | "!=" | "<=" | ">=" | "<" | ">" => lt
-                    .clone()
-                    .arithmetic_compare_op_type_conversion(rt.clone())
-                    .map(|(conv, _)| (conv, IntrinsicType::Bool.into())),
-                "&" | "|" | "^" => lt.clone().bitwise_op_type_conversion(rt.clone()),
-                "&&" | "||" => lt.clone().logical_op_type_conversion(rt.clone()),
-                _ => None,
-            };
-            let (conv, res) = match r {
-                Some(x) => x,
-                None => {
-                    eprintln!(
-                        "Error: cannot apply binary op {} between terms ({lt:?} and {rt:?})",
-                        op.slice
-                    );
-                    (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
-                }
-            };
-
-            let (left, right) = match conv {
-                BinaryOpTypeConversion::NoConversion => (left, right),
-                BinaryOpTypeConversion::CastLeftHand(to) => {
-                    let left = ctx.add(SimplifiedExpression::Cast(left, to.into()), to.into());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::CastRightHand(to) => {
-                    let right = ctx.add(SimplifiedExpression::Cast(right, to.into()), to.into());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateAndCastLeftHand(it) => {
-                    let left = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
-                        it.into(),
-                    );
-                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateAndCastRightHand(it) => {
-                    let right = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
-                        it.into(),
-                    );
-                    let right =
-                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateLeftHand(it) => {
-                    let left = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
-                        it.into(),
-                    );
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateRightHand(it) => {
-                    let right = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
-                        it.into(),
-                    );
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(it) => {
-                    let left = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(left, it),
-                        it.into(),
-                    );
-                    let right =
-                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(it) => {
-                    let right = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(right, it),
-                        it.into(),
-                    );
-                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
-
-                    (left, right)
-                }
-                BinaryOpTypeConversion::CastBoth => {
-                    let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
-                    let right =
-                        ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
-
-                    (left, right)
-                }
-            };
-
-            (
-                ctx.add(
-                    match op.slice {
-                        "+" => SimplifiedExpression::Add(left, right),
-                        "-" => SimplifiedExpression::Sub(left, right),
-                        "*" => SimplifiedExpression::Mul(left, right),
-                        "/" => SimplifiedExpression::Div(left, right),
-                        "%" => SimplifiedExpression::Rem(left, right),
-                        "&" => SimplifiedExpression::BitAnd(left, right),
-                        "|" => SimplifiedExpression::BitOr(left, right),
-                        "^" => SimplifiedExpression::BitXor(left, right),
-                        "==" => SimplifiedExpression::Eq(left, right),
-                        "!=" => SimplifiedExpression::Ne(left, right),
-                        ">=" => SimplifiedExpression::Ge(left, right),
-                        "<=" => SimplifiedExpression::Le(left, right),
-                        ">" => SimplifiedExpression::Gt(left, right),
-                        "<" => SimplifiedExpression::Lt(left, right),
-                        "&&" => SimplifiedExpression::LogAnd(left, right),
-                        "||" => SimplifiedExpression::LogOr(left, right),
-                        _ => unreachable!("unknown binary op"),
-                    },
-                    res.clone(),
-                ),
-                res,
-            )
+            binary_op(left, lt, SourceRef::from(&op), right, rt, ctx)
         }
         ExpressionNode::Prefixed(op, expr) => {
             let (expr, et) = simplify_expression(*expr, ctx, symbol_scope);
@@ -723,6 +434,77 @@ pub fn simplify_expression<'a, 's>(
                             SimplifiedExpression::InitializeVar(PtrEq(new_symbol_scope), vid),
                             ty,
                         );
+                    }
+                    StatementNode::OpEq {
+                        varname_token,
+                        opeq_token,
+                        expr,
+                    } => {
+                        let Some((vscope, vid)) = new_symbol_scope.lookup(varname_token.slice)
+                        else {
+                            panic!("Error: assigning to undefined variable");
+                        };
+                        let (vid, vty) = match vid {
+                            VarLookupResult::ScopeLocalVar(x, vty) => (x, vty),
+                            VarLookupResult::FunctionInputVar(_, _) => {
+                                panic!("Error: cannot assign to function input")
+                            }
+                            VarLookupResult::IntrinsicFunctions(_) => {
+                                panic!("Error: cannot assign to fuction")
+                            }
+                            VarLookupResult::IntrinsicTypeConstructor(_) => {
+                                panic!("Error: cannot assign to intrinsic type construct")
+                            }
+                            VarLookupResult::UserDefinedFunction(_) => {
+                                panic!("Error: cannot assign to function")
+                            }
+                        };
+
+                        match opeq_token.slice {
+                            "=" => {
+                                let (res, ty) =
+                                    simplify_expression(expr, &mut new_ctx, new_symbol_scope);
+                                if ty != vty {
+                                    panic!("Error: assigning different type value");
+                                }
+
+                                new_ctx.add(
+                                    SimplifiedExpression::StoreVar(PtrEq(vscope), vid, res),
+                                    IntrinsicType::Unit.into(),
+                                );
+                            }
+                            "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "&&="
+                            | "||=" | "^^=" => {
+                                let (left, lty) = emit_varref(
+                                    SourceRef::from(&varname_token),
+                                    &mut new_ctx,
+                                    vscope,
+                                );
+                                let (right, rty) =
+                                    simplify_expression(expr, &mut new_ctx, new_symbol_scope);
+                                let (res, resty) = binary_op(
+                                    left,
+                                    lty,
+                                    SourceRef {
+                                        slice: &opeq_token.slice[..opeq_token.slice.len() - 1],
+                                        col: opeq_token.col,
+                                        line: opeq_token.line,
+                                    },
+                                    right,
+                                    rty,
+                                    &mut new_ctx,
+                                );
+                                if resty != vty {
+                                    panic!("Error: assigning different type value");
+                                }
+
+                                new_ctx.add(
+                                    SimplifiedExpression::StoreVar(PtrEq(vscope), vid, res),
+                                    IntrinsicType::Unit.into(),
+                                );
+                            }
+                            _ => unreachable!("unknown binary opeq"),
+                        }
                     }
                 }
             }
@@ -946,8 +728,8 @@ pub fn simplify_expression<'a, 's>(
             ..
         } => {
             let (condition, cty) = simplify_expression(*condition, ctx, symbol_scope);
-            let (then_expr, tty) = simplify_expression(*then_expr, ctx, symbol_scope);
-            let (else_expr, ety) = match else_expr {
+            let (mut then_expr, tty) = simplify_expression(*then_expr, ctx, symbol_scope);
+            let (mut else_expr, ety) = match else_expr {
                 None => (
                     ctx.add(SimplifiedExpression::ConstUnit, IntrinsicType::Unit.into()),
                     IntrinsicType::Unit.into(),
@@ -965,6 +747,53 @@ pub fn simplify_expression<'a, 's>(
 
             let res_ty = match (tty, ety) {
                 (a, b) if a == b => a,
+                // TODO: 他の変換は必要になったら書く
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::Float)) => {
+                    then_expr = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                            then_expr,
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    );
+                    IntrinsicType::Float.into()
+                }
+                (
+                    ConcreteType::UnknownNumberClass,
+                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                ) => {
+                    then_expr = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                            then_expr,
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    );
+                    IntrinsicType::Float.into()
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
+                    else_expr = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                            else_expr,
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    );
+                    IntrinsicType::Float.into()
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                    ConcreteType::UnknownNumberClass,
+                ) => {
+                    else_expr = ctx.add(
+                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                            else_expr,
+                            IntrinsicType::Float,
+                        ),
+                        IntrinsicType::Float.into(),
+                    );
+                    IntrinsicType::Float.into()
+                }
                 _ => {
                     eprintln!("Error: if then block and else block has different result type");
                     ConcreteType::Never
@@ -1063,6 +892,295 @@ fn emit_varref<'a, 's>(
     }
 }
 
+fn binary_op<'a, 's>(
+    left_expr: ExprRef,
+    left_ty: ConcreteType<'s>,
+    op: SourceRef<'s>,
+    right_expr: ExprRef,
+    right_ty: ConcreteType<'s>,
+    ctx: &mut SimplificationContext<'a, 's>,
+) -> (ExprRef, ConcreteType<'s>) {
+    if matches!(
+        op.slice,
+        "^^" | "+" | "-" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">"
+    ) {
+        // pow(gen2 conversion)
+        let conv = match op.slice {
+            "^^" => left_ty.clone().pow_op_type_conversion(right_ty.clone()),
+            "+" | "-" | "/" | "%" => left_ty
+                .clone()
+                .arithmetic_compare_op_type_conversion(right_ty.clone()),
+            // 比較演算の出力は必ずBoolになる
+            "==" | "!=" | "<=" | ">=" | "<" | ">" => left_ty
+                .clone()
+                .arithmetic_compare_op_type_conversion(right_ty.clone())
+                .map(|(conv_left, conv_right, t)| {
+                    (
+                        conv_left,
+                        conv_right,
+                        IntrinsicType::Bool
+                            .of_vector(t.vector_elements().unwrap())
+                            .unwrap()
+                            .into(),
+                    )
+                }),
+            _ => unreachable!(),
+        };
+        let (left_conv, right_conv, result_ty) = match conv {
+            Some(x) => x,
+            None => {
+                eprintln!(
+                    "Error: cannot apply binary op {} between terms ({left_ty:?} and {right_ty:?})",
+                    op.slice
+                );
+
+                (
+                    BinaryOpTermConversion::NoConversion,
+                    BinaryOpTermConversion::NoConversion,
+                    ConcreteType::Never,
+                )
+            }
+        };
+
+        let left = match left_conv {
+            BinaryOpTermConversion::NoConversion => left_expr,
+            BinaryOpTermConversion::Cast(to) => {
+                ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into())
+            }
+            BinaryOpTermConversion::Instantiate(it) => ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
+                it.into(),
+            ),
+            BinaryOpTermConversion::Distribute(to, count) => ctx.add(
+                SimplifiedExpression::ConstructIntrinsicComposite(to, vec![left_expr]),
+                to.into(),
+            ),
+            BinaryOpTermConversion::CastAndDistribute(to, count) => {
+                let last_type = to.of_vector(count as _).unwrap();
+                let left = ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into());
+                ctx.add(
+                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![left]),
+                    last_type.into(),
+                )
+            }
+            BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
+                let last_type = it.of_vector(count as _).unwrap();
+                let left = ctx.add(
+                    SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
+                    it.into(),
+                );
+                ctx.add(
+                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![left]),
+                    last_type.into(),
+                )
+            }
+            BinaryOpTermConversion::PromoteUnknownNumber => ctx.add(
+                SimplifiedExpression::ConstIntToNumber(left_expr),
+                ConcreteType::UnknownNumberClass,
+            ),
+        };
+        let right = match right_conv {
+            BinaryOpTermConversion::NoConversion => right_expr,
+            BinaryOpTermConversion::Cast(to) => {
+                ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into())
+            }
+            BinaryOpTermConversion::Instantiate(it) => ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
+                it.into(),
+            ),
+            BinaryOpTermConversion::Distribute(to, count) => ctx.add(
+                SimplifiedExpression::ConstructIntrinsicComposite(to, vec![right_expr]),
+                to.into(),
+            ),
+            BinaryOpTermConversion::CastAndDistribute(to, count) => {
+                let last_type = to.of_vector(count as _).unwrap();
+                let x = ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into());
+                ctx.add(
+                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
+                    last_type.into(),
+                )
+            }
+            BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
+                let last_type = it.of_vector(count as _).unwrap();
+                let x = ctx.add(
+                    SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
+                    it.into(),
+                );
+                ctx.add(
+                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
+                    last_type.into(),
+                )
+            }
+            BinaryOpTermConversion::PromoteUnknownNumber => ctx.add(
+                SimplifiedExpression::ConstIntToNumber(right_expr),
+                ConcreteType::UnknownNumberClass,
+            ),
+        };
+
+        return (
+            ctx.add(
+                match op.slice {
+                    "^^" => SimplifiedExpression::Pow(left, right),
+                    "+" => SimplifiedExpression::Add(left, right),
+                    "-" => SimplifiedExpression::Sub(left, right),
+                    "/" => SimplifiedExpression::Div(left, right),
+                    "%" => SimplifiedExpression::Rem(left, right),
+                    "&" => SimplifiedExpression::BitAnd(left, right),
+                    "|" => SimplifiedExpression::BitOr(left, right),
+                    "^" => SimplifiedExpression::BitXor(left, right),
+                    "==" => SimplifiedExpression::Eq(left, right),
+                    "!=" => SimplifiedExpression::Ne(left, right),
+                    ">=" => SimplifiedExpression::Ge(left, right),
+                    "<=" => SimplifiedExpression::Le(left, right),
+                    ">" => SimplifiedExpression::Gt(left, right),
+                    "<" => SimplifiedExpression::Lt(left, right),
+                    _ => unreachable!("unknown binary op"),
+                },
+                result_ty.clone(),
+            ),
+            result_ty,
+        );
+    }
+
+    let ((left_expr, left_ty), (right_expr, right_ty)) =
+        if op.slice == "*" && left_ty.is_scalar_type() && right_ty.is_vector_type() {
+            // scalar times vectorの演算はないのでオペランドだけ逆にする（評価順は維持する）
+            ((right_expr, right_ty), (left_expr, left_ty))
+        } else {
+            ((left_expr, left_ty), (right_expr, right_ty))
+        };
+
+    let r = match op.slice {
+        // 行列とかの掛け算があるので特別扱い
+        "*" => left_ty
+            .clone()
+            .multiply_op_type_conversion(right_ty.clone()),
+        "&" | "|" | "^" => left_ty.clone().bitwise_op_type_conversion(right_ty.clone()),
+        "&&" | "||" => left_ty.clone().logical_op_type_conversion(right_ty.clone()),
+        _ => None,
+    };
+    let (conv, res) = match r {
+        Some(x) => x,
+        None => {
+            eprintln!(
+                "Error: cannot apply binary op {} between terms ({left_ty:?} and {right_ty:?})",
+                op.slice
+            );
+            (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
+        }
+    };
+
+    let (left, right) = match conv {
+        BinaryOpTypeConversion::NoConversion => (left_expr, right_expr),
+        BinaryOpTypeConversion::CastLeftHand(to) => {
+            let left = ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into());
+
+            (left, right_expr)
+        }
+        BinaryOpTypeConversion::CastRightHand(to) => {
+            let right = ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into());
+
+            (left_expr, right)
+        }
+        BinaryOpTypeConversion::InstantiateAndCastLeftHand(it) => {
+            let left = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
+                it.into(),
+            );
+            let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+
+            (left, right_expr)
+        }
+        BinaryOpTypeConversion::InstantiateAndCastRightHand(it) => {
+            let right = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
+                it.into(),
+            );
+            let right = ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+
+            (left_expr, right)
+        }
+        BinaryOpTypeConversion::InstantiateLeftHand(it) => {
+            let left = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
+                it.into(),
+            );
+
+            (left, right_expr)
+        }
+        BinaryOpTypeConversion::InstantiateRightHand(it) => {
+            let right = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
+                it.into(),
+            );
+
+            (left_expr, right)
+        }
+        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(it) => {
+            let left = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
+                it.into(),
+            );
+            let right = ctx.add(
+                SimplifiedExpression::Cast(right_expr, res.clone()),
+                res.clone(),
+            );
+
+            (left, right)
+        }
+        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(it) => {
+            let right = ctx.add(
+                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
+                it.into(),
+            );
+            let left = ctx.add(
+                SimplifiedExpression::Cast(left_expr, res.clone()),
+                res.clone(),
+            );
+
+            (left, right)
+        }
+        BinaryOpTypeConversion::CastBoth => {
+            let left = ctx.add(
+                SimplifiedExpression::Cast(left_expr, res.clone()),
+                res.clone(),
+            );
+            let right = ctx.add(
+                SimplifiedExpression::Cast(right_expr, res.clone()),
+                res.clone(),
+            );
+
+            (left, right)
+        }
+    };
+
+    (
+        ctx.add(
+            match op.slice {
+                "+" => SimplifiedExpression::Add(left, right),
+                "-" => SimplifiedExpression::Sub(left, right),
+                "*" => SimplifiedExpression::Mul(left, right),
+                "/" => SimplifiedExpression::Div(left, right),
+                "%" => SimplifiedExpression::Rem(left, right),
+                "&" => SimplifiedExpression::BitAnd(left, right),
+                "|" => SimplifiedExpression::BitOr(left, right),
+                "^" => SimplifiedExpression::BitXor(left, right),
+                "==" => SimplifiedExpression::Eq(left, right),
+                "!=" => SimplifiedExpression::Ne(left, right),
+                ">=" => SimplifiedExpression::Ge(left, right),
+                "<=" => SimplifiedExpression::Le(left, right),
+                ">" => SimplifiedExpression::Gt(left, right),
+                "<" => SimplifiedExpression::Lt(left, right),
+                "&&" => SimplifiedExpression::LogAnd(left, right),
+                "||" => SimplifiedExpression::LogOr(left, right),
+                _ => unreachable!("unknown binary op"),
+            },
+            res.clone(),
+        ),
+        res,
+    )
+}
+
 fn funcall<'a, 's>(
     base_expr: ExprRef,
     base_ty: ConcreteType<'s>,
@@ -1071,7 +1189,35 @@ fn funcall<'a, 's>(
     ctx: &mut SimplificationContext<'a, 's>,
 ) -> (ExprRef, ConcreteType<'s>) {
     let res_ty = match base_ty {
-        ConcreteType::IntrinsicTypeConstructor(t) => t.into(),
+        ConcreteType::IntrinsicTypeConstructor(t) => {
+            let element_ty = t.scalar_type().unwrap();
+            for (t, a) in arg_types.iter().zip(args.iter_mut()) {
+                match (t, &element_ty) {
+                    // TODO: 他の返還は必要になったら書く
+                    (ConcreteType::UnknownIntClass, IntrinsicScalarType::Float) => {
+                        *a = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                *a,
+                                IntrinsicType::Float,
+                            ),
+                            IntrinsicType::Float.into(),
+                        );
+                    }
+                    (ConcreteType::UnknownNumberClass, IntrinsicScalarType::Float) => {
+                        *a = ctx.add(
+                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
+                                *a,
+                                IntrinsicType::Float,
+                            ),
+                            IntrinsicType::Float.into(),
+                        );
+                    }
+                    _ => (),
+                }
+            }
+
+            t.into()
+        }
         ConcreteType::Function {
             args: def_arg_types,
             output,

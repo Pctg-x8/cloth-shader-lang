@@ -595,6 +595,12 @@ pub enum Instruction<IdType = Id> {
         function_type: IdType,
     },
     FunctionEnd,
+    ImageSampleImplicitLod {
+        result_type: IdType,
+        result: IdType,
+        sampled_image: IdType,
+        coordinate: IdType,
+    },
     ImageRead {
         result_type: IdType,
         result: IdType,
@@ -1230,6 +1236,17 @@ impl<IdType> Instruction<IdType> {
                 function_type: relocator(function_type),
             },
             Self::FunctionEnd => Instruction::FunctionEnd,
+            Self::ImageSampleImplicitLod {
+                result_type,
+                result,
+                sampled_image,
+                coordinate,
+            } => Instruction::ImageSampleImplicitLod {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                sampled_image: relocator(sampled_image),
+                coordinate: relocator(coordinate),
+            },
             Self::ImageRead {
                 result_type,
                 result,
@@ -2183,6 +2200,18 @@ impl Instruction<Id> {
                 function_type,
             ]),
             &Self::FunctionEnd => w.push(Self::opcode(1, 56)),
+            &Self::ImageSampleImplicitLod {
+                result_type,
+                result,
+                sampled_image,
+                coordinate,
+            } => w.push_array([
+                Self::opcode(5, 87),
+                result_type,
+                result,
+                sampled_image,
+                coordinate,
+            ]),
             &Self::ImageRead {
                 result_type,
                 result,

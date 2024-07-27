@@ -315,7 +315,10 @@ fn main() {
                         0 => panic!("module entry point must output at least one value"),
                         1 => {
                             if last_var_type != fn_symbol.output[0].1 {
-                                panic!("Error: output type mismatching");
+                                panic!(
+                                    "Error: output type mismatching({last_var_type:?} /= {:?})",
+                                    fn_symbol.output[0].1
+                                );
                             }
 
                             let output = fn_symbol.flatten_output(function_symbol_scope);
@@ -345,7 +348,12 @@ fn main() {
                                     fn_symbol.output.iter().map(|x| x.1.clone()).collect(),
                                 )
                             {
-                                panic!("Error: output type mismatching");
+                                panic!(
+                                    "Error: output type mismatching({last_var_type:?} /= {:?})",
+                                    ConcreteType::Tuple(
+                                        fn_symbol.output.iter().map(|x| x.1.clone()).collect(),
+                                    )
+                                );
                             }
 
                             let output = fn_symbol.flatten_output(function_symbol_scope);
@@ -372,14 +380,7 @@ fn main() {
                     }
                 }
 
-                println!(
-                    "ir body({} reft={}):",
-                    f.fname_token.slice,
-                    SimplifiedExpression::is_referential_transparent(
-                        &simplify_context.vars,
-                        last_var_id.0,
-                    )
-                );
+                println!("ir body({}):", f.fname_token.slice);
                 for (n, (x, t)) in simplify_context.vars.iter().enumerate() {
                     ir::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
                 }
@@ -387,11 +388,6 @@ fn main() {
                 top_scope.attach_function_body(
                     f.fname_token.slice,
                     FunctionBody {
-                        is_referential_transparent:
-                            SimplifiedExpression::is_referential_transparent(
-                                &simplify_context.vars,
-                                last_var_id.0,
-                            ),
                         symbol_scope: function_symbol_scope,
                         expressions: simplify_context.vars,
                         returning: last_var_id,

@@ -130,6 +130,32 @@ impl<'a, 's> SymbolScope<'a, 's> {
                 },
             ],
         );
+        intrinsic_symbols.insert(
+            "sampleAt",
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.SampleAt#Texture1D",
+                    args: vec![IntrinsicType::Texture1D.into()],
+                    output: IntrinsicType::Float4.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.SampleAt#Texture2D",
+                    args: vec![IntrinsicType::Texture2D.into()],
+                    output: IntrinsicType::Float4.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.SampleAt#Texture3D",
+                    args: vec![IntrinsicType::Texture3D.into()],
+                    output: IntrinsicType::Float4.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+            ],
+        );
         var_id_by_name.insert(
             "Float4",
             VarId::IntrinsicTypeConstructor(IntrinsicType::Float4),
