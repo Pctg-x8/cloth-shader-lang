@@ -229,10 +229,10 @@ impl IntrinsicType {
     pub fn make_spv_type(&self) -> spv::Type {
         match self {
             Self::Unit => spv::Type::Void,
-            Self::Bool => spv::Type::Bool,
-            Self::UInt => spv::Type::uint(32),
-            Self::SInt => spv::Type::sint(32),
-            Self::Float => spv::Type::float(32),
+            Self::Bool => spv::ScalarType::Bool.into(),
+            Self::UInt => spv::ScalarType::Int(32, false).into(),
+            Self::SInt => spv::ScalarType::Int(32, true).into(),
+            Self::Float => spv::ScalarType::Float(32).into(),
             Self::UInt2 => Self::UInt.make_spv_type().of_vector(2),
             Self::UInt3 => Self::UInt.make_spv_type().of_vector(3),
             Self::UInt4 => Self::UInt.make_spv_type().of_vector(4),
@@ -257,7 +257,7 @@ impl IntrinsicType {
             Self::Texture1D => unimplemented!(),
             Self::Texture2D => unimplemented!(),
             Self::Texture3D => unimplemented!(),
-            Self::SubpassInput => spv::Type::subpass_data_image_type(),
+            Self::SubpassInput => spv::Type::SUBPASS_DATA_IMAGE_TYPE,
         }
     }
 }
@@ -459,13 +459,10 @@ impl<'s> ConcreteType<'s> {
                         *top = offs + x.std140_size().expect("cannot a member of a struct");
                         let ty = x.make_spv_type(scope);
                         let mut decorations = vec![spv::Decorate::Offset(offs as _)];
-                        if let spv::Type::Matrix {
-                            ref column_type, ..
-                        } = ty
-                        {
+                        if let spv::Type::Matrix(ref c, _) = ty {
                             decorations.extend([
                                 spv::Decorate::ColMajor,
-                                spv::Decorate::MatrixStride(column_type.matrix_stride().unwrap()),
+                                spv::Decorate::MatrixStride(c.matrix_stride().unwrap()),
                             ]);
                         }
 
@@ -494,13 +491,10 @@ impl<'s> ConcreteType<'s> {
                         *top = offs + x.ty.std140_size().expect("cannot a member of a struct");
                         let ty = x.ty.make_spv_type(scope);
                         let mut decorations = vec![spv::Decorate::Offset(offs as _)];
-                        if let spv::Type::Matrix {
-                            ref column_type, ..
-                        } = ty
-                        {
+                        if let spv::Type::Matrix(ref c, _) = ty {
                             decorations.extend([
                                 spv::Decorate::ColMajor,
-                                spv::Decorate::MatrixStride(column_type.matrix_stride().unwrap()),
+                                spv::Decorate::MatrixStride(c.matrix_stride().unwrap()),
                             ]);
                         }
 
@@ -525,15 +519,10 @@ impl<'s> ConcreteType<'s> {
                             *top = offs + x.ty.std140_size().expect("cannot a member of a struct");
                             let ty = x.ty.make_spv_type(scope);
                             let mut decorations = vec![spv::Decorate::Offset(offs as _)];
-                            if let spv::Type::Matrix {
-                                ref column_type, ..
-                            } = ty
-                            {
+                            if let spv::Type::Matrix(ref c, _) = ty {
                                 decorations.extend([
                                     spv::Decorate::ColMajor,
-                                    spv::Decorate::MatrixStride(
-                                        column_type.matrix_stride().unwrap(),
-                                    ),
+                                    spv::Decorate::MatrixStride(c.matrix_stride().unwrap()),
                                 ]);
                             }
 
@@ -580,17 +569,17 @@ pub enum BinaryOpTermConversion {
     PromoteUnknownNumber,
     Cast(IntrinsicType),
     Instantiate(IntrinsicType),
-    Distribute(IntrinsicType, u32),
+    Distribute(IntrinsicType),
     CastAndDistribute(IntrinsicType, u32),
     InstantiateAndDistribute(IntrinsicType, u32),
 }
 impl BinaryOpTermConversion {
     const fn distribute(self, to: IntrinsicType, component_count: u32) -> Self {
         match self {
-            Self::NoConversion => Self::Distribute(to, component_count),
+            Self::NoConversion => Self::Distribute(to),
             Self::Cast(x) => Self::CastAndDistribute(x, component_count),
             Self::Instantiate(x) => Self::InstantiateAndDistribute(x, component_count),
-            Self::Distribute(_, _) => Self::Distribute(to, component_count),
+            Self::Distribute(_) => Self::Distribute(to),
             Self::CastAndDistribute(x, _) => Self::CastAndDistribute(x, component_count),
             Self::InstantiateAndDistribute(x, _) => {
                 Self::InstantiateAndDistribute(x, component_count)
@@ -604,7 +593,6 @@ pub enum BinaryOpTypeConversion {
     NoConversion,
     CastLeftHand(IntrinsicType),
     CastRightHand(IntrinsicType),
-    CastBoth,
     InstantiateAndCastLeftHand(IntrinsicType),
     InstantiateAndCastRightHand(IntrinsicType),
     InstantiateRightAndCastLeftHand(IntrinsicType),
@@ -1557,26 +1545,17 @@ impl<'s> ConcreteType<'s> {
                         )),
                         IntrinsicScalarType::SInt => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
                             IntrinsicType::ivec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::UInt => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
                             IntrinsicType::uvec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::Float => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             IntrinsicType::vec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::UnknownIntClass => Some((
@@ -1608,18 +1587,12 @@ impl<'s> ConcreteType<'s> {
                         )),
                         IntrinsicScalarType::SInt => Some((
                             BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
                             a.clone(),
                         )),
                         IntrinsicScalarType::Float => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             IntrinsicType::vec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::UnknownIntClass => Some((
@@ -1651,26 +1624,17 @@ impl<'s> ConcreteType<'s> {
                         )),
                         IntrinsicScalarType::SInt => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
                             IntrinsicType::ivec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::UInt => Some((
                             BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
                             a.clone(),
                         )),
                         IntrinsicScalarType::Float => Some((
                             BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             IntrinsicType::vec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::UnknownIntClass => Some((
@@ -1704,10 +1668,7 @@ impl<'s> ConcreteType<'s> {
                         )),
                         IntrinsicScalarType::Float => Some((
                             BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             a.clone(),
                         )),
                         IntrinsicScalarType::UnknownIntClass
@@ -1769,18 +1730,12 @@ impl<'s> ConcreteType<'s> {
                     IntrinsicScalarType::SInt => match b.scalar_type()? {
                         IntrinsicScalarType::Unit => None,
                         IntrinsicScalarType::Bool | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
                             BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
                             IntrinsicType::ivec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
                             BinaryOpTermConversion::NoConversion,
                             b.clone(),
                         )),
@@ -1798,10 +1753,7 @@ impl<'s> ConcreteType<'s> {
                     IntrinsicScalarType::UInt => match b.scalar_type()? {
                         IntrinsicScalarType::Unit => None,
                         IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
                             BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
                             IntrinsicType::uvec(element_count)?.into(),
                         )),
@@ -1814,10 +1766,7 @@ impl<'s> ConcreteType<'s> {
                             b.clone(),
                         )),
                         IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
                             BinaryOpTermConversion::NoConversion,
                             b.clone(),
                         )),
@@ -1837,18 +1786,12 @@ impl<'s> ConcreteType<'s> {
                         IntrinsicScalarType::Bool
                         | IntrinsicScalarType::SInt
                         | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
                             IntrinsicType::vec(element_count)?.into(),
                         )),
                         IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Distribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
+                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
                             BinaryOpTermConversion::NoConversion,
                             b.clone(),
                         )),

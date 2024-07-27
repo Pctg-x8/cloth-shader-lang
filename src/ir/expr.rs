@@ -956,7 +956,7 @@ fn binary_op<'a, 's>(
                 SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
                 it.into(),
             ),
-            BinaryOpTermConversion::Distribute(to, count) => ctx.add(
+            BinaryOpTermConversion::Distribute(to) => ctx.add(
                 SimplifiedExpression::ConstructIntrinsicComposite(to, vec![left_expr]),
                 to.into(),
             ),
@@ -993,7 +993,7 @@ fn binary_op<'a, 's>(
                 SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
                 it.into(),
             ),
-            BinaryOpTermConversion::Distribute(to, count) => ctx.add(
+            BinaryOpTermConversion::Distribute(to) => ctx.add(
                 SimplifiedExpression::ConstructIntrinsicComposite(to, vec![right_expr]),
                 to.into(),
             ),
@@ -1140,18 +1140,6 @@ fn binary_op<'a, 's>(
             );
             let left = ctx.add(
                 SimplifiedExpression::Cast(left_expr, res.clone()),
-                res.clone(),
-            );
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::CastBoth => {
-            let left = ctx.add(
-                SimplifiedExpression::Cast(left_expr, res.clone()),
-                res.clone(),
-            );
-            let right = ctx.add(
-                SimplifiedExpression::Cast(right_expr, res.clone()),
                 res.clone(),
             );
 

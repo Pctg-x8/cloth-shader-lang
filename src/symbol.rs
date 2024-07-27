@@ -15,7 +15,6 @@ pub struct IntrinsicFunctionSymbol {
     pub args: Vec<ConcreteType<'static>>,
     pub output: ConcreteType<'static>,
     pub is_pure: bool,
-    pub is_referential_tranparent: bool,
 }
 
 #[derive(Debug, Clone)]

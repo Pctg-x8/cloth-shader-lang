@@ -437,10 +437,12 @@ fn main() {
     }
 
     let mut spv_context = SpvModuleEmissionContext::new();
-    spv_context.capabilities.insert(spv::Capability::Shader);
     spv_context
         .capabilities
-        .insert(spv::Capability::InputAttachment);
+        .insert(spv::asm::Capability::Shader);
+    spv_context
+        .capabilities
+        .insert(spv::asm::Capability::InputAttachment);
     for e in entry_points {
         let body = top_scope
             .user_defined_function_body(e.name)
@@ -453,11 +455,7 @@ fn main() {
         body_context.ops.push(spv::Instruction::Label {
             result: main_label_id,
         });
-        emit_function_body_spv_ops(
-            &body.borrow().expressions,
-            body.borrow().returning,
-            &mut body_context,
-        );
+        emit_function_body_spv_ops(&body.borrow().expressions, &mut body_context);
         body_context.ops.push(spv::Instruction::Return);
         let SpvFunctionBodyEmissionContext {
             latest_id: body_latest_id,
@@ -475,7 +473,7 @@ fn main() {
         spv_context.function_ops.push(spv::Instruction::Function {
             result_type: fn_result_ty,
             result: fnid,
-            function_control: spv::FunctionControl::empty(),
+            function_control: spv::asm::FunctionControl::empty(),
             function_type: fnty,
         });
         let fnid_offset = spv_context.latest_function_id;
@@ -507,7 +505,7 @@ fn main() {
             .extend(e.execution_mode_modifiers.iter().map(|m| match m {
                 spv::ExecutionModeModifier::OriginUpperLeft => spv::Instruction::ExecutionMode {
                     entry_point: fnid,
-                    mode: spv::ExecutionMode::OriginUpperLeft,
+                    mode: spv::asm::ExecutionMode::OriginUpperLeft,
                     args: Vec::new(),
                 },
             }));
@@ -544,11 +542,7 @@ const fn module_header(bound: spv::Id) -> spv::BinaryModuleHeader {
 }
 
 fn optimize<'a, 's>(body: &mut FunctionBody<'a, 's>, scope_arena: &'a Arena<SymbolScope<'a, 's>>) {
-    inline_function1(
-        &mut body.expressions,
-        body.symbol_scope,
-        Some(&mut body.returning),
-    );
+    inline_function1(&mut body.expressions);
 
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "inline function1:").unwrap();

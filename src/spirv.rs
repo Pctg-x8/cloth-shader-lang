@@ -1,186 +1,8 @@
 use std::io::Write;
 
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum Dim {
-    Dim1 = 0,
-    Dim2 = 1,
-    Dim3 = 2,
-    Cube = 3,
-    Rect = 4,
-    Buffer = 5,
-    SubpassData = 6,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum TypeImageSampled {
-    KnownRuntime = 0,
-    WithSamplingOps = 1,
-    WithReadWriteOps = 2,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum ImageFormat {
-    Unknown = 0,
-    Rgba32f,
-    Rgba16f,
-    R32f,
-    Rgba8,
-    Rgba8Snorm,
-    Rg32f,
-    Rg16f,
-    R11fG11fB10f,
-    R16f,
-    Rgba16,
-    Rgb10A2,
-    Rg16,
-    Rg8,
-    R16,
-    R8,
-    Rgba16Snorm,
-    Rg16Snorm,
-    Rg8Snorm,
-    R16Snorm,
-    R8Snorm,
-    Rgba32i,
-    Rgba16i,
-    Rgba8i,
-    R32i,
-    Rg32i,
-    Rg16i,
-    Rg8i,
-    R16i,
-    R8i,
-    Rgba32ui,
-    Rgba16ui,
-    Rgba8ui,
-    R32ui,
-    Rgb10a2ui,
-    Rg32ui,
-    Rg16ui,
-    Rg8ui,
-    R16ui,
-    R8ui,
-    R64ui,
-    R64i,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum AccessQualifier {
-    ReadOnly = 0,
-    WriteOnly = 1,
-    ReadWrite = 2,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum StorageClass {
-    UniformConstant,
-    Input,
-    Uniform,
-    Output,
-    Workgroup,
-    CrossWorkgroup,
-    Private,
-    Function,
-    Generic,
-    PushConstant,
-    AtomicCounter,
-    Image,
-    StorageBuffer,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum SamplerAddressingMode {
-    None = 0,
-    ClampToEdge = 1,
-    Clamp = 2,
-    Repeat = 3,
-    RepeatMirrored = 4,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum SamplerFilterMode {
-    Nearest = 0,
-    Linear = 1,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum ExecutionModel {
-    Vertex = 0,
-    TessellationControl = 1,
-    TessellationEvaluation = 2,
-    Geometry = 3,
-    Fragment = 4,
-    GLCompute = 5,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum Builtin {
-    Position = 0,
-    VertexId = 5,
-    InstanceId = 6,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum Decoration {
-    Block = 2,
-    ColMajor = 5,
-    MatrixStride = 7,
-    Builtin = 11,
-    Location = 30,
-    Binding = 33,
-    DescriptorSet = 34,
-    Offset = 35,
-    InputAttachmentIndex = 43,
-}
-
-bitflags::bitflags! {
-    #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-    pub struct FunctionControl : u32 {
-        const NONE = 0x00;
-        const INLINE = 0x01;
-        const DONT_INLINE = 0x02;
-        const PURE = 0x04;
-        const CONST = 0x08;
-    }
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum AddressingModel {
-    Logical = 0,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum MemoryModel {
-    GLSL450 = 1,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum Capability {
-    Matrix = 0,
-    Shader = 1,
-    Geometry = 2,
-    Tessellation = 3,
-    InputAttachment = 40,
-}
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum ExecutionMode {
-    OriginUpperLeft = 7,
-}
+pub mod asm;
+pub mod types;
+pub use self::types::*;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum ExecutionModeModifier {
@@ -192,12 +14,126 @@ pub enum Decorate {
     Block,
     ColMajor,
     MatrixStride(u32),
-    Builtin(Builtin),
+    Builtin(self::asm::Builtin),
     Location(u32),
     Binding(u32),
     DescriptorSet(u32),
     Offset(u32),
     InputAttachmentIndex(u32),
+}
+impl Decorate {
+    pub fn make_instruction<IdType>(&self, target: IdType) -> Instruction<IdType> {
+        match self {
+            &Self::Block => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::Block,
+                args: vec![],
+            },
+            &Self::ColMajor => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::ColMajor,
+                args: vec![],
+            },
+            &Self::MatrixStride(s) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::MatrixStride,
+                args: vec![s],
+            },
+            &Self::Builtin(b) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::Builtin,
+                args: vec![b as _],
+            },
+            &Self::Location(loc) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::Location,
+                args: vec![loc],
+            },
+            &Self::Binding(b) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::Binding,
+                args: vec![b],
+            },
+            &Self::DescriptorSet(s) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::DescriptorSet,
+                args: vec![s],
+            },
+            &Self::Offset(o) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::Offset,
+                args: vec![o],
+            },
+            &Self::InputAttachmentIndex(a) => Instruction::Decorate {
+                target,
+                decoration: self::asm::Decoration::InputAttachmentIndex,
+                args: vec![a],
+            },
+        }
+    }
+
+    pub fn make_member_instruction<IdType>(
+        &self,
+        struct_type: IdType,
+        member: u32,
+    ) -> Instruction<IdType> {
+        match self {
+            &Self::Block => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::Block,
+                args: vec![],
+            },
+            &Self::ColMajor => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::ColMajor,
+                args: vec![],
+            },
+            &Self::MatrixStride(s) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::MatrixStride,
+                args: vec![s],
+            },
+            &Self::Builtin(b) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::Builtin,
+                args: vec![b as _],
+            },
+            &Self::Location(loc) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::Location,
+                args: vec![loc],
+            },
+            &Self::Binding(b) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::Binding,
+                args: vec![b],
+            },
+            &Self::DescriptorSet(s) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::DescriptorSet,
+                args: vec![s],
+            },
+            &Self::Offset(o) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::Offset,
+                args: vec![o],
+            },
+            &Self::InputAttachmentIndex(a) => Instruction::MemberDecorate {
+                struct_type,
+                member,
+                decoration: self::asm::Decoration::InputAttachmentIndex,
+                args: vec![a],
+            },
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -218,9 +154,9 @@ pub enum Constant {
     },
     Sampler {
         result_type: Type,
-        sampler_addressing_mode: SamplerAddressingMode,
+        sampler_addressing_mode: self::asm::SamplerAddressingMode,
         normalized: bool,
-        sampler_filter_mode: SamplerFilterMode,
+        sampler_filter_mode: self::asm::SamplerFilterMode,
     },
     Null {
         result_type: Type,
@@ -263,171 +199,19 @@ impl From<f32> for Constant {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum TypeArrayLength {
-    ConstExpr(Constant),
-    SpecConstantID(u32),
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct TypeStructMember {
-    pub ty: Type,
-    pub decorations: Vec<Decorate>,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum Type {
-    Void,
-    Bool,
-    Int {
-        width: u32,
-        signedness: bool,
-    },
-    Float {
-        width: u32,
-    },
-    Vector {
-        component_type: Box<Type>,
-        component_count: u32,
-    },
-    Matrix {
-        column_type: Box<Type>,
-        column_count: u32,
-    },
-    Image {
-        sampled_type: Box<Type>,
-        dim: Dim,
-        depth: Option<bool>,
-        arrayed: bool,
-        multisampled: bool,
-        sampled: TypeImageSampled,
-        image_format: ImageFormat,
-        access_qualifier: Option<AccessQualifier>,
-    },
-    Sampler,
-    SampledImage {
-        image_type: Box<Type>,
-    },
-    Array {
-        element_type: Box<Type>,
-        length: Box<TypeArrayLength>,
-    },
-    RuntimeArray {
-        element_type: Box<Type>,
-    },
-    Struct {
-        decorations: Vec<Decorate>,
-        member_types: Vec<TypeStructMember>,
-    },
-    Opaque {
-        name: String,
-    },
-    Pointer {
-        storage_class: StorageClass,
-        base_type: Box<Type>,
-    },
-    Function {
-        return_type: Box<Type>,
-        parameter_types: Vec<Type>,
-    },
-    ForwardPointer {
-        pointer_type: Box<Type>,
-        storage_class: StorageClass,
-    },
-}
-impl Type {
-    #[inline(always)]
-    pub fn subpass_data_image_type() -> Self {
-        Self::Image {
-            sampled_type: Box::new(Self::Float { width: 32 }),
-            dim: Dim::SubpassData,
-            depth: Some(false),
-            arrayed: false,
-            multisampled: false,
-            sampled: TypeImageSampled::WithReadWriteOps,
-            image_format: ImageFormat::Unknown,
-            access_qualifier: None,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn sint(width: u32) -> Self {
-        Self::Int {
-            width,
-            signedness: true,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn uint(width: u32) -> Self {
-        Self::Int {
-            width,
-            signedness: false,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn float(width: u32) -> Self {
-        Self::Float { width }
-    }
-
-    #[inline(always)]
-    pub fn of_vector(self, component_count: u32) -> Self {
-        if component_count == 1 {
-            self
-        } else {
-            Self::Vector {
-                component_type: Box::new(self),
-                component_count,
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn of_matrix(self, row_count: u32, column_count: u32) -> Self {
-        Self::Matrix {
-            column_type: Box::new(self.of_vector(row_count)),
-            column_count,
-        }
-    }
-
-    #[inline(always)]
-    pub fn of_pointer(self, storage: StorageClass) -> Self {
-        Self::Pointer {
-            storage_class: storage,
-            base_type: Box::new(self),
-        }
-    }
-
-    pub const fn matrix_stride(&self) -> Option<u32> {
-        match self {
-            &Self::Vector {
-                ref component_type,
-                component_count,
-            } => match &**component_type {
-                Self::Bool | Self::Int { width: 32, .. } | Self::Float { width: 32 } => {
-                    Some(4 * component_count)
-                }
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-}
-
 pub type Id = u32;
 
 #[derive(Debug, Clone)]
 pub enum Instruction<IdType = Id> {
     Decorate {
         target: IdType,
-        decoration: Decoration,
+        decoration: self::asm::Decoration,
         args: Vec<u32>,
     },
     MemberDecorate {
         struct_type: IdType,
         member: u32,
-        decoration: Decoration,
+        decoration: self::asm::Decoration,
         args: Vec<u32>,
     },
     ExtInstImport {
@@ -442,22 +226,22 @@ pub enum Instruction<IdType = Id> {
         operands: Vec<IdType>,
     },
     MemoryModel {
-        addressing_model: AddressingModel,
-        memory_model: MemoryModel,
+        addressing_model: self::asm::AddressingModel,
+        memory_model: self::asm::MemoryModel,
     },
     EntryPoint {
-        execution_model: ExecutionModel,
+        execution_model: self::asm::ExecutionModel,
         entry_point: IdType,
         name: String,
         interface: Vec<IdType>,
     },
     ExecutionMode {
         entry_point: IdType,
-        mode: ExecutionMode,
+        mode: self::asm::ExecutionMode,
         args: Vec<u32>,
     },
     Capability {
-        capability: Capability,
+        capability: self::asm::Capability,
     },
     TypeVoid {
         result: IdType,
@@ -487,13 +271,13 @@ pub enum Instruction<IdType = Id> {
     TypeImage {
         result: IdType,
         sampled_type: IdType,
-        dim: Dim,
+        dim: self::asm::Dim,
         depth: Option<bool>,
         arrayed: bool,
         multisampled: bool,
-        sampled: TypeImageSampled,
-        image_format: ImageFormat,
-        access_qualifier: Option<AccessQualifier>,
+        sampled: self::asm::TypeImageSampled,
+        image_format: self::asm::ImageFormat,
+        access_qualifier: Option<self::asm::AccessQualifier>,
     },
     TypeSampler {
         result: IdType,
@@ -521,7 +305,7 @@ pub enum Instruction<IdType = Id> {
     },
     TypePointer {
         result: IdType,
-        storage_class: StorageClass,
+        storage_class: self::asm::StorageClass,
         base_type: IdType,
     },
     TypeFunction {
@@ -532,7 +316,7 @@ pub enum Instruction<IdType = Id> {
     TypeForwardPointer {
         result: IdType,
         pointer_type: IdType,
-        storage_class: StorageClass,
+        storage_class: self::asm::StorageClass,
     },
     ConstantTrue {
         result_type: IdType,
@@ -555,9 +339,9 @@ pub enum Instruction<IdType = Id> {
     ConstantSampler {
         result_type: IdType,
         result: IdType,
-        sampler_addressing_mode: SamplerAddressingMode,
+        sampler_addressing_mode: self::asm::SamplerAddressingMode,
         normalized: bool,
-        sampler_filter_mode: SamplerFilterMode,
+        sampler_filter_mode: self::asm::SamplerFilterMode,
     },
     ConstantNull {
         result_type: IdType,
@@ -566,7 +350,7 @@ pub enum Instruction<IdType = Id> {
     Variable {
         result_type: IdType,
         result: IdType,
-        storage_class: StorageClass,
+        storage_class: self::asm::StorageClass,
         initializer: Option<IdType>,
     },
     Load {
@@ -591,7 +375,7 @@ pub enum Instruction<IdType = Id> {
     Function {
         result_type: IdType,
         result: IdType,
-        function_control: FunctionControl,
+        function_control: self::asm::FunctionControl,
         function_type: IdType,
     },
     FunctionEnd,

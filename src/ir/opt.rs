@@ -78,9 +78,7 @@ fn replace_inlined_function_input_refs<'a, 's>(
 }
 
 pub fn inline_function1<'a, 's>(
-    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
-    scope: &'a SymbolScope<'a, 's>,
-    mut block_returing_ref: Option<&mut ExprRef>,
+    expressions: &mut [(SimplifiedExpression<'a, 's>, ConcreteType<'s>)],
 ) -> bool {
     let mut last_reffunction = HashMap::<ExprRef, (&'a SymbolScope<'a, 's>, &'s str)>::new();
     let mut tree_modified = false;
@@ -113,12 +111,10 @@ pub fn inline_function1<'a, 's>(
                 }
             }
             &mut SimplifiedExpression::ScopedBlock {
-                symbol_scope,
                 ref mut expressions,
-                ref mut returning,
                 ..
             } => {
-                tree_modified |= inline_function1(expressions, symbol_scope.0, Some(returning));
+                tree_modified |= inline_function1(expressions);
             }
             _ => (),
         }
@@ -240,6 +236,129 @@ pub fn flatten_composite_outputs<'a, 's>(
     tree_modified
 }
 
+fn promote_single_scope<'a, 's>(
+    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    block_returning_ref: &mut Option<&mut ExprRef>,
+) -> bool {
+    if expressions.len() != 1 {
+        // SimplifiedExpressionが複数ある
+        return false;
+    }
+
+    match expressions.pop().unwrap() {
+        (
+            SimplifiedExpression::ScopedBlock {
+                symbol_scope: child_scope,
+                expressions: mut scope_expr,
+                returning,
+                capturing,
+            },
+            ty,
+        ) if capturing.is_empty() => {
+            // キャプチャのないスコープはそのまま展開可能（キャプチャあっても展開可能かも）
+            assert_eq!(ty, scope_expr[returning.0].1);
+            let parent_scope = child_scope.0.parent.unwrap();
+            let local_var_offset = parent_scope.merge_local_vars(child_scope.0);
+            println!("scopemerge {child_scope:?} -> {:?}", PtrEq(parent_scope));
+
+            for x in scope_expr.iter_mut() {
+                promote_local_var_scope(&mut x.0, child_scope.0, parent_scope, local_var_offset);
+            }
+
+            expressions.extend(scope_expr);
+            if let Some(ref mut b) = block_returning_ref {
+                **b = returning;
+            }
+
+            true
+        }
+        (x, t) => {
+            expressions.push((x, t));
+            false
+        }
+    }
+}
+
+fn unfold_pure_computation_scopes<'a, 's>(
+    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    scope: &'a SymbolScope<'a, 's>,
+    block_returning_ref: &mut Option<&mut ExprRef>,
+) -> bool {
+    let mut tree_modified = false;
+
+    for n in 0..expressions.len() {
+        match &mut expressions[n] {
+            (
+                SimplifiedExpression::ScopedBlock {
+                    expressions: scope_expr,
+                    symbol_scope,
+                    returning,
+                    capturing,
+                },
+                _,
+            ) if !symbol_scope.0.has_local_vars() && scope_expr.iter().all(|x| x.0.is_pure()) => {
+                assert_eq!(returning.0, scope_expr.len() - 1);
+
+                // relocate scope local ids and unlift scope capture refs
+                for x in scope_expr.iter_mut() {
+                    x.0.relocate_ref(|x| x + n);
+                    match &mut x.0 {
+                        &mut SimplifiedExpression::AliasScopeCapture(n) => {
+                            x.0 = match capturing[n] {
+                                ScopeCaptureSource::Expr(x) => SimplifiedExpression::Alias(x),
+                                ScopeCaptureSource::Capture(x) => {
+                                    SimplifiedExpression::AliasScopeCapture(x)
+                                }
+                            };
+                        }
+                        _ => (),
+                    }
+                }
+
+                let first_expr = scope_expr.pop().unwrap();
+                let (
+                    SimplifiedExpression::ScopedBlock {
+                        expressions: mut scope_expr,
+                        ..
+                    },
+                    _,
+                ) = core::mem::replace(&mut expressions[n], first_expr)
+                else {
+                    unreachable!();
+                };
+                let nth_shifts = scope_expr.len();
+                while let Some(x) = scope_expr.pop() {
+                    expressions.insert(n, x);
+                }
+
+                // rewrite shifted reference
+                for m in n + nth_shifts + 1..expressions.len() {
+                    expressions[m]
+                        .0
+                        .relocate_ref(|x| if x >= n { x + nth_shifts } else { x });
+                }
+
+                scope.relocate_local_var_init_expr(|r| {
+                    if r.0 >= n {
+                        ExprRef(r.0 + nth_shifts)
+                    } else {
+                        r
+                    }
+                });
+
+                if let Some(ref mut ret) = block_returning_ref {
+                    ret.0 += if ret.0 >= n { nth_shifts } else { 0 };
+                }
+
+                tree_modified = true;
+            }
+            _ => (),
+        }
+    }
+
+    tree_modified
+}
+
 pub fn optimize_pure_expr<'a, 's>(
     expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
     scope: &'a SymbolScope<'a, 's>,
@@ -249,124 +368,17 @@ pub fn optimize_pure_expr<'a, 's>(
     let mut least_one_tree_modified = false;
     let mut tree_modified = true;
 
-    println!("opt input:");
-    for (n, (x, t)) in expressions.iter().enumerate() {
-        super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
-    }
+    // println!("opt input:");
+    // for (n, (x, t)) in expressions.iter().enumerate() {
+    //     super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+    // }
 
     while tree_modified {
         tree_modified = false;
 
-        // promote single scope
-        if expressions.len() == 1 {
-            match expressions.pop().unwrap() {
-                (
-                    SimplifiedExpression::ScopedBlock {
-                        symbol_scope: child_scope,
-                        expressions: mut scope_expr,
-                        returning,
-                        capturing,
-                    },
-                    ty,
-                ) if capturing.is_empty() => {
-                    assert_eq!(ty, scope_expr[returning.0].1);
-                    let parent_scope = child_scope.0.parent.unwrap();
-                    let local_var_offset = parent_scope.merge_local_vars(child_scope.0);
-                    println!("scopemerge {child_scope:?} -> {:?}", PtrEq(parent_scope));
-
-                    for x in scope_expr.iter_mut() {
-                        promote_local_var_scope(
-                            &mut x.0,
-                            child_scope.0,
-                            parent_scope,
-                            local_var_offset,
-                        );
-                    }
-
-                    expressions.extend(scope_expr);
-                    if let Some(ref mut b) = block_returning_ref {
-                        **b = returning;
-                    }
-
-                    tree_modified = true;
-                }
-                (x, t) => expressions.push((x, t)),
-            }
-        }
-
-        // unfold pure computation scope
-        for n in 0..expressions.len() {
-            match &mut expressions[n] {
-                (
-                    SimplifiedExpression::ScopedBlock {
-                        expressions: scope_expr,
-                        symbol_scope,
-                        returning,
-                        capturing,
-                    },
-                    _,
-                ) if !symbol_scope.0.has_local_vars()
-                    && scope_expr.iter().all(|x| x.0.is_pure()) =>
-                {
-                    assert_eq!(returning.0, scope_expr.len() - 1);
-
-                    // relocate scope local ids and unlift scope capture refs
-                    for x in scope_expr.iter_mut() {
-                        x.0.relocate_ref(|x| x + n);
-                        match &mut x.0 {
-                            &mut SimplifiedExpression::AliasScopeCapture(n) => {
-                                x.0 = match capturing[n] {
-                                    ScopeCaptureSource::Expr(x) => SimplifiedExpression::Alias(x),
-                                    ScopeCaptureSource::Capture(x) => {
-                                        SimplifiedExpression::AliasScopeCapture(x)
-                                    }
-                                };
-                            }
-                            _ => (),
-                        }
-                    }
-
-                    let first_expr = scope_expr.pop().unwrap();
-                    let (
-                        SimplifiedExpression::ScopedBlock {
-                            expressions: mut scope_expr,
-                            ..
-                        },
-                        _,
-                    ) = core::mem::replace(&mut expressions[n], first_expr)
-                    else {
-                        unreachable!();
-                    };
-                    let nth_shifts = scope_expr.len();
-                    while let Some(x) = scope_expr.pop() {
-                        expressions.insert(n, x);
-                    }
-
-                    // rewrite shifted reference
-                    for m in n + nth_shifts + 1..expressions.len() {
-                        expressions[m]
-                            .0
-                            .relocate_ref(|x| if x >= n { x + nth_shifts } else { x });
-                    }
-
-                    scope.relocate_local_var_init_expr(|r| {
-                        if r.0 >= n {
-                            ExprRef(r.0 + nth_shifts)
-                        } else {
-                            r
-                        }
-                    });
-
-                    if let Some(ref mut ret) = block_returning_ref {
-                        ret.0 += if ret.0 >= n { nth_shifts } else { 0 };
-                    }
-
-                    tree_modified = true;
-                }
-                _ => (),
-            }
-        }
-
+        tree_modified |= promote_single_scope(expressions, &mut block_returning_ref);
+        tree_modified |=
+            unfold_pure_computation_scopes(expressions, scope, &mut block_returning_ref);
         tree_modified |= flatten_composite_outputs(expressions, scope, scope_arena);
 
         // inlining loadvar until dirtified / resolving expression aliases
@@ -920,7 +932,6 @@ pub fn optimize_pure_expr<'a, 's>(
         let mut stripped_ops = HashSet::new();
         for (_, t) in current_scope_var_usages.iter() {
             if let &LocalVarUsage::Write(last_write) = t {
-                println!("striplastwrite: {last_write:?}");
                 stripped_ops.insert(last_write.0);
             }
         }
@@ -1068,41 +1079,15 @@ pub fn optimize_pure_expr<'a, 's>(
             }
         }
 
-        println!("transformed(cont?{tree_modified}):");
-        for (n, (x, t)) in expressions.iter().enumerate() {
-            super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
-        }
+        // println!("transformed(cont?{tree_modified}):");
+        // for (n, (x, t)) in expressions.iter().enumerate() {
+        //     super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+        // }
 
         least_one_tree_modified |= tree_modified;
     }
 
     least_one_tree_modified
-}
-
-fn replace_inlined_function_input<'a, 's>(
-    expr: &mut SimplifiedExpression<'a, 's>,
-    inlined_function_symbol_scope: &'a SymbolScope<'a, 's>,
-    call_args: &[ExprRef],
-) {
-    match expr {
-        &mut SimplifiedExpression::LoadByCanonicalRefPath(RefPath::FunctionInput(n)) => {
-            *expr = SimplifiedExpression::Alias(call_args[n]);
-        }
-        &mut SimplifiedExpression::LoadVar(vscope, VarId::FunctionInput(n))
-            if vscope == PtrEq(inlined_function_symbol_scope) =>
-        {
-            *expr = SimplifiedExpression::Alias(call_args[n]);
-        }
-        &mut SimplifiedExpression::ScopedBlock {
-            ref mut expressions,
-            ..
-        } => {
-            for x in expressions {
-                replace_inlined_function_input(&mut x.0, inlined_function_symbol_scope, call_args);
-            }
-        }
-        _ => (),
-    }
 }
 
 fn promote_local_var_scope<'a, 's>(

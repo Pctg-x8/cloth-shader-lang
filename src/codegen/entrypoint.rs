@@ -40,7 +40,7 @@ pub struct ShaderInterfacePushConstantVariable {
 #[derive(Debug)]
 pub struct ShaderEntryPointDescription<'s> {
     pub name: &'s str,
-    pub execution_model: spv::ExecutionModel,
+    pub execution_model: spv::asm::ExecutionModel,
     pub execution_mode_modifiers: Vec<spv::ExecutionModeModifier>,
     pub input_variables: Vec<ShaderInterfaceInputVariable>,
     pub output_variables: Vec<ShaderInterfaceOutputVariable>,
@@ -50,19 +50,19 @@ pub struct ShaderEntryPointDescription<'s> {
 impl<'s> ShaderEntryPointDescription<'s> {
     pub fn extract(func: &UserDefinedFunctionSymbol<'s>, scope: &SymbolScope<'_, 's>) -> Self {
         let execution_model = match func.attribute.shader_model {
-            Some(ShaderModel::VertexShader) => spv::ExecutionModel::Vertex,
+            Some(ShaderModel::VertexShader) => spv::asm::ExecutionModel::Vertex,
             Some(ShaderModel::TessellationControlShader) => {
-                spv::ExecutionModel::TessellationControl
+                spv::asm::ExecutionModel::TessellationControl
             }
             Some(ShaderModel::TessellationEvaluationShader) => {
-                spv::ExecutionModel::TessellationEvaluation
+                spv::asm::ExecutionModel::TessellationEvaluation
             }
-            Some(ShaderModel::GeometryShader) => spv::ExecutionModel::Geometry,
-            Some(ShaderModel::FragmentShader) => spv::ExecutionModel::Fragment,
-            Some(ShaderModel::ComputeShader) => spv::ExecutionModel::GLCompute,
+            Some(ShaderModel::GeometryShader) => spv::asm::ExecutionModel::Geometry,
+            Some(ShaderModel::FragmentShader) => spv::asm::ExecutionModel::Fragment,
+            Some(ShaderModel::ComputeShader) => spv::asm::ExecutionModel::GLCompute,
             None => unreachable!("not a entry point function"),
         };
-        let execution_mode_modifiers = if execution_model == spv::ExecutionModel::Fragment {
+        let execution_mode_modifiers = if execution_model == spv::asm::ExecutionModel::Fragment {
             vec![spv::ExecutionModeModifier::OriginUpperLeft]
         } else {
             vec![]
@@ -150,15 +150,10 @@ fn process_entry_point_inputs<'s>(
 
                             let ty = x.ty.make_spv_type(scope);
                             let mut decorations = vec![spv::Decorate::Offset(offset as _)];
-                            if let spv::Type::Matrix {
-                                ref column_type, ..
-                            } = ty
-                            {
+                            if let spv::Type::Matrix(ref mt, _) = ty {
                                 decorations.extend([
                                     spv::Decorate::ColMajor,
-                                    spv::Decorate::MatrixStride(
-                                        column_type.matrix_stride().unwrap(),
-                                    ),
+                                    spv::Decorate::MatrixStride(mt.matrix_stride().unwrap()),
                                 ]);
                             }
 
@@ -179,13 +174,13 @@ fn process_entry_point_inputs<'s>(
             ConcreteType::Intrinsic(IntrinsicType::Texture2D) => {
                 let spv_ty = spv::Type::SampledImage {
                     image_type: Box::new(spv::Type::Image {
-                        sampled_type: Box::new(spv::Type::float(32)),
-                        dim: spv::Dim::Dim2,
+                        sampled_type: spv::ScalarType::Float(32).into(),
+                        dim: spv::asm::Dim::Dim2,
                         depth: Some(false),
                         arrayed: false,
                         multisampled: false,
-                        sampled: spv::TypeImageSampled::WithSamplingOps,
-                        image_format: spv::ImageFormat::Rgba8,
+                        sampled: spv::asm::TypeImageSampled::WithSamplingOps,
+                        image_format: spv::asm::ImageFormat::Rgba8,
                         access_qualifier: None,
                     }),
                 };
@@ -212,7 +207,7 @@ fn process_entry_point_inputs<'s>(
         } => match ty {
             ConcreteType::Intrinsic(IntrinsicType::SubpassInput) => {
                 uniform_variables.push(ShaderInterfaceUniformVariable {
-                    ty: spv::Type::subpass_data_image_type(),
+                    ty: spv::Type::SUBPASS_DATA_IMAGE_TYPE,
                     original_refpath: refpath.clone(),
                     decorations: vec![
                         spv::Decorate::DescriptorSet(*set),
@@ -257,9 +252,9 @@ fn process_entry_point_inputs<'s>(
             ty: ty.make_spv_type(scope),
             original_refpath: refpath.clone(),
             decorations: vec![spv::Decorate::Builtin(match b {
-                BuiltinInputOutput::Position => spv::Builtin::Position,
-                BuiltinInputOutput::VertexID => spv::Builtin::VertexId,
-                BuiltinInputOutput::InstanceID => spv::Builtin::InstanceId,
+                BuiltinInputOutput::Position => spv::asm::Builtin::Position,
+                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexId,
+                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceId,
             })],
         }),
         _ => match ty {
@@ -324,9 +319,9 @@ fn process_entry_point_outputs<'s>(
         } => output_variables.push(ShaderInterfaceOutputVariable {
             ty: ty.make_spv_type(scope),
             decorations: vec![spv::Decorate::Builtin(match b {
-                BuiltinInputOutput::Position => spv::Builtin::Position,
-                BuiltinInputOutput::VertexID => spv::Builtin::VertexId,
-                BuiltinInputOutput::InstanceID => spv::Builtin::InstanceId,
+                BuiltinInputOutput::Position => spv::asm::Builtin::Position,
+                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexId,
+                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceId,
             })],
         }),
         _ => match ty {

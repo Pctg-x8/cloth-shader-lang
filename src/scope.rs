@@ -49,7 +49,6 @@ impl<'a, 's> SymbolScope<'a, 's> {
                 args: vec![IntrinsicType::SubpassInput.into()],
                 output: IntrinsicType::Float4.into(),
                 is_pure: true,
-                is_referential_tranparent: true,
             }],
         );
         intrinsic_symbols.insert(
@@ -60,13 +59,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
                     args: vec![IntrinsicType::Float4.into()],
                     output: IntrinsicType::Float4.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Normalize#Float3",
                     args: vec![IntrinsicType::Float3.into()],
                     output: IntrinsicType::Float3.into(),
-                    is_referential_tranparent: true,
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
@@ -74,7 +71,6 @@ impl<'a, 's> SymbolScope<'a, 's> {
                     args: vec![IntrinsicType::Float2.into()],
                     output: IntrinsicType::Float2.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
             ],
         );
@@ -86,21 +82,18 @@ impl<'a, 's> SymbolScope<'a, 's> {
                     args: vec![IntrinsicType::Float4.into(), IntrinsicType::Float4.into()],
                     output: IntrinsicType::Float.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Dot#Float3",
                     args: vec![IntrinsicType::Float3.into(), IntrinsicType::Float3.into()],
                     output: IntrinsicType::Float.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Dot#Float2",
                     args: vec![IntrinsicType::Float2.into(), IntrinsicType::Float2.into()],
                     output: IntrinsicType::Float.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
             ],
         );
@@ -112,21 +105,18 @@ impl<'a, 's> SymbolScope<'a, 's> {
                     args: vec![IntrinsicType::Float4x4.into()],
                     output: IntrinsicType::Float4x4.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Transpose#Float3x3",
                     args: vec![IntrinsicType::Float3x3.into()],
                     output: IntrinsicType::Float3x3.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Transpose#Float2x2",
                     args: vec![IntrinsicType::Float2x2.into()],
                     output: IntrinsicType::Float2x2.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
             ],
         );
@@ -135,24 +125,27 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture1D",
-                    args: vec![IntrinsicType::Texture1D.into()],
+                    args: vec![IntrinsicType::Texture1D.into(), IntrinsicType::Float.into()],
                     output: IntrinsicType::Float4.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture2D",
-                    args: vec![IntrinsicType::Texture2D.into()],
+                    args: vec![
+                        IntrinsicType::Texture2D.into(),
+                        IntrinsicType::Float2.into(),
+                    ],
                     output: IntrinsicType::Float4.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture3D",
-                    args: vec![IntrinsicType::Texture3D.into()],
+                    args: vec![
+                        IntrinsicType::Texture3D.into(),
+                        IntrinsicType::Float3.into(),
+                    ],
                     output: IntrinsicType::Float4.into(),
                     is_pure: true,
-                    is_referential_tranparent: true,
                 },
             ],
         );
