@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io::Write};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    io::Write,
+};
 
 use clap::Parser;
 use codegen::{
@@ -8,8 +12,8 @@ use codegen::{
 use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     expr::{simplify_expression, SimplificationContext, SimplifiedExpression},
-    opt::optimize_pure_expr,
-    FunctionBody,
+    opt::{inline_function1, optimize_pure_expr},
+    ExprRef, FunctionBody,
 };
 use parser::{
     FunctionDeclarationInputArguments, FunctionDeclarationOutput, ParseState, Tokenizer,
@@ -26,6 +30,7 @@ use typed_arena::Arena;
 mod parser;
 mod spirv;
 use spirv as spv;
+use utils::PtrEq;
 mod codegen;
 mod concrete_type;
 mod ir;
@@ -38,6 +43,94 @@ mod utils;
 #[derive(Parser)]
 pub struct Args {
     pub file_name: std::path::PathBuf,
+}
+
+struct UserFunctionCallGraph<'a, 's, 'g> {
+    scope: PtrEq<'a, SymbolScope<'a, 's>>,
+    name: &'s str,
+    calling: RefCell<
+        HashMap<(PtrEq<'a, SymbolScope<'a, 's>>, &'s str), &'g UserFunctionCallGraph<'a, 's, 'g>>,
+    >,
+}
+impl<'a, 's, 'g> UserFunctionCallGraph<'a, 's, 'g> {
+    pub fn new(scope: &'a SymbolScope<'a, 's>, name: &'s str) -> Self {
+        Self {
+            scope: PtrEq(scope),
+            name,
+            calling: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+fn collect_function_call_graph<'a, 's, 'g>(
+    body: &[(SimplifiedExpression<'a, 's>, ConcreteType<'s>)],
+    graph_root: &'g UserFunctionCallGraph<'a, 's, 'g>,
+    graph_arena: &'g Arena<UserFunctionCallGraph<'a, 's, 'g>>,
+) -> HashMap<ExprRef, (PtrEq<'a, SymbolScope<'a, 's>>, &'s str)> {
+    let mut last_reffunction = HashMap::<ExprRef, (PtrEq<'a, SymbolScope<'a, 's>>, &'s str)>::new();
+
+    for (n, (expr, _)) in body.iter().enumerate() {
+        match expr {
+            &SimplifiedExpression::RefFunction(scope, f) => {
+                last_reffunction.insert(ExprRef(n), (scope, f));
+            }
+            &SimplifiedExpression::Funcall(base, _) => {
+                if let Some(&(scope, name)) = last_reffunction.get(&base) {
+                    let child_graph = graph_arena.alloc(UserFunctionCallGraph::new(scope.0, name));
+                    graph_root
+                        .calling
+                        .borrow_mut()
+                        .insert((scope, name), child_graph);
+                    if let Some(body) = scope.0.user_defined_function_body(name) {
+                        collect_function_call_graph(
+                            &body.borrow().expressions,
+                            child_graph,
+                            graph_arena,
+                        );
+                    }
+                }
+            }
+            &SimplifiedExpression::ScopedBlock {
+                ref expressions,
+                returning,
+                ..
+            } => {
+                let mut inner_reffunctions =
+                    collect_function_call_graph(expressions, graph_root, graph_arena);
+                if let Some((scope, name)) = inner_reffunctions.remove(&returning) {
+                    // escaping reffunction value
+                    last_reffunction.insert(ExprRef(n), (scope, name));
+                }
+            }
+            _ => (),
+        }
+    }
+
+    last_reffunction
+}
+
+fn print_call_graph<'a, 's, 'g>(root: &'g UserFunctionCallGraph<'a, 's, 'g>) {
+    fn rec<'a, 's, 'g>(
+        current: &'g UserFunctionCallGraph<'a, 's, 'g>,
+        text_stack: &mut Vec<String>,
+        occurence_stack: &mut Vec<(PtrEq<'a, SymbolScope<'a, 's>>, &'s str)>,
+    ) {
+        text_stack.push(format!("{}@{:?}", current.name, current.scope));
+        if occurence_stack.contains(&(current.scope, current.name)) {
+            println!("{} (looped)", text_stack.join(" - "));
+        } else if current.calling.borrow().is_empty() {
+            println!("{}", text_stack.join(" - "));
+        } else {
+            occurence_stack.push((current.scope, current.name));
+            for v in current.calling.borrow().values() {
+                rec(v, text_stack, occurence_stack)
+            }
+            occurence_stack.pop();
+        }
+        text_stack.pop();
+    }
+
+    rec(root, &mut Vec::new(), &mut Vec::new());
 }
 
 fn main() {
@@ -225,10 +318,25 @@ fn main() {
                                 panic!("Error: output type mismatching");
                             }
 
-                            last_var_id = simplify_context.add(
-                                SimplifiedExpression::StoreOutput(last_var_id, 0),
-                                IntrinsicType::Unit.into(),
-                            );
+                            let output = fn_symbol.flatten_output(function_symbol_scope);
+                            match output.len() {
+                                0 => panic!("module entry point must output at least one value"),
+                                1 => {
+                                    last_var_id = simplify_context.add(
+                                        SimplifiedExpression::StoreOutput(last_var_id, 0),
+                                        IntrinsicType::Unit.into(),
+                                    );
+                                }
+                                _ => {
+                                    last_var_id = simplify_context.add(
+                                        SimplifiedExpression::FlattenAndDistributeOutputComposite(
+                                            last_var_id,
+                                            (0..output.len()).collect(),
+                                        ),
+                                        IntrinsicType::Unit.into(),
+                                    );
+                                }
+                            }
                             last_var_type = IntrinsicType::Unit.into();
                         }
                         _ => {
@@ -240,26 +348,50 @@ fn main() {
                                 panic!("Error: output type mismatching");
                             }
 
-                            last_var_id = simplify_context.add(
-                                SimplifiedExpression::DistributeOutputTuple(
-                                    last_var_id,
-                                    (0..fn_symbol.output.len()).collect(),
-                                ),
-                                IntrinsicType::Unit.into(),
-                            );
+                            let output = fn_symbol.flatten_output(function_symbol_scope);
+                            match output.len() {
+                                0 => panic!("module entry point must output at least one value"),
+                                1 => {
+                                    last_var_id = simplify_context.add(
+                                        SimplifiedExpression::StoreOutput(last_var_id, 0),
+                                        IntrinsicType::Unit.into(),
+                                    );
+                                }
+                                _ => {
+                                    last_var_id = simplify_context.add(
+                                        SimplifiedExpression::FlattenAndDistributeOutputComposite(
+                                            last_var_id,
+                                            (0..output.len()).collect(),
+                                        ),
+                                        IntrinsicType::Unit.into(),
+                                    );
+                                }
+                            }
                             last_var_type = IntrinsicType::Unit.into();
                         }
                     }
                 }
-                optimize_pure_expr(
-                    &mut simplify_context.vars,
-                    function_symbol_scope,
-                    Some(&mut last_var_id),
+
+                println!(
+                    "ir body({} reft={}):",
+                    f.fname_token.slice,
+                    SimplifiedExpression::is_referential_transparent(
+                        &simplify_context.vars,
+                        last_var_id.0,
+                    )
                 );
+                for (n, (x, t)) in simplify_context.vars.iter().enumerate() {
+                    ir::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+                }
 
                 top_scope.attach_function_body(
                     f.fname_token.slice,
                     FunctionBody {
+                        is_referential_transparent:
+                            SimplifiedExpression::is_referential_transparent(
+                                &simplify_context.vars,
+                                last_var_id.0,
+                            ),
                         symbol_scope: function_symbol_scope,
                         expressions: simplify_context.vars,
                         returning: last_var_id,
@@ -282,21 +414,42 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
+    let function_call_graph_arena = Arena::new();
+    let call_graph_per_entry = top_scope
+        .iter_user_defined_function_symbols()
+        .filter_map(|f| {
+            if !f.attribute.module_entry_point {
+                return None;
+            }
+
+            let graph_root =
+                function_call_graph_arena.alloc(UserFunctionCallGraph::new(top_scope, f.name()));
+            let Some(body) = top_scope.user_defined_function_body(f.name()) else {
+                panic!("entry point function must have its body");
+            };
+            collect_function_call_graph(
+                &body.borrow().expressions,
+                &*graph_root,
+                &function_call_graph_arena,
+            );
+            Some(&*graph_root)
+        })
+        .collect::<Vec<_>>();
+    println!("call graphs:");
+    for c in call_graph_per_entry.iter() {
+        print_call_graph(c);
+    }
+
     let mut spv_context = SpvModuleEmissionContext::new();
-    spv_context.header_ops.push(spv::Instruction::Capability {
-        capability: spv::Capability::Shader,
-    });
-    spv_context.header_ops.push(spv::Instruction::Capability {
-        capability: spv::Capability::InputAttachment,
-    });
-    spv_context.header_ops.push(spv::Instruction::MemoryModel {
-        addressing_model: spv::AddressingModel::Logical,
-        memory_model: spv::MemoryModel::GLSL450,
-    });
+    spv_context.capabilities.insert(spv::Capability::Shader);
+    spv_context
+        .capabilities
+        .insert(spv::Capability::InputAttachment);
     for e in entry_points {
         let body = top_scope
             .user_defined_function_body(e.name)
             .expect("cannot emit entry point without body");
+        optimize(&mut body.borrow_mut(), &symbol_scope_arena);
         let entry_point_maps = emit_entry_point_spv_ops(&e, &mut spv_context);
         let mut body_context =
             SpvFunctionBodyEmissionContext::new(&mut spv_context, entry_point_maps);
@@ -304,7 +457,11 @@ fn main() {
         body_context.ops.push(spv::Instruction::Label {
             result: main_label_id,
         });
-        emit_function_body_spv_ops(&body.expressions, body.returning, &mut body_context);
+        emit_function_body_spv_ops(
+            &body.borrow().expressions,
+            body.borrow().returning,
+            &mut body_context,
+        );
         body_context.ops.push(spv::Instruction::Return);
         let SpvFunctionBodyEmissionContext {
             latest_id: body_latest_id,
@@ -390,38 +547,38 @@ const fn module_header(bound: spv::Id) -> spv::BinaryModuleHeader {
     }
 }
 
-// fn print_simp_expr(x: &SimplifiedExpression, ty: &ConcreteType, vid: usize, nested: usize) {
-//     match x {
-//         SimplifiedExpression::ScopedBlock {
-//             expressions,
-//             returning,
-//             symbol_scope,
-//         } => {
-//             println!("  {}%{vid}: {ty:?} = Scope {{", "  ".repeat(nested));
-//             println!("  {}Function Inputs:", "  ".repeat(nested + 1));
-//             for (n, a) in symbol_scope.0.function_input_vars.iter().enumerate() {
-//                 println!(
-//                     "  {}  {n} = {}: {:?}",
-//                     "  ".repeat(nested + 1),
-//                     a.occurence.slice,
-//                     a.ty
-//                 );
-//             }
-//             println!("  {}Local Vars:", "  ".repeat(nested + 1));
-//             for (n, a) in symbol_scope.0.local_vars.borrow().iter().enumerate() {
-//                 println!(
-//                     "  {}  {n} = {}: {:?}",
-//                     "  ".repeat(nested + 1),
-//                     a.occurence.slice,
-//                     a.ty
-//                 );
-//             }
-//             for (n, (x, t)) in expressions.iter().enumerate() {
-//                 print_simp_expr(x, t, n, nested + 1);
-//             }
-//             println!("  {}returning {returning:?}", "  ".repeat(nested + 1));
-//             println!("  {}}}", "  ".repeat(nested));
-//         }
-//         _ => println!("  {}%{vid}: {ty:?} = {x:?}", "  ".repeat(nested)),
-//     }
-// }
+fn optimize<'a, 's>(body: &mut FunctionBody<'a, 's>, scope_arena: &'a Arena<SymbolScope<'a, 's>>) {
+    inline_function1(
+        &mut body.expressions,
+        body.symbol_scope,
+        Some(&mut body.returning),
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "inline function1:").unwrap();
+    for (n, (x, t)) in body.expressions.iter().enumerate() {
+        ir::expr::print_simp_expr(&mut stdout, x, t, n, 0);
+    }
+    stdout.flush().unwrap();
+    drop(stdout);
+
+    optimize_pure_expr(
+        &mut body.expressions,
+        body.symbol_scope,
+        scope_arena,
+        Some(&mut body.returning),
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "optimized:").unwrap();
+    for (n, (x, t)) in body.expressions.iter().enumerate() {
+        ir::expr::print_simp_expr(&mut stdout, x, t, n, 0);
+    }
+    writeln!(
+        stdout,
+        "returning {:?}: {:?}",
+        body.returning, body.returning_type
+    )
+    .unwrap();
+    stdout.flush().unwrap();
+}

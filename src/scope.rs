@@ -14,12 +14,13 @@ use crate::{
 pub struct SymbolScope<'a, 's> {
     pub parent: Option<&'a SymbolScope<'a, 's>>,
     pub is_toplevel_function: bool,
-    intrinsic_symbols: HashMap<&'s str, IntrinsicFunctionSymbol>,
+    intrinsic_symbols: HashMap<&'s str, Vec<IntrinsicFunctionSymbol>>,
     user_defined_type_symbols: HashMap<&'s str, (SourceRef<'s>, UserDefinedType<'s>)>,
     user_defined_function_symbols: HashMap<&'s str, UserDefinedFunctionSymbol<'s>>,
-    user_defined_function_body: DebugPrintGuard<RefCell<HashMap<&'s str, FunctionBody<'a, 's>>>>,
-    function_input_vars: Vec<FunctionInputVariable<'s>>,
-    local_vars: RefCell<Vec<LocalVariable<'s>>>,
+    user_defined_function_body:
+        DebugPrintGuard<RefCell<HashMap<&'s str, RefCell<FunctionBody<'a, 's>>>>>,
+    pub function_input_vars: Vec<FunctionInputVariable<'s>>,
+    pub local_vars: RefCell<Vec<LocalVariable<'s>>>,
     var_id_by_name: RefCell<HashMap<&'s str, VarId>>,
 }
 impl<'a, 's> SymbolScope<'a, 's> {
@@ -43,18 +44,103 @@ impl<'a, 's> SymbolScope<'a, 's> {
 
         intrinsic_symbols.insert(
             "subpassLoad",
-            IntrinsicFunctionSymbol {
+            vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.SubpassLoad",
-                ty: ConcreteType::Function {
-                    args: vec![ConcreteType::Intrinsic(IntrinsicType::SubpassInput)],
-                    output: Some(Box::new(ConcreteType::Intrinsic(IntrinsicType::Float4))),
-                },
+                args: vec![IntrinsicType::SubpassInput.into()],
+                output: IntrinsicType::Float4.into(),
                 is_pure: true,
-            },
+                is_referential_tranparent: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "normalize",
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Normalize#Float4",
+                    args: vec![IntrinsicType::Float4.into()],
+                    output: IntrinsicType::Float4.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Normalize#Float3",
+                    args: vec![IntrinsicType::Float3.into()],
+                    output: IntrinsicType::Float3.into(),
+                    is_referential_tranparent: true,
+                    is_pure: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Normalize#Float2",
+                    args: vec![IntrinsicType::Float2.into()],
+                    output: IntrinsicType::Float2.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+            ],
+        );
+        intrinsic_symbols.insert(
+            "dot",
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Dot#Float4",
+                    args: vec![IntrinsicType::Float4.into(), IntrinsicType::Float4.into()],
+                    output: IntrinsicType::Float.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Dot#Float3",
+                    args: vec![IntrinsicType::Float3.into(), IntrinsicType::Float3.into()],
+                    output: IntrinsicType::Float.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Dot#Float2",
+                    args: vec![IntrinsicType::Float2.into(), IntrinsicType::Float2.into()],
+                    output: IntrinsicType::Float.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+            ],
+        );
+        intrinsic_symbols.insert(
+            "transpose",
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Transpose#Float4x4",
+                    args: vec![IntrinsicType::Float4x4.into()],
+                    output: IntrinsicType::Float4x4.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Transpose#Float3x3",
+                    args: vec![IntrinsicType::Float3x3.into()],
+                    output: IntrinsicType::Float3x3.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Transpose#Float2x2",
+                    args: vec![IntrinsicType::Float2x2.into()],
+                    output: IntrinsicType::Float2x2.into(),
+                    is_pure: true,
+                    is_referential_tranparent: true,
+                },
+            ],
         );
         var_id_by_name.insert(
             "Float4",
             VarId::IntrinsicTypeConstructor(IntrinsicType::Float4),
+        );
+        var_id_by_name.insert(
+            "Float3",
+            VarId::IntrinsicTypeConstructor(IntrinsicType::Float3),
+        );
+        var_id_by_name.insert(
+            "Float2",
+            VarId::IntrinsicTypeConstructor(IntrinsicType::Float2),
         );
 
         Self {
@@ -171,7 +257,7 @@ impl<'a, 's> SymbolScope<'a, 's> {
     pub fn attach_function_body(&self, fname: &'s str, body: FunctionBody<'a, 's>) {
         match self.user_defined_function_body.0.borrow_mut().entry(fname) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(body);
+                v.insert(RefCell::new(body));
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 panic!("Error: same name function body was already declared");
@@ -183,9 +269,20 @@ impl<'a, 's> SymbolScope<'a, 's> {
     pub fn user_defined_function_body<'e>(
         &'e self,
         name: &str,
-    ) -> Option<core::cell::Ref<'e, FunctionBody<'a, 's>>> {
+    ) -> Option<core::cell::Ref<'e, RefCell<FunctionBody<'a, 's>>>> {
         core::cell::Ref::filter_map(self.user_defined_function_body.0.borrow(), |x| x.get(name))
             .ok()
+    }
+
+    #[inline]
+    pub fn user_defined_function_body_mut<'e>(
+        &'e self,
+        name: &str,
+    ) -> Option<core::cell::RefMut<'e, RefCell<FunctionBody<'a, 's>>>> {
+        core::cell::RefMut::filter_map(self.user_defined_function_body.0.borrow_mut(), |x| {
+            x.get_mut(name)
+        })
+        .ok()
     }
 
     pub fn declare_function_input(&mut self, name: SourceRef<'s>, ty: ConcreteType<'s>) -> VarId {
@@ -223,7 +320,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
 
     pub fn lookup<'x>(&'x self, name: &str) -> Option<(&Self, VarLookupResult<'x, 's>)> {
         if let Some(x) = self.intrinsic_symbols.get(name) {
-            return Some((self, VarLookupResult::IntrinsicFunction(x)));
+            return Some((self, VarLookupResult::IntrinsicFunctions(x)));
+        }
+
+        if let Some(x) = self.user_defined_function_symbols.get(name) {
+            return Some((self, VarLookupResult::UserDefinedFunction(x)));
         }
 
         match self.var_id_by_name.borrow().get(name) {
@@ -270,6 +371,7 @@ pub enum VarId {
 pub enum VarLookupResult<'x, 's> {
     FunctionInputVar(usize, &'x ConcreteType<'s>),
     ScopeLocalVar(usize, ConcreteType<'s>),
-    IntrinsicFunction(&'x IntrinsicFunctionSymbol),
+    IntrinsicFunctions(&'x [IntrinsicFunctionSymbol]),
     IntrinsicTypeConstructor(IntrinsicType),
+    UserDefinedFunction(&'x UserDefinedFunctionSymbol<'s>),
 }

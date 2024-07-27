@@ -133,6 +133,8 @@ pub enum Builtin {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Decoration {
     Block = 2,
+    ColMajor = 5,
+    MatrixStride = 7,
     Builtin = 11,
     Location = 30,
     Binding = 33,
@@ -188,6 +190,8 @@ pub enum ExecutionModeModifier {
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Decorate {
     Block,
+    ColMajor,
+    MatrixStride(u32),
     Builtin(Builtin),
     Location(u32),
     Binding(u32),
@@ -312,6 +316,7 @@ pub enum Type {
         element_type: Box<Type>,
     },
     Struct {
+        decorations: Vec<Decorate>,
         member_types: Vec<TypeStructMember>,
     },
     Opaque {
@@ -393,6 +398,21 @@ impl Type {
             base_type: Box::new(self),
         }
     }
+
+    pub const fn matrix_stride(&self) -> Option<u32> {
+        match self {
+            &Self::Vector {
+                ref component_type,
+                component_count,
+            } => match &**component_type {
+                Self::Bool | Self::Int { width: 32, .. } | Self::Float { width: 32 } => {
+                    Some(4 * component_count)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 pub type Id = u32;
@@ -409,6 +429,17 @@ pub enum Instruction<IdType = Id> {
         member: u32,
         decoration: Decoration,
         args: Vec<u32>,
+    },
+    ExtInstImport {
+        result: IdType,
+        name: String,
+    },
+    ExtInst {
+        result_type: IdType,
+        result: IdType,
+        set: IdType,
+        instruction: u32,
+        operands: Vec<IdType>,
     },
     MemoryModel {
         addressing_model: AddressingModel,
@@ -608,6 +639,11 @@ pub enum Instruction<IdType = Id> {
         composite: IdType,
         indexes: Vec<u32>,
     },
+    Transpose {
+        result_type: IdType,
+        result: IdType,
+        matrix: IdType,
+    },
     SNegate {
         result_type: IdType,
         result: IdType,
@@ -731,6 +767,12 @@ pub enum Instruction<IdType = Id> {
         result: IdType,
         left_matrix: IdType,
         right_matrix: IdType,
+    },
+    Dot {
+        result_type: IdType,
+        result: IdType,
+        vector1: IdType,
+        vector2: IdType,
     },
     BitwiseOr {
         result_type: IdType,
@@ -917,6 +959,23 @@ impl<IdType> Instruction<IdType> {
                 member,
                 decoration,
                 args,
+            },
+            Self::ExtInstImport { result, name } => Instruction::ExtInstImport {
+                result: relocator(result),
+                name,
+            },
+            Self::ExtInst {
+                result_type,
+                result,
+                set,
+                instruction,
+                operands,
+            } => Instruction::ExtInst {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                set: relocator(set),
+                instruction,
+                operands: operands.into_iter().map(relocator).collect(),
             },
             Self::MemoryModel {
                 addressing_model,
@@ -1251,6 +1310,15 @@ impl<IdType> Instruction<IdType> {
                 composite: relocator(composite),
                 indexes,
             },
+            Self::Transpose {
+                result_type,
+                result,
+                matrix,
+            } => Instruction::Transpose {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                matrix: relocator(matrix),
+            },
             Self::SNegate {
                 result_type,
                 result,
@@ -1477,6 +1545,17 @@ impl<IdType> Instruction<IdType> {
                 result: relocator(result),
                 left_matrix: relocator(left_matrix),
                 right_matrix: relocator(right_matrix),
+            },
+            Self::Dot {
+                result_type,
+                result,
+                vector1,
+                vector2,
+            } => Instruction::Dot {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                vector1: relocator(vector1),
+                vector2: relocator(vector2),
             },
             Self::BitwiseOr {
                 result_type,
@@ -1808,6 +1887,32 @@ impl Instruction<Id> {
                     decoration as _,
                 ])?;
                 w.push_slice(args)?;
+                Ok(())
+            }
+            &Self::ExtInstImport { result, ref name } => {
+                let oplen = 2 + ((name.len() + 1 + 3) >> 2);
+                w.will_push(oplen)?;
+                w.push_array([Self::opcode(oplen as _, 11), result])?;
+                w.push_str(name)?;
+                Ok(())
+            }
+            &Self::ExtInst {
+                result_type,
+                result,
+                set,
+                instruction,
+                ref operands,
+            } => {
+                let oplen = 5 + operands.len();
+                w.will_push(oplen)?;
+                w.push_array([
+                    Self::opcode(oplen as _, 12),
+                    result_type,
+                    result,
+                    set,
+                    instruction,
+                ])?;
+                w.push_slice(operands)?;
                 Ok(())
             }
             &Self::MemoryModel {
@@ -2146,6 +2251,11 @@ impl Instruction<Id> {
                 w.push_slice(indexes)?;
                 Ok(())
             }
+            &Self::Transpose {
+                result_type,
+                result,
+                matrix,
+            } => w.push_array([Self::opcode(4, 84), result_type, result, matrix]),
             &Self::SNegate {
                 result_type,
                 result,
@@ -2360,6 +2470,12 @@ impl Instruction<Id> {
                 left_matrix,
                 right_matrix,
             ]),
+            &Self::Dot {
+                result_type,
+                result,
+                vector1,
+                vector2,
+            } => w.push_array([Self::opcode(5, 148), result_type, result, vector1, vector2]),
             &Self::BitwiseOr {
                 result_type,
                 result,

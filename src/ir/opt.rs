@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use typed_arena::Arena;
+
 use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
     ref_path::RefPath,
@@ -9,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    expr::{ConstModifiers, SimplifiedExpression},
+    expr::{ConstModifiers, ScopeCaptureSource, SimplifiedExpression},
     ExprRef,
 };
 
@@ -40,13 +42,217 @@ impl LocalVarUsage {
     }
 }
 
+fn replace_inlined_function_input_refs<'a, 's>(
+    expressions: &mut [(SimplifiedExpression<'a, 's>, ConcreteType<'s>)],
+    function_scope: &'a SymbolScope<'a, 's>,
+    substitutions: &[usize],
+) {
+    for (x, _) in expressions.iter_mut() {
+        match x {
+            &mut SimplifiedExpression::LoadVar(vscope, VarId::FunctionInput(n))
+                if vscope == PtrEq(function_scope) =>
+            {
+                *x = SimplifiedExpression::AliasScopeCapture(substitutions[n]);
+            }
+            &mut SimplifiedExpression::ScopedBlock {
+                ref mut capturing,
+                ref mut expressions,
+                ..
+            } => {
+                let finput_capture_offset = capturing.len();
+                capturing.extend(
+                    substitutions
+                        .iter()
+                        .map(|&x| ScopeCaptureSource::Capture(x)),
+                );
+                let substitutions = substitutions
+                    .iter()
+                    .enumerate()
+                    .map(|(x, _)| x + finput_capture_offset)
+                    .collect::<Vec<_>>();
+                replace_inlined_function_input_refs(expressions, function_scope, &substitutions);
+            }
+            _ => (),
+        }
+    }
+}
+
+pub fn inline_function1<'a, 's>(
+    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    scope: &'a SymbolScope<'a, 's>,
+    mut block_returing_ref: Option<&mut ExprRef>,
+) -> bool {
+    let mut last_reffunction = HashMap::<ExprRef, (&'a SymbolScope<'a, 's>, &'s str)>::new();
+    let mut tree_modified = false;
+
+    for (n, (x, _)) in expressions.iter_mut().enumerate() {
+        match x {
+            &mut SimplifiedExpression::RefFunction(vscope, name) => {
+                last_reffunction.insert(ExprRef(n), (vscope.0, name));
+            }
+            &mut SimplifiedExpression::Funcall(base, ref args) => {
+                if let Some((fscope, fname)) = last_reffunction.get(&base) {
+                    if let Some(fbody) = fscope.user_defined_function_body(fname) {
+                        let mut expressions = fbody.borrow().expressions.clone();
+                        let substitutions = (0..args.len()).collect::<Vec<_>>();
+                        replace_inlined_function_input_refs(
+                            &mut expressions,
+                            fbody.borrow().symbol_scope,
+                            &substitutions,
+                        );
+
+                        *x = SimplifiedExpression::ScopedBlock {
+                            capturing: args.iter().map(|&x| ScopeCaptureSource::Expr(x)).collect(),
+                            symbol_scope: PtrEq(fbody.borrow().symbol_scope),
+                            expressions,
+                            returning: fbody.borrow().returning,
+                        };
+
+                        tree_modified = true;
+                    }
+                }
+            }
+            &mut SimplifiedExpression::ScopedBlock {
+                symbol_scope,
+                ref mut expressions,
+                ref mut returning,
+                ..
+            } => {
+                tree_modified |= inline_function1(expressions, symbol_scope.0, Some(returning));
+            }
+            _ => (),
+        }
+    }
+
+    tree_modified
+}
+
+fn flatten_composite_outputs_rec<'a, 's>(
+    generated_sink: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    scope: &'a SymbolScope<'a, 's>,
+    source_type: &ConcreteType<'s>,
+    source_id: ExprRef,
+    left_slot_numbers: &mut Vec<usize>,
+) {
+    match source_type {
+        &ConcreteType::Intrinsic(_) => {
+            // can output directly
+            let slot_number = left_slot_numbers.remove(0);
+            generated_sink.push((
+                SimplifiedExpression::StoreOutput(source_id, slot_number),
+                IntrinsicType::Unit.into(),
+            ));
+        }
+        &ConcreteType::Tuple(ref xs) => {
+            // flatten more
+            for (n, x) in xs.iter().enumerate() {
+                generated_sink.push((SimplifiedExpression::TupleRef(source_id, n), x.clone()));
+                let new_source_id = ExprRef(generated_sink.len() - 1);
+                flatten_composite_outputs_rec(
+                    generated_sink,
+                    scope,
+                    x,
+                    new_source_id,
+                    left_slot_numbers,
+                );
+            }
+        }
+        &ConcreteType::Struct(ref members) => {
+            // flatten more
+            for x in members {
+                generated_sink.push((
+                    SimplifiedExpression::MemberRef(source_id, x.name.clone()),
+                    x.ty.clone(),
+                ));
+                let new_source_id = ExprRef(generated_sink.len() - 1);
+                flatten_composite_outputs_rec(
+                    generated_sink,
+                    scope,
+                    &x.ty,
+                    new_source_id,
+                    left_slot_numbers,
+                );
+            }
+        }
+        &ConcreteType::UserDefined { name, .. } => match scope.lookup_user_defined_type(name) {
+            Some((_, (_, crate::concrete_type::UserDefinedType::Struct(members)))) => {
+                // flatten more
+                for x in members {
+                    generated_sink.push((
+                        SimplifiedExpression::MemberRef(source_id, x.name.clone()),
+                        x.ty.clone(),
+                    ));
+                    let new_source_id = ExprRef(generated_sink.len() - 1);
+                    flatten_composite_outputs_rec(
+                        generated_sink,
+                        scope,
+                        &x.ty,
+                        new_source_id,
+                        left_slot_numbers,
+                    );
+                }
+            }
+            None => panic!("Error: cannot output this type: {source_type:?}"),
+        },
+        _ => panic!("Error: cannot output this type: {source_type:?}"),
+    }
+}
+
+pub fn flatten_composite_outputs<'a, 's>(
+    expressions: &mut [(SimplifiedExpression<'a, 's>, ConcreteType<'s>)],
+    scope: &'a SymbolScope<'a, 's>,
+    scope_arena: &'a Arena<SymbolScope<'a, 's>>,
+) -> bool {
+    let mut tree_modified = false;
+
+    for n in 0..expressions.len() {
+        match &expressions[n].0 {
+            &SimplifiedExpression::FlattenAndDistributeOutputComposite(src, ref slot_numbers) => {
+                let mut slot_numbers = slot_numbers.clone();
+                let mut generated = Vec::new();
+                generated.push((
+                    SimplifiedExpression::AliasScopeCapture(0),
+                    expressions[src.0].1.clone(),
+                ));
+                let new_scope = scope_arena.alloc(SymbolScope::new(Some(scope), false));
+                flatten_composite_outputs_rec(
+                    &mut generated,
+                    new_scope,
+                    &expressions[src.0].1,
+                    ExprRef(0),
+                    &mut slot_numbers,
+                );
+                expressions[n] = (
+                    SimplifiedExpression::ScopedBlock {
+                        capturing: vec![ScopeCaptureSource::Expr(src)],
+                        symbol_scope: PtrEq(new_scope),
+                        returning: ExprRef(generated.len() - 1),
+                        expressions: generated,
+                    },
+                    IntrinsicType::Unit.into(),
+                );
+                tree_modified = true;
+            }
+            _ => (),
+        }
+    }
+
+    tree_modified
+}
+
 pub fn optimize_pure_expr<'a, 's>(
     expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
     scope: &'a SymbolScope<'a, 's>,
+    scope_arena: &'a Arena<SymbolScope<'a, 's>>,
     mut block_returning_ref: Option<&mut ExprRef>,
 ) -> bool {
     let mut least_one_tree_modified = false;
     let mut tree_modified = true;
+
+    // println!("input:");
+    // for (n, (x, t)) in expressions.iter().enumerate() {
+    //     super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+    // }
 
     while tree_modified {
         tree_modified = false;
@@ -59,9 +265,10 @@ pub fn optimize_pure_expr<'a, 's>(
                         symbol_scope: child_scope,
                         expressions: mut scope_expr,
                         returning,
+                        capturing,
                     },
                     ty,
-                ) => {
+                ) if capturing.is_empty() => {
                     assert_eq!(ty, scope_expr[returning.0].1);
                     let parent_scope = child_scope.0.parent.unwrap();
                     let local_var_offset = parent_scope.merge_local_vars(child_scope.0);
@@ -95,6 +302,7 @@ pub fn optimize_pure_expr<'a, 's>(
                         expressions: scope_expr,
                         symbol_scope,
                         returning,
+                        capturing,
                     },
                     _,
                 ) if !symbol_scope.0.has_local_vars()
@@ -102,9 +310,22 @@ pub fn optimize_pure_expr<'a, 's>(
                 {
                     assert_eq!(returning.0, scope_expr.len() - 1);
 
+                    // relocate scope local ids and unlift scope capture refs
                     for x in scope_expr.iter_mut() {
                         x.0.relocate_ref(|x| x + n);
+                        match &mut x.0 {
+                            &mut SimplifiedExpression::AliasScopeCapture(n) => {
+                                x.0 = match capturing[n] {
+                                    ScopeCaptureSource::Expr(x) => SimplifiedExpression::Alias(x),
+                                    ScopeCaptureSource::Capture(x) => {
+                                        SimplifiedExpression::AliasScopeCapture(x)
+                                    }
+                                };
+                            }
+                            _ => (),
+                        }
                     }
+
                     let first_expr = scope_expr.pop().unwrap();
                     let (
                         SimplifiedExpression::ScopedBlock {
@@ -146,7 +367,9 @@ pub fn optimize_pure_expr<'a, 's>(
             }
         }
 
-        // inlining loadvar until dirtified
+        tree_modified |= flatten_composite_outputs(expressions, scope, scope_arena);
+
+        // inlining loadvar until dirtified / resolving expression aliases
         let mut last_loadvar_expr_id = HashMap::new();
         let mut expr_id_alias = HashMap::new();
         let mut last_expr_ids = HashMap::new();
@@ -171,6 +394,10 @@ pub fn optimize_pure_expr<'a, 's>(
                     scope.relocate_local_var_init_expr(|r| if r.0 == n { init_expr_id } else { r });
                     last_loadvar_expr_id
                         .insert((vscope.as_ptr(), VarId::ScopeLocal(vx)), init_expr_id.0);
+                }
+                &mut SimplifiedExpression::Alias(x) => {
+                    expr_id_alias.insert(n, x.0);
+                    scope.relocate_local_var_init_expr(|r| if r.0 == n { x } else { r });
                 }
                 x => {
                     tree_modified |=
@@ -305,6 +532,9 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::LogOr(left, right) => {
                     referenced_expr.extend([left, right]);
                 }
+                &mut SimplifiedExpression::Pow(left, right) => {
+                    referenced_expr.extend([left, right]);
+                }
                 &mut SimplifiedExpression::Select(c, t, e) => {
                     referenced_expr.extend([c, t, e]);
                 }
@@ -327,35 +557,38 @@ pub fn optimize_pure_expr<'a, 's>(
                         };
 
                     if let Some((it, count)) = intrinsic_constructor {
-                        let mut args = args.clone();
+                        let args = args.clone();
                         referenced_expr.extend(args.iter().copied());
-
-                        let org_arg_count = args.len();
-                        let mut ins_count = 0;
-                        while args.len() < count {
-                            // extend by repeating
-                            args.push(args[ins_count % org_arg_count]);
-                            ins_count += 1;
-                        }
 
                         expressions[n].0 =
                             SimplifiedExpression::ConstructIntrinsicComposite(it, args);
                         tree_modified = true;
                     } else {
-                        let intrinsic_function =
-                            match unsafe { &(&*expressions_head_ptr.add(base.0)).0 } {
-                                &SimplifiedExpression::IntrinsicFunction(name, is_pure) => {
-                                    Some((name, is_pure))
-                                }
-                                _ => None,
-                            };
+                        let intrinsic_function = match unsafe {
+                            &(&*expressions_head_ptr.add(base.0)).0
+                        } {
+                            &SimplifiedExpression::IntrinsicFunctions(ref overloads) => {
+                                let matching_overloads = overloads.iter().find(|f| {
+                                    f.args.iter().zip(args.iter()).all(|x| {
+                                        x.0 == unsafe { &(&*expressions_head_ptr.add(x.1 .0)).1 }
+                                    })
+                                });
 
-                        if let Some((instr, is_pure)) = intrinsic_function {
+                                match matching_overloads {
+                                    Some(f) => Some((f.name, f.is_pure, f.output.clone())),
+                                    None => panic!("Error: no matching overloads found"),
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        if let Some((instr, is_pure, output)) = intrinsic_function {
                             let args = args.clone();
                             referenced_expr.extend(args.iter().copied());
 
                             expressions[n].0 =
                                 SimplifiedExpression::IntrinsicFuncall(instr, is_pure, args);
+                            expressions[n].1 = output;
                             tree_modified = true;
                         } else {
                             referenced_expr.insert(base);
@@ -368,9 +601,44 @@ pub fn optimize_pure_expr<'a, 's>(
                     SourceRefSliceEq(SourceRef { slice: name, .. }),
                 ) => match &expressions[base.0].0 {
                     SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
+                        let member_index = match &expressions[base.0].1 {
+                            &ConcreteType::Struct(ref member) => {
+                                match member.iter().position(|x| x.name.0.slice == name){
+                                    Some(x) => x,
+                                    None => panic!("Error: struct type does not contains member named '{name}'"),
+                                }
+                            }
+                            &ConcreteType::UserDefined { .. } => panic!("not instantiated"),
+                            _ => unreachable!("Error: cannot apply MemberRef for non-struct types"),
+                        };
+
                         expressions[n].0 = SimplifiedExpression::LoadByCanonicalRefPath(
-                            RefPath::Member(Box::new(rp.clone()), name),
+                            RefPath::Member(Box::new(rp.clone()), member_index),
                         );
+                        tree_modified = true;
+                    }
+                    SimplifiedExpression::ConstructStructValue(ref xs) => {
+                        let member_index = match &expressions[base.0].1 {
+                            &ConcreteType::Struct(ref member) => {
+                                match member.iter().position(|x| x.name.0.slice == name){
+                                    Some(x) => x,
+                                    None => panic!("Error: struct type does not contains member named '{name}'"),
+                                }
+                            }
+                            &ConcreteType::UserDefined { .. } => panic!("not instantiated"),
+                            _ => unreachable!("Error: cannot apply MemberRef for non-struct types"),
+                        };
+
+                        expressions[n].0 = SimplifiedExpression::Alias(xs[member_index]);
+                        tree_modified = true;
+                    }
+                    _ => {
+                        referenced_expr.insert(base);
+                    }
+                },
+                &mut SimplifiedExpression::TupleRef(base, index) => match &expressions[base.0].0 {
+                    &SimplifiedExpression::ConstructTuple(ref xs) => {
+                        expressions[n].0 = SimplifiedExpression::Alias(xs[index]);
                         tree_modified = true;
                     }
                     _ => {
@@ -406,7 +674,8 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::StoreLocal(_, v) => {
                     referenced_expr.insert(v);
                 }
-                &mut SimplifiedExpression::IntrinsicFunction(_, _) => (),
+                &mut SimplifiedExpression::RefFunction(_, _) => (),
+                &mut SimplifiedExpression::IntrinsicFunctions(_) => (),
                 &mut SimplifiedExpression::IntrinsicTypeConstructor(_) => (),
                 &mut SimplifiedExpression::IntrinsicFuncall(_, _, ref xs) => {
                     referenced_expr.extend(xs.iter().copied());
@@ -434,6 +703,9 @@ pub fn optimize_pure_expr<'a, 's>(
                 }
                 &mut SimplifiedExpression::Swizzle4(src, _, _, _, _) => {
                     referenced_expr.insert(src);
+                }
+                &mut SimplifiedExpression::VectorShuffle4(v1, v2, _, _, _, _) => {
+                    referenced_expr.extend([v1, v2]);
                 }
                 &mut SimplifiedExpression::InstantiateIntrinsicTypeClass(
                     v,
@@ -491,13 +763,84 @@ pub fn optimize_pure_expr<'a, 's>(
                 &mut SimplifiedExpression::ConstructTuple(ref xs) => {
                     referenced_expr.extend(xs.iter().copied());
                 }
+                &mut SimplifiedExpression::ConstructIntrinsicComposite(
+                    IntrinsicType::Float4,
+                    ref xs,
+                ) => match &xs[..] {
+                    &[a, b] => match (&expressions[a.0], &expressions[b.0]) {
+                        // TODO: 他パターンは後で実装
+                        (
+                            &(_, ConcreteType::Intrinsic(IntrinsicType::Float3)),
+                            &(SimplifiedExpression::Swizzle1(src2, d), _),
+                        ) => {
+                            // splice float3
+                            expressions[n].0 =
+                                SimplifiedExpression::VectorShuffle4(a, src2, 0, 1, 2, d + 3);
+                            referenced_expr.extend([a, src2]);
+                            tree_modified = true;
+                        }
+                        (
+                            &(_, ConcreteType::Intrinsic(IntrinsicType::Float3)),
+                            &(_, ConcreteType::Intrinsic(IntrinsicType::Float)),
+                        ) => {
+                            // decomposite float3 and construct
+                            expressions[n].0 = SimplifiedExpression::ScopedBlock {
+                                capturing: vec![
+                                    ScopeCaptureSource::Expr(a),
+                                    ScopeCaptureSource::Expr(b),
+                                ],
+                                symbol_scope: PtrEq(
+                                    scope_arena.alloc(SymbolScope::new(Some(scope), false)),
+                                ),
+                                expressions: vec![
+                                    (
+                                        SimplifiedExpression::AliasScopeCapture(0),
+                                        IntrinsicType::Float3.into(),
+                                    ),
+                                    (
+                                        SimplifiedExpression::Swizzle1(ExprRef(0), 0),
+                                        IntrinsicType::Float.into(),
+                                    ),
+                                    (
+                                        SimplifiedExpression::Swizzle1(ExprRef(0), 1),
+                                        IntrinsicType::Float.into(),
+                                    ),
+                                    (
+                                        SimplifiedExpression::Swizzle1(ExprRef(0), 2),
+                                        IntrinsicType::Float.into(),
+                                    ),
+                                    (
+                                        SimplifiedExpression::AliasScopeCapture(1),
+                                        IntrinsicType::Float.into(),
+                                    ),
+                                    (
+                                        SimplifiedExpression::ConstructIntrinsicComposite(
+                                            IntrinsicType::Float4,
+                                            vec![ExprRef(1), ExprRef(2), ExprRef(3), ExprRef(4)],
+                                        ),
+                                        IntrinsicType::Float4.into(),
+                                    ),
+                                ],
+                                returning: ExprRef(5),
+                            };
+                            referenced_expr.extend([a, b]);
+                            tree_modified = true;
+                        }
+                        _ => {
+                            referenced_expr.extend([a, b]);
+                        }
+                    },
+                    _ => {
+                        referenced_expr.extend(xs.iter().copied());
+                    }
+                },
                 &mut SimplifiedExpression::ConstructIntrinsicComposite(_, ref xs) => {
                     referenced_expr.extend(xs.iter().copied());
                 }
                 &mut SimplifiedExpression::StoreOutput(x, _) => {
                     referenced_expr.insert(x);
                 }
-                &mut SimplifiedExpression::DistributeOutputTuple(x, _) => {
+                &mut SimplifiedExpression::FlattenAndDistributeOutputComposite(x, _) => {
                     referenced_expr.insert(x);
                 }
                 &mut SimplifiedExpression::ConstructStructValue(ref xs) => {
@@ -507,9 +850,19 @@ pub fn optimize_pure_expr<'a, 's>(
                     ref mut expressions,
                     ref mut returning,
                     ref symbol_scope,
+                    ref capturing,
                 } => {
-                    tree_modified |=
-                        optimize_pure_expr(expressions, symbol_scope.0, Some(returning));
+                    tree_modified |= optimize_pure_expr(
+                        expressions,
+                        symbol_scope.0,
+                        scope_arena,
+                        Some(returning),
+                    );
+
+                    referenced_expr.extend(capturing.iter().filter_map(|x| match x {
+                        ScopeCaptureSource::Expr(x) => Some(x),
+                        _ => None,
+                    }));
 
                     for (n, x) in expressions.iter().enumerate() {
                         match x.0 {
@@ -533,6 +886,10 @@ pub fn optimize_pure_expr<'a, 's>(
                         }
                     }
                 }
+                &mut SimplifiedExpression::AliasScopeCapture(_) => (),
+                &mut SimplifiedExpression::Alias(x) => {
+                    referenced_expr.insert(x);
+                }
             }
         }
 
@@ -549,6 +906,7 @@ pub fn optimize_pure_expr<'a, 's>(
                 stripped_ops.insert(n);
             }
         }
+        let mut referenced_expr = referenced_expr.into_iter().collect::<Vec<_>>();
 
         // strip expressions
         let mut stripped_ops = stripped_ops.into_iter().collect::<Vec<_>>();
@@ -563,6 +921,10 @@ pub fn optimize_pure_expr<'a, 's>(
 
             if let Some(ref mut ret) = block_returning_ref {
                 ret.0 -= if ret.0 > n { 1 } else { 0 };
+            }
+
+            for x in referenced_expr.iter_mut() {
+                x.0 -= if x.0 > n { 1 } else { 0 };
             }
 
             for x in stripped_ops.iter_mut() {
@@ -604,15 +966,115 @@ pub fn optimize_pure_expr<'a, 's>(
             tree_modified = true;
         }
 
-        // println!("transformed(cont?{tree_modified}):");
-        // for (n, (x, t)) in expressions.iter().enumerate() {
-        //     print_simp_expr(x, t, n, 0);
-        // }
+        // unfold unreferenced computation scope
+        for n in 0..expressions.len() {
+            match &mut expressions[n] {
+                (
+                    SimplifiedExpression::ScopedBlock {
+                        expressions: scope_expr,
+                        symbol_scope,
+                        returning,
+                        capturing,
+                    },
+                    _,
+                ) if !symbol_scope.0.has_local_vars()
+                    && (!referenced_expr.contains(&ExprRef(n))
+                        || block_returning_ref.as_ref().is_some_and(|x| x.0 == n)) =>
+                {
+                    assert_eq!(returning.0, scope_expr.len() - 1);
+
+                    // relocate scope local ids and unlift scope capture refs
+                    for x in scope_expr.iter_mut() {
+                        x.0.relocate_ref(|x| x + n);
+                        match &mut x.0 {
+                            &mut SimplifiedExpression::AliasScopeCapture(n) => {
+                                x.0 = match capturing[n] {
+                                    ScopeCaptureSource::Expr(x) => SimplifiedExpression::Alias(x),
+                                    ScopeCaptureSource::Capture(x) => {
+                                        SimplifiedExpression::AliasScopeCapture(x)
+                                    }
+                                };
+                            }
+                            _ => (),
+                        }
+                    }
+
+                    let first_expr = scope_expr.pop().unwrap();
+                    let (
+                        SimplifiedExpression::ScopedBlock {
+                            expressions: mut scope_expr,
+                            ..
+                        },
+                        _,
+                    ) = core::mem::replace(&mut expressions[n], first_expr)
+                    else {
+                        unreachable!();
+                    };
+                    let nth_shifts = scope_expr.len();
+                    while let Some(x) = scope_expr.pop() {
+                        expressions.insert(n, x);
+                    }
+
+                    // rewrite shifted reference
+                    for m in n + nth_shifts + 1..expressions.len() {
+                        expressions[m]
+                            .0
+                            .relocate_ref(|x| if x >= n { x + nth_shifts } else { x });
+                    }
+
+                    scope.relocate_local_var_init_expr(|r| {
+                        if r.0 >= n {
+                            ExprRef(r.0 + nth_shifts)
+                        } else {
+                            r
+                        }
+                    });
+
+                    if let Some(ref mut ret) = block_returning_ref {
+                        ret.0 += if ret.0 >= n { nth_shifts } else { 0 };
+                    }
+
+                    tree_modified = true;
+                }
+                _ => (),
+            }
+        }
+
+        println!("transformed(cont?{tree_modified}):");
+        for (n, (x, t)) in expressions.iter().enumerate() {
+            super::expr::print_simp_expr(&mut std::io::stdout(), x, t, n, 0);
+        }
 
         least_one_tree_modified |= tree_modified;
     }
 
     least_one_tree_modified
+}
+
+fn replace_inlined_function_input<'a, 's>(
+    expr: &mut SimplifiedExpression<'a, 's>,
+    inlined_function_symbol_scope: &'a SymbolScope<'a, 's>,
+    call_args: &[ExprRef],
+) {
+    match expr {
+        &mut SimplifiedExpression::LoadByCanonicalRefPath(RefPath::FunctionInput(n)) => {
+            *expr = SimplifiedExpression::Alias(call_args[n]);
+        }
+        &mut SimplifiedExpression::LoadVar(vscope, VarId::FunctionInput(n))
+            if vscope == PtrEq(inlined_function_symbol_scope) =>
+        {
+            *expr = SimplifiedExpression::Alias(call_args[n]);
+        }
+        &mut SimplifiedExpression::ScopedBlock {
+            ref mut expressions,
+            ..
+        } => {
+            for x in expressions {
+                replace_inlined_function_input(&mut x.0, inlined_function_symbol_scope, call_args);
+            }
+        }
+        _ => (),
+    }
 }
 
 fn promote_local_var_scope<'a, 's>(

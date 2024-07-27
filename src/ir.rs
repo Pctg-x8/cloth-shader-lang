@@ -21,4 +21,5 @@ pub struct FunctionBody<'a, 's> {
     pub expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
     pub returning: ExprRef,
     pub returning_type: ConcreteType<'s>,
+    pub is_referential_transparent: bool,
 }

@@ -11,9 +11,9 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct ShaderInterfaceInputVariable<'s> {
+pub struct ShaderInterfaceInputVariable {
     pub ty: spv::Type,
-    pub original_refpath: RefPath<'s>,
+    pub original_refpath: RefPath,
     pub decorations: Vec<spv::Decorate>,
 }
 
@@ -24,16 +24,16 @@ pub struct ShaderInterfaceOutputVariable {
 }
 
 #[derive(Debug)]
-pub struct ShaderInterfaceUniformVariable<'s> {
+pub struct ShaderInterfaceUniformVariable {
     pub ty: spv::Type,
-    pub original_refpath: RefPath<'s>,
+    pub original_refpath: RefPath,
     pub decorations: Vec<spv::Decorate>,
 }
 
 #[derive(Debug)]
-pub struct ShaderInterfacePushConstantVariable<'s> {
+pub struct ShaderInterfacePushConstantVariable {
     pub ty: spv::Type,
-    pub original_refpath: RefPath<'s>,
+    pub original_refpath: RefPath,
     pub offset: u32,
 }
 
@@ -42,10 +42,10 @@ pub struct ShaderEntryPointDescription<'s> {
     pub name: &'s str,
     pub execution_model: spv::ExecutionModel,
     pub execution_mode_modifiers: Vec<spv::ExecutionModeModifier>,
-    pub input_variables: Vec<ShaderInterfaceInputVariable<'s>>,
+    pub input_variables: Vec<ShaderInterfaceInputVariable>,
     pub output_variables: Vec<ShaderInterfaceOutputVariable>,
-    pub uniform_variables: Vec<ShaderInterfaceUniformVariable<'s>>,
-    pub push_constant_variables: Vec<ShaderInterfacePushConstantVariable<'s>>,
+    pub uniform_variables: Vec<ShaderInterfaceUniformVariable>,
+    pub push_constant_variables: Vec<ShaderInterfacePushConstantVariable>,
 }
 impl<'s> ShaderEntryPointDescription<'s> {
     pub fn extract(func: &UserDefinedFunctionSymbol<'s>, scope: &SymbolScope<'_, 's>) -> Self {
@@ -103,12 +103,12 @@ impl<'s> ShaderEntryPointDescription<'s> {
 
 fn process_entry_point_inputs<'s>(
     attr: &SymbolAttribute,
-    refpath: &RefPath<'s>,
+    refpath: &RefPath,
     ty: &ConcreteType<'s>,
     scope: &SymbolScope<'_, 's>,
-    input_variables: &mut Vec<ShaderInterfaceInputVariable<'s>>,
-    uniform_variables: &mut Vec<ShaderInterfaceUniformVariable<'s>>,
-    push_constant_variables: &mut Vec<ShaderInterfacePushConstantVariable<'s>>,
+    input_variables: &mut Vec<ShaderInterfaceInputVariable>,
+    uniform_variables: &mut Vec<ShaderInterfaceUniformVariable>,
+    push_constant_variables: &mut Vec<ShaderInterfacePushConstantVariable>,
 ) {
     match attr {
         SymbolAttribute {
@@ -130,6 +130,7 @@ fn process_entry_point_inputs<'s>(
         } => match ty {
             ConcreteType::Struct(members) => {
                 let spv_ty = spv::Type::Struct {
+                    decorations: vec![spv::Decorate::Block],
                     member_types: members
                         .iter()
                         .scan(0, |top, x| {
@@ -147,10 +148,21 @@ fn process_entry_point_inputs<'s>(
                                     .std140_size()
                                     .expect("this type cannot be a member of an uniform struct");
 
-                            Some(spv::TypeStructMember {
-                                ty: x.ty.make_spv_type(scope),
-                                decorations: vec![spv::Decorate::Offset(offset as _)],
-                            })
+                            let ty = x.ty.make_spv_type(scope);
+                            let mut decorations = vec![spv::Decorate::Offset(offset as _)];
+                            if let spv::Type::Matrix {
+                                ref column_type, ..
+                            } = ty
+                            {
+                                decorations.extend([
+                                    spv::Decorate::ColMajor,
+                                    spv::Decorate::MatrixStride(
+                                        column_type.matrix_stride().unwrap(),
+                                    ),
+                                ]);
+                            }
+
+                            Some(spv::TypeStructMember { ty, decorations })
                         })
                         .collect(),
                 };
@@ -229,10 +241,10 @@ fn process_entry_point_inputs<'s>(
         }),
         _ => match ty {
             ConcreteType::Struct(members) => {
-                for m in members {
+                for (n, m) in members.iter().enumerate() {
                     process_entry_point_inputs(
                         &m.attribute,
-                        &RefPath::Member(Box::new(refpath.clone()), m.name.0.slice),
+                        &RefPath::Member(Box::new(refpath.clone()), n),
                         &m.ty,
                         scope,
                         input_variables,

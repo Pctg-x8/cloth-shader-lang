@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use entrypoint::ShaderEntryPointDescription;
 
@@ -14,8 +14,9 @@ use crate::{
 
 pub mod entrypoint;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpvSectionLocalId {
+    ExtInstImport(spv::Id),
     TypeConst(spv::Id),
     GlobalVariable(spv::Id),
     Function(spv::Id),
@@ -23,13 +24,17 @@ pub enum SpvSectionLocalId {
 }
 
 pub struct SpvModuleEmissionContext {
-    pub header_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
+    pub capabilities: HashSet<spv::Capability>,
+    pub ext_inst_imports: HashMap<String, SpvSectionLocalId>,
+    pub addressing_model: spv::AddressingModel,
+    pub memory_model: spv::MemoryModel,
     pub entry_point_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub execution_mode_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub annotation_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub type_const_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub global_variable_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub function_ops: Vec<spv::Instruction<SpvSectionLocalId>>,
+    pub latest_ext_inst_import_id: spv::Id,
     pub latest_type_const_id: spv::Id,
     pub latest_global_variable_id: spv::Id,
     pub latest_function_id: spv::Id,
@@ -39,13 +44,17 @@ pub struct SpvModuleEmissionContext {
 impl SpvModuleEmissionContext {
     pub fn new() -> Self {
         Self {
-            header_ops: Vec::new(),
+            capabilities: HashSet::new(),
+            ext_inst_imports: HashMap::new(),
+            addressing_model: spv::AddressingModel::Logical,
+            memory_model: spv::MemoryModel::GLSL450,
             entry_point_ops: Vec::new(),
             execution_mode_ops: Vec::new(),
             annotation_ops: Vec::new(),
             type_const_ops: Vec::new(),
             global_variable_ops: Vec::new(),
             function_ops: Vec::new(),
+            latest_ext_inst_import_id: 0,
             latest_type_const_id: 0,
             latest_global_variable_id: 0,
             latest_function_id: 0,
@@ -55,14 +64,33 @@ impl SpvModuleEmissionContext {
     }
 
     pub fn serialize_ops(self) -> (Vec<spv::Instruction>, spv::Id) {
-        let type_const_offset = 1;
+        let ext_inst_import_offset = 1;
+        let type_const_offset = ext_inst_import_offset + self.latest_ext_inst_import_id;
         let global_variable_offset = type_const_offset + self.latest_type_const_id;
         let function_offset = global_variable_offset + self.latest_global_variable_id;
 
-        let mut max_id = 1;
-        let ops = self
-            .header_ops
+        let mut sorted_ext_inst_imports = self
+            .ext_inst_imports
             .into_iter()
+            .map(|(name, id)| (id, name))
+            .collect::<Vec<_>>();
+        sorted_ext_inst_imports.sort_by_key(|&(id, _)| id);
+
+        let capabilities = self
+            .capabilities
+            .into_iter()
+            .map(|c| spv::Instruction::Capability { capability: c });
+        let ext_inst_imports = sorted_ext_inst_imports
+            .into_iter()
+            .map(|(id, name)| spv::Instruction::ExtInstImport { result: id, name });
+
+        let mut max_id = 1;
+        let ops = capabilities
+            .chain(ext_inst_imports)
+            .chain(std::iter::once(spv::Instruction::MemoryModel {
+                addressing_model: self.addressing_model,
+                memory_model: self.memory_model,
+            }))
             .chain(self.entry_point_ops.into_iter())
             .chain(self.execution_mode_ops.into_iter())
             .chain(self.annotation_ops.into_iter())
@@ -72,6 +100,7 @@ impl SpvModuleEmissionContext {
             .map(|x| {
                 x.relocate(|id| {
                     let nid = match id {
+                        SpvSectionLocalId::ExtInstImport(x) => x + ext_inst_import_offset,
                         SpvSectionLocalId::TypeConst(x) => x + type_const_offset,
                         SpvSectionLocalId::GlobalVariable(x) => x + global_variable_offset,
                         SpvSectionLocalId::Function(x) => x + function_offset,
@@ -83,6 +112,14 @@ impl SpvModuleEmissionContext {
             })
             .collect();
         (ops, max_id)
+    }
+
+    pub fn request_ext_inst_set(&mut self, name: String) -> SpvSectionLocalId {
+        *self.ext_inst_imports.entry(name).or_insert_with(|| {
+            self.latest_ext_inst_import_id += 1;
+
+            SpvSectionLocalId::ExtInstImport(self.latest_ext_inst_import_id - 1)
+        })
     }
 
     pub fn new_type_const_id(&mut self) -> SpvSectionLocalId {
@@ -140,6 +177,16 @@ impl SpvModuleEmissionContext {
                     target,
                     decoration: spv::Decoration::Offset,
                     args: vec![*o],
+                },
+                spv::Decorate::ColMajor => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::ColMajor,
+                    args: Vec::new(),
+                },
+                spv::Decorate::MatrixStride(stride) => spv::Instruction::Decorate {
+                    target,
+                    decoration: spv::Decoration::MatrixStride,
+                    args: vec![*stride],
                 },
             }));
     }
@@ -396,7 +443,10 @@ impl SpvModuleEmissionContext {
                 self.defined_type_map.insert(t, id);
                 id
             }
-            spv::Type::Struct { ref member_types } => {
+            spv::Type::Struct {
+                ref member_types,
+                ref decorations,
+            } => {
                 let member_type_ids = member_types
                     .iter()
                     .map(|x| self.request_type_id(x.ty.clone()))
@@ -406,6 +456,7 @@ impl SpvModuleEmissionContext {
                     result: id,
                     member_types: member_type_ids,
                 });
+                self.decorate(id, decorations);
 
                 for (n, x) in member_types.iter().enumerate() {
                     self.annotation_ops
@@ -416,6 +467,20 @@ impl SpvModuleEmissionContext {
                                 decoration: spv::Decoration::Offset,
                                 args: vec![*x],
                             },
+                            spv::Decorate::ColMajor => spv::Instruction::MemberDecorate {
+                                struct_type: id,
+                                member: n as _,
+                                decoration: spv::Decoration::ColMajor,
+                                args: Vec::new(),
+                            },
+                            spv::Decorate::MatrixStride(stride) => {
+                                spv::Instruction::MemberDecorate {
+                                    struct_type: id,
+                                    member: n as _,
+                                    decoration: spv::Decoration::MatrixStride,
+                                    args: vec![*stride],
+                                }
+                            }
                             _ => unimplemented!(),
                         }));
                 }
@@ -483,18 +548,15 @@ impl SpvModuleEmissionContext {
     }
 }
 
-pub struct SpvFunctionBodyEmissionContext<'s, 'm> {
+pub struct SpvFunctionBodyEmissionContext<'m> {
     pub module_ctx: &'m mut SpvModuleEmissionContext,
-    pub entry_point_maps: ShaderEntryPointMaps<'s>,
+    pub entry_point_maps: ShaderEntryPointMaps,
     pub ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub latest_id: spv::Id,
     pub emitted_expression_id: HashMap<usize, Option<(SpvSectionLocalId, spv::Type)>>,
 }
-impl<'s, 'm> SpvFunctionBodyEmissionContext<'s, 'm> {
-    pub fn new(
-        module_ctx: &'m mut SpvModuleEmissionContext,
-        maps: ShaderEntryPointMaps<'s>,
-    ) -> Self {
+impl<'s, 'm> SpvFunctionBodyEmissionContext<'m> {
+    pub fn new(module_ctx: &'m mut SpvModuleEmissionContext, maps: ShaderEntryPointMaps) -> Self {
         Self {
             module_ctx,
             entry_point_maps: maps,
@@ -877,6 +939,91 @@ impl<'s, 'm> SpvFunctionBodyEmissionContext<'s, 'm> {
     }
 
     #[inline]
+    pub fn vector_times_scalar(
+        &mut self,
+        output_ty: spv::Type,
+        vector: SpvSectionLocalId,
+        scalar: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::VectorTimesScalar {
+            result_type,
+            result,
+            vector,
+            scalar,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn matrix_times_scalar(
+        &mut self,
+        output_ty: spv::Type,
+        matrix: SpvSectionLocalId,
+        scalar: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::MatrixTimesScalar {
+            result_type,
+            result,
+            matrix,
+            scalar,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn matrix_times_vector(
+        &mut self,
+        output_ty: spv::Type,
+        matrix: SpvSectionLocalId,
+        vector: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::MatrixTimesVector {
+            result_type,
+            result,
+            matrix,
+            vector,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn vector_times_matrix(
+        &mut self,
+        output_ty: spv::Type,
+        vector: SpvSectionLocalId,
+        matrix: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::VectorTimesMatrix {
+            result_type,
+            result,
+            vector,
+            matrix,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn matrix_times_matrix(
+        &mut self,
+        output_ty: spv::Type,
+        left_matrix: SpvSectionLocalId,
+        right_matrix: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::MatrixTimesMatrix {
+            result_type,
+            result,
+            left_matrix,
+            right_matrix,
+        });
+        result
+    }
+
+    #[inline]
     pub fn sdiv(
         &mut self,
         output_ty: spv::Type,
@@ -979,6 +1126,36 @@ impl<'s, 'm> SpvFunctionBodyEmissionContext<'s, 'm> {
     }
 
     #[inline]
+    pub fn snegate(
+        &mut self,
+        output_ty: spv::Type,
+        operand: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::SNegate {
+            result_type,
+            result,
+            operand,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn fnegate(
+        &mut self,
+        output_ty: spv::Type,
+        operand: SpvSectionLocalId,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_ty);
+        self.ops.push(spv::Instruction::FNegate {
+            result_type,
+            result,
+            operand,
+        });
+        result
+    }
+
+    #[inline]
     pub fn convert_sint_to_float(
         &mut self,
         component_count: u32,
@@ -1055,6 +1232,25 @@ impl<'s, 'm> SpvFunctionBodyEmissionContext<'s, 'm> {
             result,
             composite: source,
             indexes: indices,
+        });
+        result
+    }
+
+    #[inline]
+    pub fn vector_shuffle(
+        &mut self,
+        output_type: spv::Type,
+        source1: SpvSectionLocalId,
+        source2: SpvSectionLocalId,
+        components: Vec<u32>,
+    ) -> SpvSectionLocalId {
+        let (result_type, result) = self.issue_typed_ids(output_type);
+        self.ops.push(spv::Instruction::VectorShuffle {
+            result_type,
+            result,
+            vector1: source1,
+            vector2: source2,
+            components,
         });
         result
     }
@@ -1172,12 +1368,12 @@ enum GlobalAccessType {
     },
 }
 
-pub struct ShaderEntryPointMaps<'s> {
-    refpath_to_global_var: HashMap<RefPath<'s>, GlobalAccessType>,
+pub struct ShaderEntryPointMaps {
+    refpath_to_global_var: HashMap<RefPath, GlobalAccessType>,
     output_global_vars: Vec<SpvSectionLocalId>,
     interface_global_vars: Vec<SpvSectionLocalId>,
 }
-impl ShaderEntryPointMaps<'_> {
+impl ShaderEntryPointMaps {
     pub fn iter_interface_global_vars<'s>(
         &'s self,
     ) -> impl Iterator<Item = &'s SpvSectionLocalId> + 's {
@@ -1187,7 +1383,7 @@ impl ShaderEntryPointMaps<'_> {
 pub fn emit_entry_point_spv_ops<'s>(
     ep: &ShaderEntryPointDescription<'s>,
     ctx: &mut SpvModuleEmissionContext,
-) -> ShaderEntryPointMaps<'s> {
+) -> ShaderEntryPointMaps {
     let mut entry_point_maps = ShaderEntryPointMaps {
         refpath_to_global_var: HashMap::new(),
         output_global_vars: Vec::new(),
@@ -1226,17 +1422,30 @@ pub fn emit_entry_point_spv_ops<'s>(
 
     if !ep.push_constant_variables.is_empty() {
         let block_ty = spv::Type::Struct {
+            decorations: vec![spv::Decorate::Block],
             member_types: ep
                 .push_constant_variables
                 .iter()
-                .map(|x| spv::TypeStructMember {
-                    ty: x.ty.clone(),
-                    decorations: vec![spv::Decorate::Offset(x.offset)],
+                .map(|x| {
+                    let mut decorations = vec![spv::Decorate::Offset(x.offset)];
+                    if let spv::Type::Matrix {
+                        ref column_type, ..
+                    } = x.ty
+                    {
+                        decorations.extend([
+                            spv::Decorate::ColMajor,
+                            spv::Decorate::MatrixStride(column_type.matrix_stride().unwrap()),
+                        ]);
+                    }
+
+                    spv::TypeStructMember {
+                        ty: x.ty.clone(),
+                        decorations,
+                    }
                 })
                 .collect(),
         };
         let block_tid = ctx.request_type_id(block_ty.clone());
-        ctx.decorate(block_tid, &[spv::Decorate::Block]);
         let block_var = ctx.declare_global_variable(block_ty, spv::StorageClass::PushConstant);
         for (n, a) in ep.push_constant_variables.iter().enumerate() {
             entry_point_maps.refpath_to_global_var.insert(
@@ -1259,7 +1468,11 @@ pub fn emit_function_body_spv_ops(
     returning: ExprRef,
     ctx: &mut SpvFunctionBodyEmissionContext,
 ) {
-    let _ = emit_expr_spv_ops(body, returning.0, ctx);
+    for (n, (b, _)) in body.iter().enumerate() {
+        if !b.is_pure() {
+            emit_expr_spv_ops(body, n, ctx);
+        }
+    }
 }
 
 fn emit_expr_spv_ops(
@@ -1301,7 +1514,6 @@ fn emit_expr_spv_ops(
 
             match it {
                 IntrinsicType::Float4 => {
-                    assert_eq!(args.len(), 4);
                     assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
 
                     let rt = spv::Type::float(32).of_vector(4);
@@ -1318,14 +1530,62 @@ fn emit_expr_spv_ops(
                             .push(spv::Instruction::ConstantComposite {
                                 result_type,
                                 result: result_id,
-                                constituents: args,
+                                constituents: match args.len() {
+                                    1 => args.repeat(4),
+                                    2 => args.repeat(2),
+                                    4 => args,
+                                    _ => panic!("Error: component count mismatching"),
+                                },
                             });
                     } else {
                         result_id = ctx.new_id();
                         ctx.ops.push(spv::Instruction::CompositeConstruct {
                             result_type,
                             result: result_id,
-                            constituents: args,
+                            constituents: match args.len() {
+                                1 => args.repeat(4),
+                                2 => args.repeat(2),
+                                4 => args,
+                                _ => panic!("Error: component count mismatching"),
+                            },
+                        });
+                    };
+
+                    Some((result_id, rt))
+                }
+                IntrinsicType::Float3 => {
+                    assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
+
+                    let rt = spv::Type::float(32).of_vector(3);
+                    let result_type = ctx.module_ctx.request_type_id(rt.clone());
+                    let is_constant = args
+                        .iter()
+                        .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
+
+                    let result_id;
+                    if is_constant {
+                        result_id = ctx.module_ctx.new_type_const_id();
+                        ctx.module_ctx
+                            .type_const_ops
+                            .push(spv::Instruction::ConstantComposite {
+                                result_type,
+                                result: result_id,
+                                constituents: match args.len() {
+                                    1 => args.repeat(3),
+                                    3 => args,
+                                    _ => panic!("Error: component count mismatching"),
+                                },
+                            });
+                    } else {
+                        result_id = ctx.new_id();
+                        ctx.ops.push(spv::Instruction::CompositeConstruct {
+                            result_type,
+                            result: result_id,
+                            constituents: match args.len() {
+                                1 => args.repeat(3),
+                                3 => args,
+                                _ => panic!("Error: component count mismatching"),
+                            },
                         });
                     };
 
@@ -1561,23 +1821,117 @@ fn emit_expr_spv_ops(
         SimplifiedExpression::Mul(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
 
-            Some((
-                match lt {
-                    spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
-                    spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+            match (&lt, &rt) {
+                (
+                    &spv::Type::Vector {
+                        ref component_type,
+                        component_count,
+                    },
+                    &spv::Type::Float { width },
+                ) if **component_type == spv::Type::float(width) => {
+                    let rt = spv::Type::float(width).of_vector(component_count);
+                    Some((ctx.vector_times_scalar(rt.clone(), l, r), rt))
+                }
+                (
+                    &spv::Type::Matrix {
+                        ref column_type,
+                        column_count,
+                    },
+                    &spv::Type::Float { width },
+                ) => match **column_type {
                     spv::Type::Vector {
-                        ref component_type, ..
-                    } => match &**component_type {
-                        spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
-                        spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+                        ref component_type,
+                        component_count,
+                    } if **component_type == spv::Type::float(width) => {
+                        let rt = spv::Type::float(width).of_matrix(component_count, column_count);
+                        Some((ctx.matrix_times_scalar(rt.clone(), l, r), rt))
+                    }
+                    _ => unreachable!(),
+                },
+                (
+                    &spv::Type::Matrix {
+                        column_type: ref ctl,
+                        column_count: ccl,
+                    },
+                    &spv::Type::Vector {
+                        component_type: ref ctr,
+                        component_count: ccr,
+                    },
+                ) => match **ctl {
+                    spv::Type::Vector {
+                        ref component_type,
+                        component_count,
+                    } => match **component_type {
+                        spv::Type::Float { width } if **ctr == spv::Type::float(width) => {
+                            let rt = spv::Type::float(width).of_vector(component_count);
+                            Some((ctx.matrix_times_vector(rt.clone(), l, r), rt))
+                        }
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
                 },
-                lt,
-            ))
+                (
+                    &spv::Type::Vector {
+                        component_type: ref ctl,
+                        component_count: ccl,
+                    },
+                    &spv::Type::Matrix {
+                        column_type: ref ctr,
+                        column_count: ccr,
+                    },
+                ) => match **ctr {
+                    spv::Type::Vector {
+                        ref component_type,
+                        component_count,
+                    } => match **component_type {
+                        spv::Type::Float { width } if **ctl == spv::Type::float(width) => {
+                            let rt = spv::Type::float(width).of_vector(ccr);
+                            Some((ctx.vector_times_matrix(rt.clone(), l, r), rt))
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                (
+                    &spv::Type::Matrix {
+                        column_type: ref ctl,
+                        column_count: ccl,
+                    },
+                    &spv::Type::Matrix {
+                        column_type: ref ctr,
+                        column_count: ccr,
+                    },
+                ) if **ctl == **ctr => match **ctl {
+                    spv::Type::Vector {
+                        ref component_type,
+                        component_count,
+                    } => match **component_type {
+                        spv::Type::Float { width } => {
+                            let rt = spv::Type::float(width).of_matrix(component_count, ccr);
+                            Some((ctx.matrix_times_matrix(rt.clone(), l, r), rt))
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                (a, b) if a == b => Some((
+                    match &lt {
+                        spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
+                        spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+                        spv::Type::Vector {
+                            ref component_type, ..
+                        } => match &**component_type {
+                            spv::Type::Int { .. } => ctx.imul(lt.clone(), l, r),
+                            spv::Type::Float { .. } => ctx.fmul(lt.clone(), l, r),
+                            _ => unreachable!(),
+                        },
+                        _ => unreachable!(),
+                    },
+                    lt,
+                )),
+                _ => unreachable!(),
+            }
         }
         SimplifiedExpression::Div(l, r) => {
             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
@@ -1639,6 +1993,60 @@ fn emit_expr_spv_ops(
                     _ => unreachable!(),
                 },
                 lt,
+            ))
+        }
+        SimplifiedExpression::Pow(l, r) => {
+            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            let rt = match lt {
+                spv::Type::Float { width } => spv::Type::float(width),
+                spv::Type::Vector {
+                    component_type,
+                    component_count,
+                } => match *component_type {
+                    spv::Type::Float { width } => {
+                        spv::Type::float(width).of_vector(component_count)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            let glsl_std_450_lib_set_id =
+                ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::ExtInst {
+                result_type,
+                result,
+                set: glsl_std_450_lib_set_id,
+                instruction: 26,
+                operands: vec![l, r],
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::Neg(x) => {
+            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+
+            Some((
+                match &xt {
+                    &spv::Type::Int {
+                        signedness: true, ..
+                    } => ctx.snegate(xt.clone(), x),
+                    &spv::Type::Float { .. } => ctx.fnegate(xt.clone(), x),
+                    &spv::Type::Vector {
+                        ref component_type, ..
+                    } => match &**component_type {
+                        &spv::Type::Int {
+                            signedness: true, ..
+                        } => ctx.snegate(xt.clone(), x),
+                        &spv::Type::Float { .. } => ctx.fnegate(xt.clone(), x),
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                xt,
             ))
         }
         SimplifiedExpression::Cast(x, t) => {
@@ -1817,6 +2225,19 @@ fn emit_expr_spv_ops(
                 rt,
             ))
         }
+        &SimplifiedExpression::VectorShuffle4(v1, v2, a, b, c, d) => {
+            let (v1, v1t) = emit_expr_spv_ops(body, v1.0, ctx).unwrap();
+            let (v2, _) = emit_expr_spv_ops(body, v2.0, ctx).unwrap();
+            let spv::Type::Vector { component_type, .. } = v1t else {
+                unreachable!("v1t = {v1t:?}");
+            };
+
+            let rt = component_type.of_vector(4);
+            Some((
+                ctx.vector_shuffle(rt.clone(), v1, v2, vec![a as _, b as _, c as _, d as _]),
+                rt,
+            ))
+        }
         SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
                 Some(GlobalAccessType::Direct(gv, vty)) => {
@@ -1842,7 +2263,64 @@ fn emit_expr_spv_ops(
                         member_ty,
                     ))
                 }
-                None => panic!("no corresponding canonical refpath found? {rp:?}"),
+                // TODO: あとで再帰組む
+                None => match rp {
+                    RefPath::Member(root, index) => {
+                        Some(match ctx.entry_point_maps.refpath_to_global_var.get(root) {
+                            Some(GlobalAccessType::Direct(gv, vty)) => {
+                                let (gv, vty) = (gv.clone(), vty.clone());
+                                let member_ty = match vty {
+                                    spv::Type::Struct { member_types, .. } => {
+                                        member_types[*index].ty.clone()
+                                    }
+                                    _ => unreachable!("cannot member ref"),
+                                };
+
+                                let ac_index_id =
+                                    ctx.module_ctx.request_const_id((*index as u32).into());
+                                // TODO: Uniform決め打ちは後で何とかする（Storage Bufferサポートするときに詰む）
+                                (
+                                    ctx.chained_load(
+                                        member_ty.clone(),
+                                        spv::StorageClass::Uniform,
+                                        gv,
+                                        vec![ac_index_id],
+                                    ),
+                                    member_ty,
+                                )
+                            }
+                            Some(&GlobalAccessType::PushConstantStruct {
+                                struct_var,
+                                member_index,
+                                ref member_ty,
+                            }) => {
+                                let member_ty = member_ty.clone();
+                                let final_ty = match member_ty {
+                                    spv::Type::Struct { member_types, .. } => {
+                                        member_types[*index].ty.clone()
+                                    }
+                                    _ => unreachable!("cannot member ref"),
+                                };
+
+                                let ac_index_id =
+                                    ctx.module_ctx.request_const_id(member_index.into());
+                                let ac_index2_id =
+                                    ctx.module_ctx.request_const_id((*index as u32).into());
+                                (
+                                    ctx.chained_load(
+                                        final_ty.clone(),
+                                        spv::StorageClass::PushConstant,
+                                        struct_var,
+                                        vec![ac_index_id, ac_index2_id],
+                                    ),
+                                    final_ty,
+                                )
+                            }
+                            None => panic!("no corresponding canonical refpath found? {rp:?}"),
+                        })
+                    }
+                    _ => panic!("no corresponding canonical refpath found? {rp:?}"),
+                },
             }
         }
         SimplifiedExpression::ConstSInt(s, mods) => {
@@ -1937,6 +2415,66 @@ fn emit_expr_spv_ops(
                 coordinate: coordinate_const,
             });
             Some((result_id, rt))
+        }
+        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Dot#Float3", _, args) => {
+            let (args, arg_ty): (Vec<_>, Vec<_>) = args
+                .iter()
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .unzip();
+            assert!(
+                arg_ty.len() == 2
+                    && arg_ty
+                        .iter()
+                        .all(|t| *t == spv::Type::float(32).of_vector(3))
+            );
+
+            let rt = spv::Type::float(32);
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::Dot {
+                result_type,
+                result,
+                vector1: args[0],
+                vector2: args[1],
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Normalize#Float3", _, args) => {
+            let (args, arg_ty): (Vec<_>, Vec<_>) = args
+                .iter()
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .unzip();
+            assert_eq!(arg_ty.len(), 1);
+            assert_eq!(arg_ty[0], spv::Type::float(32).of_vector(3));
+
+            let glsl_std_450_ext_set = ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
+
+            let rt = spv::Type::float(32).of_vector(3);
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::ExtInst {
+                result_type,
+                result,
+                set: glsl_std_450_ext_set,
+                instruction: 69,
+                operands: args,
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Transpose#Float4x4", _, args) => {
+            let (args, arg_ty): (Vec<_>, Vec<_>) = args
+                .iter()
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .unzip();
+            assert_eq!(arg_ty.len(), 1);
+            assert_eq!(arg_ty[0], spv::Type::float(32).of_matrix(4, 4));
+
+            let rt = spv::Type::float(32).of_matrix(4, 4);
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::Transpose {
+                result_type,
+                result,
+                matrix: args[0],
+            });
+            Some((result, rt))
         }
         SimplifiedExpression::StoreOutput(x, o) => {
             let (x, _xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();

@@ -815,41 +815,60 @@ fn parse_expression_logical_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<E
     Ok(expr)
 }
 fn parse_expression_compare_ops<'s>(state: &mut ParseState<'s>) -> ParseResult<ExpressionNode<'s>> {
-    let mut expr = parse_expression_bitwise_ops(state)?;
+    let mut expr = parse_expression_infix_funcall_ops(state)?;
 
     while state.check_indent_requirements() {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Op && t.slice == "==" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_bitwise_ops(state)?;
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::Op && t.slice == "!=" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_bitwise_ops(state)?;
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::Op && t.slice == "<=" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_bitwise_ops(state)?;
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::Op && t.slice == ">=" => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_bitwise_ops(state)?;
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::OpenAngleBracket => {
                 let op_token = t.clone();
                 state.consume_token();
-                let right_expr = parse_expression_bitwise_ops(state)?;
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
                 expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
             }
             Some(t) if t.kind == TokenKind::CloseAngleBracket => {
+                let op_token = t.clone();
+                state.consume_token();
+                let right_expr = parse_expression_infix_funcall_ops(state)?;
+                expr = ExpressionNode::Binary(Box::new(expr), op_token, Box::new(right_expr));
+            }
+            _ => break,
+        }
+    }
+
+    Ok(expr)
+}
+fn parse_expression_infix_funcall_ops<'s>(
+    state: &mut ParseState<'s>,
+) -> ParseResult<ExpressionNode<'s>> {
+    let mut expr = parse_expression_bitwise_ops(state)?;
+
+    while state.check_indent_requirements() {
+        match state.current_token() {
+            Some(t) if t.kind == TokenKind::InfixIdentifier => {
                 let op_token = t.clone();
                 state.consume_token();
                 let right_expr = parse_expression_bitwise_ops(state)?;
@@ -1044,12 +1063,9 @@ fn parse_expression_suffixed_ops<'s>(
             }
             _ if state.check_indent_requirements() => {
                 let save = state.save();
-                println!("funcall single: {:?}", state.current_token());
                 if let Ok(arg) = parse_expression_funcall_single_arg(state) {
-                    println!("funcall single ok");
                     expr = ExpressionNode::FuncallSingle(Box::new(expr), Box::new(arg));
                 } else {
-                    println!("funcall single fail");
                     state.restore(save);
                 }
                 break;
@@ -1207,6 +1223,7 @@ fn parse_expression_prime<'s>(state: &mut ParseState<'s>) -> ParseResult<Express
 #[derive(Debug)]
 pub enum TokenizerErrorKind {
     IncompleteHexLiteral,
+    UnclosedInfixIdentifier,
 }
 
 #[derive(Debug)]
@@ -1389,10 +1406,39 @@ impl<'s> Tokenizer<'s> {
             return Ok(Some(tk));
         }
 
+        if self.source.starts_with('`') {
+            let (ident_char_count, ident_byte_count) = self.source[1..]
+                .chars()
+                .take_while(|&c| !"=!\"#%&'`()[]?><.,;:@=~-^|\\ \t\r\n".contains(c))
+                .fold((0, 0), |(a, b), c| (a + 1, b + c.len_utf8()));
+            assert!(
+                ident_byte_count > 0,
+                "empty identifier token(src: {}...)",
+                &self.source[..8]
+            );
+            if !self.source[1 + ident_byte_count..].starts_with('`') {
+                return Err(TokenizerError {
+                    kind: TokenizerErrorKind::UnclosedInfixIdentifier,
+                    line: self.line,
+                    col: self.col,
+                });
+            }
+            let tk = Token {
+                slice: &self.source[..ident_byte_count + 2],
+                kind: TokenKind::InfixIdentifier,
+                line: self.line,
+                col: self.col,
+                line_indent: self.current_line_indent,
+            };
+            self.source = &self.source[ident_byte_count + 2..];
+            self.col += ident_char_count + 2;
+            return Ok(Some(tk));
+        }
+
         let (ident_char_count, ident_byte_count) = self
             .source
             .chars()
-            .take_while(|&c| !"=!\"#%&'()[]?><.,;:@=~-^|\\ \t\r\n".contains(c))
+            .take_while(|&c| !"=!\"#%&'`()[]?><.,;:@=~-^|\\ \t\r\n".contains(c))
             .fold((0, 0), |(a, b), c| (a + 1, b + c.len_utf8()));
         assert!(
             ident_byte_count > 0,
@@ -1418,6 +1464,7 @@ impl<'s> Tokenizer<'s> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Identifier,
+    InfixIdentifier,
     Keyword,
     Op,
     Number,
