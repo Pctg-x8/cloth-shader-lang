@@ -125,8 +125,8 @@ pub enum ExecutionModel {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Builtin {
     Position = 0,
-    VertexId = 5,
-    InstanceId = 6,
+    VertexIndex = 42,
+    InstanceIndex = 43,
 }
 
 #[repr(u32)]

@@ -253,8 +253,8 @@ fn process_entry_point_inputs<'s>(
             original_refpath: refpath.clone(),
             decorations: vec![spv::Decorate::Builtin(match b {
                 BuiltinInputOutput::Position => spv::asm::Builtin::Position,
-                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexId,
-                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceId,
+                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexIndex,
+                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceIndex,
             })],
         }),
         _ => match ty {
@@ -320,8 +320,8 @@ fn process_entry_point_outputs<'s>(
             ty: ty.make_spv_type(scope),
             decorations: vec![spv::Decorate::Builtin(match b {
                 BuiltinInputOutput::Position => spv::asm::Builtin::Position,
-                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexId,
-                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceId,
+                BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexIndex,
+                BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceIndex,
             })],
         }),
         _ => match ty {
