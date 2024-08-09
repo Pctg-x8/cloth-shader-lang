@@ -38,14 +38,26 @@ pub struct ShaderInterfacePushConstantVariable {
 }
 
 #[derive(Debug)]
+pub struct WorkgroupSharedVariable {
+    pub ty: spv::Type,
+    pub original_refpath: RefPath,
+}
+
+#[derive(Debug)]
+pub struct ShaderEntryPointGlobalVariables {
+    pub inputs: Vec<ShaderInterfaceInputVariable>,
+    pub outputs: Vec<ShaderInterfaceOutputVariable>,
+    pub uniforms: Vec<ShaderInterfaceUniformVariable>,
+    pub push_constants: Vec<ShaderInterfacePushConstantVariable>,
+    pub workgroup_shared_vars: Vec<WorkgroupSharedVariable>,
+}
+
+#[derive(Debug)]
 pub struct ShaderEntryPointDescription<'s> {
     pub name: &'s str,
     pub execution_model: spv::asm::ExecutionModel,
     pub execution_mode_modifiers: Vec<spv::ExecutionModeModifier>,
-    pub input_variables: Vec<ShaderInterfaceInputVariable>,
-    pub output_variables: Vec<ShaderInterfaceOutputVariable>,
-    pub uniform_variables: Vec<ShaderInterfaceUniformVariable>,
-    pub push_constant_variables: Vec<ShaderInterfacePushConstantVariable>,
+    pub global_variables: ShaderEntryPointGlobalVariables,
 }
 impl<'s> ShaderEntryPointDescription<'s> {
     pub fn extract(func: &UserDefinedFunctionSymbol<'s>, scope: &SymbolScope<'_, 's>) -> Self {
@@ -68,35 +80,31 @@ impl<'s> ShaderEntryPointDescription<'s> {
             vec![]
         };
 
-        let (
-            mut input_variables,
-            mut output_variables,
-            mut uniform_variables,
-            mut push_constant_variables,
-        ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (n, (attr, _, ty)) in func.inputs.iter().enumerate() {
+        let mut global_vars = ShaderEntryPointGlobalVariables {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            uniforms: Vec::new(),
+            push_constants: Vec::new(),
+            workgroup_shared_vars: Vec::new(),
+        };
+        for (n, (attr, _, _, ty)) in func.inputs.iter().enumerate() {
             process_entry_point_inputs(
                 attr,
                 &RefPath::FunctionInput(n),
                 ty,
                 scope,
-                &mut input_variables,
-                &mut uniform_variables,
-                &mut push_constant_variables,
+                &mut global_vars,
             );
         }
         for (attr, ty) in func.output.iter() {
-            process_entry_point_outputs(attr, ty, scope, &mut output_variables);
+            process_entry_point_outputs(attr, ty, scope, &mut global_vars.outputs);
         }
 
         Self {
             name: func.occurence.slice,
             execution_model,
             execution_mode_modifiers,
-            input_variables,
-            output_variables,
-            uniform_variables,
-            push_constant_variables,
+            global_variables: global_vars,
         }
     }
 }
@@ -106,9 +114,7 @@ fn process_entry_point_inputs<'s>(
     refpath: &RefPath,
     ty: &ConcreteType<'s>,
     scope: &SymbolScope<'_, 's>,
-    input_variables: &mut Vec<ShaderInterfaceInputVariable>,
-    uniform_variables: &mut Vec<ShaderInterfaceUniformVariable>,
-    push_constant_variables: &mut Vec<ShaderInterfacePushConstantVariable>,
+    global_vars: &mut ShaderEntryPointGlobalVariables,
 ) {
     match attr {
         SymbolAttribute {
@@ -122,10 +128,12 @@ fn process_entry_point_inputs<'s>(
         SymbolAttribute {
             descriptor_set_location: Some(set),
             descriptor_set_binding: Some(binding),
+            image_format_specifier,
             input_attachment_index: None,
             push_constant_offset: None,
             bound_location: None,
             bound_builtin_io: None,
+            workgroup_shared: false,
             ..
         } => match ty {
             ConcreteType::Struct(members) => {
@@ -162,7 +170,7 @@ fn process_entry_point_inputs<'s>(
                         .collect(),
                 };
 
-                uniform_variables.push(ShaderInterfaceUniformVariable {
+                global_vars.uniforms.push(ShaderInterfaceUniformVariable {
                     ty: spv_ty,
                     original_refpath: refpath.clone(),
                     decorations: vec![
@@ -185,7 +193,7 @@ fn process_entry_point_inputs<'s>(
                     }),
                 };
 
-                uniform_variables.push(ShaderInterfaceUniformVariable {
+                global_vars.uniforms.push(ShaderInterfaceUniformVariable {
                     ty: spv_ty,
                     original_refpath: refpath.clone(),
                     decorations: vec![
@@ -194,7 +202,45 @@ fn process_entry_point_inputs<'s>(
                     ],
                 })
             }
-            _ => panic!("Error: descriptor binding can be done only for struct or texture types"),
+            ConcreteType::Intrinsic(IntrinsicType::Image2D) => {
+                let spv_ty = spv::Type::Image {
+                    sampled_type: spv::ScalarType::Float(32).into(),
+                    dim: spv::asm::Dim::Dim2,
+                    depth: Some(false),
+                    arrayed: false,
+                    multisampled: false,
+                    sampled: spv::asm::TypeImageSampled::WithSamplingOps,
+                    image_format: image_format_specifier.unwrap_or(spv::asm::ImageFormat::Rgba8),
+                    access_qualifier: None,
+                };
+
+                global_vars.uniforms.push(ShaderInterfaceUniformVariable {
+                    ty: spv_ty,
+                    original_refpath: refpath.clone(),
+                    decorations: vec![
+                        spv::Decorate::DescriptorSet(*set),
+                        spv::Decorate::Binding(*binding),
+                    ],
+                })
+            }
+            ty => {
+                let ty = spv::Type::Struct {
+                    member_types: vec![spv::TypeStructMember {
+                        ty: ty.make_spv_type(scope),
+                        decorations: vec![spv::Decorate::Offset(0)],
+                    }],
+                    decorations: vec![spv::Decorate::Block],
+                };
+
+                global_vars.uniforms.push(ShaderInterfaceUniformVariable {
+                    ty,
+                    original_refpath: refpath.clone(),
+                    decorations: vec![
+                        spv::Decorate::DescriptorSet(*set),
+                        spv::Decorate::Binding(*binding),
+                    ],
+                })
+            }
         },
         SymbolAttribute {
             descriptor_set_location: Some(set),
@@ -203,10 +249,11 @@ fn process_entry_point_inputs<'s>(
             push_constant_offset: None,
             bound_location: None,
             bound_builtin_io: None,
+            workgroup_shared: false,
             ..
         } => match ty {
             ConcreteType::Intrinsic(IntrinsicType::SubpassInput) => {
-                uniform_variables.push(ShaderInterfaceUniformVariable {
+                global_vars.uniforms.push(ShaderInterfaceUniformVariable {
                     ty: spv::Type::SUBPASS_DATA_IMAGE_TYPE,
                     original_refpath: refpath.clone(),
                     decorations: vec![
@@ -224,39 +271,55 @@ fn process_entry_point_inputs<'s>(
             push_constant_offset: Some(pc),
             bound_location: None,
             bound_builtin_io: None,
+            workgroup_shared: false,
             ..
         } => {
             if !ty.can_uniform_struct_member() {
                 panic!("Error: this type cannot be used as push constant value")
             }
 
-            push_constant_variables.push(ShaderInterfacePushConstantVariable {
-                ty: ty.make_spv_type(scope),
-                original_refpath: refpath.clone(),
-                offset: *pc,
-            });
+            global_vars
+                .push_constants
+                .push(ShaderInterfacePushConstantVariable {
+                    ty: ty.make_spv_type(scope),
+                    original_refpath: refpath.clone(),
+                    offset: *pc,
+                });
         }
         SymbolAttribute {
             bound_location: Some(loc),
             bound_builtin_io: None,
+            workgroup_shared: false,
             ..
-        } => input_variables.push(ShaderInterfaceInputVariable {
+        } => global_vars.inputs.push(ShaderInterfaceInputVariable {
             ty: ty.make_spv_type(scope),
             original_refpath: refpath.clone(),
             decorations: vec![spv::Decorate::Location(*loc)],
         }),
         SymbolAttribute {
             bound_builtin_io: Some(b),
+            workgroup_shared: false,
             ..
-        } => input_variables.push(ShaderInterfaceInputVariable {
+        } => global_vars.inputs.push(ShaderInterfaceInputVariable {
             ty: ty.make_spv_type(scope),
             original_refpath: refpath.clone(),
             decorations: vec![spv::Decorate::Builtin(match b {
                 BuiltinInputOutput::Position => spv::asm::Builtin::Position,
                 BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexIndex,
                 BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceIndex,
+                BuiltinInputOutput::LocalInvocationIndex => spv::asm::Builtin::LocalInvocationIndex,
+                BuiltinInputOutput::GlobalInvocationID => spv::asm::Builtin::GlobalInvocationId,
             })],
         }),
+        SymbolAttribute {
+            workgroup_shared: true,
+            ..
+        } => global_vars
+            .workgroup_shared_vars
+            .push(WorkgroupSharedVariable {
+                ty: ty.make_spv_type(scope),
+                original_refpath: refpath.clone(),
+            }),
         _ => match ty {
             ConcreteType::Struct(members) => {
                 for (n, m) in members.iter().enumerate() {
@@ -265,13 +328,11 @@ fn process_entry_point_inputs<'s>(
                         &RefPath::Member(Box::new(refpath.clone()), n),
                         &m.ty,
                         scope,
-                        input_variables,
-                        uniform_variables,
-                        push_constant_variables,
+                        global_vars,
                     );
                 }
             }
-            _ => panic!("Error: non-decorated primitive input found"),
+            _ => panic!("Error: non-decorated primitive input found: {:?}", refpath),
         },
     }
 }
@@ -322,6 +383,12 @@ fn process_entry_point_outputs<'s>(
                 BuiltinInputOutput::Position => spv::asm::Builtin::Position,
                 BuiltinInputOutput::VertexID => spv::asm::Builtin::VertexIndex,
                 BuiltinInputOutput::InstanceID => spv::asm::Builtin::InstanceIndex,
+                BuiltinInputOutput::LocalInvocationIndex => {
+                    panic!("Error: cannot output LocalInvocationIndex")
+                }
+                BuiltinInputOutput::GlobalInvocationID => {
+                    panic!("Error: cannot output GlobalInvocationID")
+                }
             })],
         }),
         _ => match ty {

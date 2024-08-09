@@ -15,23 +15,23 @@ struct FragmentShaderInputs with
 
 [FragmentShader]
 fragDownSample input: FragmentShaderInputs -> [Location 0] Float4 =
-  let offset = Float2(-1.0, 1.0) * input.texelSize
-  let mut res = 4 * (input.tex `sampleAt` input.uv)
-  res += input.tex `sampleAt` (input.uv + offset.xx)
-  res += input.tex `sampleAt` (input.uv + offset.xy)
-  res += input.tex `sampleAt` (input.uv + offset.yx)
-  res += input.tex `sampleAt` (input.uv + offset.yy)
+  let offset = Float4(-1.0, 1.0, -1.0, 1.0) * input.texelSize.xxyy
+  let mut res = 4 * input.tex `sampleAt` input.uv
+  res += input.tex `sampleAt` (input.uv + offset.xz)
+  res += input.tex `sampleAt` (input.uv + offset.xw)
+  res += input.tex `sampleAt` (input.uv + offset.yz)
+  res += input.tex `sampleAt` (input.uv + offset.yw)
   res / 8.0
 
 [FragmentShader]
-fragUpSample input: FragmentShaderInputs -> [Location 0] Float4 =
-  let offset = Float2(-1.0, 1.0) * input.texelSize
+fragUpSample (input: FragmentShaderInputs, [DescriptorSet 1, Binding 0] upperBloomTex: Texture2D) -> [Location 0] Float4 =
+  let offset = Float4(-1.0, 1.0, -1.0, 1.0) * input.texelSize.xxyy
   let mut res = input.tex `sampleAt` (input.uv + Float2(offset.x, 0.0))
   res += input.tex `sampleAt` (input.uv + Float2(offset.y, 0.0))
-  res += input.tex `sampleAt` (input.uv + Float2(0.0, offset.x))
-  res += input.tex `sampleAt` (input.uv + Float2(0.0, offset.y))
-  res += 2.0 * (input.tex `sampleAt` (input.uv + offset.xx * 0.5))
-  res += 2.0 * (input.tex `sampleAt` (input.uv + offset.xy * 0.5))
-  res += 2.0 * (input.tex `sampleAt` (input.uv + offset.yx * 0.5))
-  res += 2.0 * (input.tex `sampleAt` (input.uv + offset.yy * 0.5))
-  res / 12.0
+  res += input.tex `sampleAt` (input.uv + Float2(0.0, offset.z))
+  res += input.tex `sampleAt` (input.uv + Float2(0.0, offset.w))
+  res += 2.0 * input.tex `sampleAt` (input.uv + offset.xz * 0.5)
+  res += 2.0 * input.tex `sampleAt` (input.uv + offset.xw * 0.5)
+  res += 2.0 * input.tex `sampleAt` (input.uv + offset.yz * 0.5)
+  res += 2.0 * input.tex `sampleAt` (input.uv + offset.yw * 0.5)
+  res / 12.0 + upperBloomTex `sampleAt` input.uv

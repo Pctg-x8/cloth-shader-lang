@@ -7,7 +7,7 @@ use crate::{
         BinaryOpTermConversion, BinaryOpTypeConversion, ConcreteType, IntrinsicScalarType,
         IntrinsicType, UserDefinedType,
     },
-    parser::{ExpressionNode, StatementNode},
+    parser::ExpressionNode,
     ref_path::RefPath,
     scope::{SymbolScope, VarId, VarLookupResult},
     source_ref::{SourceRef, SourceRefSliceEq},
@@ -15,7 +15,13 @@ use crate::{
     utils::{swizzle_indices, PtrEq},
 };
 
-use super::ExprRef;
+use super::{
+    block::{
+        transform_statement, Block, BlockFlowInstruction, BlockGenerationContext, BlockInstruction,
+        BlockInstructionEmitter, IntrinsicBinaryOperation, IntrinsicUnaryOperation, RegisterRef,
+    },
+    ExprRef,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeCaptureSource {
@@ -23,8 +29,210 @@ pub enum ScopeCaptureSource {
     Capture(usize),
 }
 
+pub fn simplify_lefthand_expression<'a, 's>(
+    expr: ExpressionNode<'s>,
+    block_ctx: &mut BlockGenerationContext<'a, 's>,
+    scope: &'a SymbolScope<'a, 's>,
+) -> SimplifyResult {
+    match expr {
+        ExpressionNode::Var(name) => {
+            let Some((scope, v)) = scope.lookup(name.slice) else {
+                panic!(
+                    "Error: referencing undefined symbol '{}' {name:?}",
+                    name.slice
+                );
+            };
+
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let result = match v {
+                VarLookupResult::IntrinsicFunctions(_) => {
+                    panic!("Error: cannot get pointer of IntrinsicFunctions");
+                }
+                VarLookupResult::IntrinsicTypeConstructor(_) => {
+                    panic!("Error: cannot get pointer of IntrinsicTypeConstructor")
+                }
+                VarLookupResult::ScopeLocalVar(vid, _, false) => {
+                    inst.scope_local_var_ref(scope, vid)
+                }
+                VarLookupResult::ScopeLocalVar(vid, _, true) => {
+                    inst.scope_local_var_mutable_ref(scope, vid)
+                }
+                VarLookupResult::FunctionInputVar(vid, _, false) => {
+                    inst.function_input_var_ref(scope, vid)
+                }
+                VarLookupResult::FunctionInputVar(vid, _, true) => {
+                    inst.function_input_var_mutable_ref(scope, vid)
+                }
+                VarLookupResult::UserDefinedFunction(_) => {
+                    panic!("Error: cannot store any value to UserDefinedFunction");
+                }
+            };
+
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            SimplifyResult {
+                result,
+                start_block: perform_block,
+                end_block: perform_block,
+            }
+        }
+        ExpressionNode::MemberRef(base, _, name) => {
+            let base = simplify_expression(*base, block_ctx, scope);
+
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let result = match base.result.ty(inst.generation_context) {
+                ConcreteType::Ref(ref inner) => match &**inner {
+                    ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
+                        (None, _) | (_, None) => panic!("cannot member ref to complex data"),
+                        (_, Some(1)) => panic!("scalar value cannot be swizzled"),
+                        (Some(_), Some(count)) => match swizzle_indices(name.slice, count) {
+                            Some([Some(a), None, None, None]) => {
+                                inst.swizzle_ref(base.result, vec![a])
+                            }
+                            Some([Some(a), Some(b), None, None]) => {
+                                inst.swizzle_ref(base.result, vec![a, b])
+                            }
+                            Some([Some(a), Some(b), Some(c), None]) => {
+                                inst.swizzle_ref(base.result, vec![a, b, c])
+                            }
+                            Some([Some(a), Some(b), Some(c), Some(d)]) => {
+                                inst.swizzle_ref(base.result, vec![a, b, c, d])
+                            }
+                            Some(_) => panic!("invalid swizzle ref"),
+                            None => panic!("too many swizzle components"),
+                        },
+                    },
+                    ConcreteType::Struct(members) => {
+                        let target_member = members.iter().find(|x| x.name.0.slice == name.slice);
+
+                        match target_member {
+                            Some(x) => {
+                                if x.mutable {
+                                    inst.member_mutable_ref(
+                                        base.result,
+                                        SourceRef::from(&name),
+                                        x.ty.clone(),
+                                    )
+                                } else {
+                                    inst.member_ref(
+                                        base.result,
+                                        SourceRef::from(&name),
+                                        x.ty.clone(),
+                                    )
+                                }
+                            }
+                            None => {
+                                panic!("Struct has no member named '{}'", name.slice);
+                            }
+                        }
+                    }
+                    ty => {
+                        panic!("unsupported member ref op for type {ty:?}");
+                    }
+                },
+                ConcreteType::MutableRef(ref inner) => match &**inner {
+                    ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
+                        (None, _) | (_, None) => panic!("cannot member ref to complex data"),
+                        (_, Some(1)) => panic!("scalar value cannot be swizzled"),
+                        (Some(_), Some(count)) => match swizzle_indices(name.slice, count) {
+                            Some([Some(a), None, None, None]) => {
+                                inst.swizzle_mutable_ref(base.result, vec![a])
+                            }
+                            Some([Some(a), Some(b), None, None]) => {
+                                inst.swizzle_mutable_ref(base.result, vec![a, b])
+                            }
+                            Some([Some(a), Some(b), Some(c), None]) => {
+                                inst.swizzle_mutable_ref(base.result, vec![a, b, c])
+                            }
+                            Some([Some(a), Some(b), Some(c), Some(d)]) => {
+                                inst.swizzle_mutable_ref(base.result, vec![a, b, c, d])
+                            }
+                            Some(_) => panic!("invalid swizzle ref"),
+                            None => panic!("too many swizzle components"),
+                        },
+                    },
+                    ConcreteType::Struct(members) => {
+                        let target_member = members.iter().find(|x| x.name.0.slice == name.slice);
+
+                        match target_member {
+                            Some(x) => inst.member_mutable_ref(
+                                base.result,
+                                SourceRef::from(&name),
+                                x.ty.clone(),
+                            ),
+                            None => {
+                                panic!("Struct has no member named '{}'", name.slice);
+                            }
+                        }
+                    }
+                    ty => {
+                        panic!("unsupported member ref op for type {ty:?}");
+                    }
+                },
+                ty => {
+                    panic!("unable to store to rhs value {ty:?}");
+                }
+            };
+
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(base.end_block, perform_block),
+                "base multiple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_block,
+            }
+        }
+        ExpressionNode::ArrayIndex(base, _, ix, _) => {
+            let base = simplify_expression(*base, block_ctx, scope);
+            let ix = simplify_expression(*ix, block_ctx, scope);
+
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let ix_value = inst.loaded(ix.result);
+            let result = match base.result.ty(inst.generation_context) {
+                ConcreteType::Ref(inner) => match &**inner {
+                    ConcreteType::Array(elm, _) => {
+                        inst.array_ref(base.result, ix_value, *elm.clone())
+                    }
+                    _ => panic!("Error: cannot indexing this type: {inner:?}"),
+                },
+                ConcreteType::MutableRef(inner) => match &**inner {
+                    ConcreteType::Array(elm, _) => {
+                        inst.array_mutable_ref(base.result, ix_value, *elm.clone())
+                    }
+                    _ => panic!("Error: cannot indexing this type: {inner:?}"),
+                },
+                ConcreteType::Array(_, _) => {
+                    unimplemented!("rhs value direct indexing")
+                }
+                ty => panic!("Error: cannot indexing this type: {ty:?}"),
+            };
+
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(base.end_block, ix.start_block),
+                "base multiple out?"
+            );
+            assert!(
+                block_ctx.try_chain(ix.end_block, perform_block),
+                "index multiple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_block,
+            }
+        }
+        _ => panic!("Error: invalid lefthand expression: {expr:?}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SimplifiedExpression<'a, 's> {
+    Nop,
     Add(ExprRef, ExprRef),
     Sub(ExprRef, ExprRef),
     Mul(ExprRef, ExprRef),
@@ -33,6 +241,8 @@ pub enum SimplifiedExpression<'a, 's> {
     BitAnd(ExprRef, ExprRef),
     BitOr(ExprRef, ExprRef),
     BitXor(ExprRef, ExprRef),
+    ShiftLeft(ExprRef, ExprRef),
+    ShiftRight(ExprRef, ExprRef),
     Eq(ExprRef, ExprRef),
     Ne(ExprRef, ExprRef),
     Gt(ExprRef, ExprRef),
@@ -46,11 +256,18 @@ pub enum SimplifiedExpression<'a, 's> {
     BitNot(ExprRef),
     LogNot(ExprRef),
     Funcall(ExprRef, Vec<ExprRef>),
-    MemberRef(ExprRef, SourceRefSliceEq<'s>),
+    VarRef(PtrEq<'a, SymbolScope<'a, 's>>, VarId),
     TupleRef(ExprRef, usize),
-    LoadVar(PtrEq<'a, SymbolScope<'a, 's>>, VarId),
-    InitializeVar(PtrEq<'a, SymbolScope<'a, 's>>, VarId),
-    StoreVar(PtrEq<'a, SymbolScope<'a, 's>>, usize, ExprRef),
+    MemberRef(ExprRef, SourceRefSliceEq<'s>),
+    ArrayRef(ExprRef, ExprRef),
+    SwizzleRef1(ExprRef, usize),
+    SwizzleRef2(ExprRef, usize, usize),
+    SwizzleRef3(ExprRef, usize, usize, usize),
+    SwizzleRef4(ExprRef, usize, usize, usize, usize),
+    ChainedRef(ExprRef, Vec<ExprRef>),
+    CanonicalPathRef(RefPath),
+    LoadRef(ExprRef),
+    StoreRef(ExprRef, ExprRef),
     LoadByCanonicalRefPath(RefPath),
     RefFunction(PtrEq<'a, SymbolScope<'a, 's>>, &'s str),
     IntrinsicFunctions(Vec<IntrinsicFunctionSymbol>),
@@ -67,6 +284,7 @@ pub enum SimplifiedExpression<'a, 's> {
     ConstInt(SourceRefSliceEq<'s>),
     ConstNumber(SourceRefSliceEq<'s>),
     ConstUnit,
+    ConstUIntImm(u32),
     ConstUInt(SourceRefSliceEq<'s>, ConstModifiers),
     ConstSInt(SourceRefSliceEq<'s>, ConstModifiers),
     ConstFloat(SourceRefSliceEq<'s>, ConstModifiers),
@@ -80,18 +298,43 @@ pub enum SimplifiedExpression<'a, 's> {
         expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
         returning: ExprRef,
     },
+    LoopBlock {
+        capturing: Vec<ScopeCaptureSource>,
+        symbol_scope: PtrEq<'a, SymbolScope<'a, 's>>,
+        expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
+    },
+    BreakLoop(ExprRef),
     StoreOutput(ExprRef, usize),
     FlattenAndDistributeOutputComposite(ExprRef, Vec<usize>),
     AliasScopeCapture(usize),
     Alias(ExprRef),
 }
+impl ExprRef {
+    pub fn is_pure(&self, env: &[(SimplifiedExpression, ConcreteType)]) -> bool {
+        match env[self.0].0 {
+            SimplifiedExpression::Funcall(_, _)
+            | SimplifiedExpression::StoreRef(_, _)
+            | SimplifiedExpression::ScopedBlock { .. }
+            | SimplifiedExpression::LoopBlock { .. }
+            | SimplifiedExpression::BreakLoop(_)
+            | SimplifiedExpression::StoreOutput(_, _)
+            | SimplifiedExpression::FlattenAndDistributeOutputComposite(_, _) => false,
+            SimplifiedExpression::IntrinsicFuncall(_, is_pure, _) => is_pure,
+            SimplifiedExpression::Select(c, t, e) => {
+                c.is_pure(env) && t.is_pure(env) && e.is_pure(env)
+            }
+            _ => true,
+        }
+    }
+}
 impl SimplifiedExpression<'_, '_> {
     pub fn is_pure(&self) -> bool {
         match self {
             Self::Funcall(_, _)
-            | Self::InitializeVar(_, _)
-            | Self::StoreVar(_, _, _)
+            | Self::StoreRef(_, _)
             | Self::ScopedBlock { .. }
+            | Self::LoopBlock { .. }
+            | Self::BreakLoop(_)
             | Self::StoreOutput(_, _)
             | Self::FlattenAndDistributeOutputComposite(_, _) => false,
             &Self::IntrinsicFuncall(_, is_pure, _) => is_pure,
@@ -109,6 +352,8 @@ impl SimplifiedExpression<'_, '_> {
             | Self::BitAnd(ref mut l, ref mut r)
             | Self::BitOr(ref mut l, ref mut r)
             | Self::BitXor(ref mut l, ref mut r)
+            | Self::ShiftLeft(ref mut l, ref mut r)
+            | Self::ShiftRight(ref mut l, ref mut r)
             | Self::Eq(ref mut l, ref mut r)
             | Self::Ne(ref mut l, ref mut r)
             | Self::Gt(ref mut l, ref mut r)
@@ -118,7 +363,9 @@ impl SimplifiedExpression<'_, '_> {
             | Self::LogAnd(ref mut l, ref mut r)
             | Self::LogOr(ref mut l, ref mut r)
             | Self::Pow(ref mut l, ref mut r)
-            | Self::VectorShuffle4(ref mut l, ref mut r, _, _, _, _) => {
+            | Self::VectorShuffle4(ref mut l, ref mut r, _, _, _, _)
+            | Self::StoreRef(ref mut l, ref mut r)
+            | Self::ArrayRef(ref mut l, ref mut r) => {
                 let (l1, r1) = (l.0, r.0);
 
                 l.0 = relocator(l.0);
@@ -133,6 +380,19 @@ impl SimplifiedExpression<'_, '_> {
                 e.0 = relocator(e.0);
                 c.0 != c1 || t.0 != t1 || e.0 != e1
             }
+            Self::ChainedRef(ref mut base, ref mut xs) => {
+                let b1 = base.0;
+                base.0 = relocator(base.0);
+                let mut dirty = b1 != base.0;
+
+                for x in xs {
+                    let x1 = x.0;
+                    x.0 = relocator(x.0);
+                    dirty |= x1 != x.0;
+                }
+
+                dirty
+            }
             Self::Neg(ref mut x)
             | Self::BitNot(ref mut x)
             | Self::LogNot(ref mut x)
@@ -141,14 +401,19 @@ impl SimplifiedExpression<'_, '_> {
             | Self::Swizzle2(ref mut x, _, _)
             | Self::Swizzle3(ref mut x, _, _, _)
             | Self::Swizzle4(ref mut x, _, _, _, _)
-            | Self::StoreVar(_, _, ref mut x)
+            | Self::LoadRef(ref mut x)
+            | Self::SwizzleRef1(ref mut x, _)
+            | Self::SwizzleRef2(ref mut x, _, _)
+            | Self::SwizzleRef3(ref mut x, _, _, _)
+            | Self::SwizzleRef4(ref mut x, _, _, _, _)
             | Self::InstantiateIntrinsicTypeClass(ref mut x, _)
             | Self::MemberRef(ref mut x, _)
             | Self::TupleRef(ref mut x, _)
             | Self::StoreOutput(ref mut x, _)
             | Self::FlattenAndDistributeOutputComposite(ref mut x, _)
             | Self::Alias(ref mut x)
-            | Self::ConstIntToNumber(ref mut x) => {
+            | Self::ConstIntToNumber(ref mut x)
+            | Self::BreakLoop(ref mut x) => {
                 let x1 = x.0;
 
                 x.0 = relocator(x.0);
@@ -191,14 +456,29 @@ impl SimplifiedExpression<'_, '_> {
                 }
                 dirty
             }
-            Self::ConstInt(_)
+            Self::LoopBlock {
+                ref mut capturing, ..
+            } => {
+                let mut dirty = false;
+                for x in capturing {
+                    if let ScopeCaptureSource::Expr(x) = x {
+                        let x1 = x.0;
+                        x.0 = relocator(x.0);
+                        dirty |= x.0 != x1;
+                    }
+                }
+                dirty
+            }
+            Self::Nop
+            | Self::ConstInt(_)
             | Self::ConstNumber(_)
             | Self::ConstUnit
+            | Self::ConstUIntImm(_)
             | Self::ConstUInt(_, _)
             | Self::ConstSInt(_, _)
             | Self::ConstFloat(_, _)
-            | Self::LoadVar(_, _)
-            | Self::InitializeVar(_, _)
+            | Self::VarRef(_, _)
+            | Self::CanonicalPathRef(_)
             | Self::LoadByCanonicalRefPath(_)
             | Self::RefFunction(_, _)
             | Self::IntrinsicFunctions(_)
@@ -217,11 +497,61 @@ bitflags::bitflags! {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypedExprRef<'s> {
+    pub id: ExprRef,
+    pub ty: ConcreteType<'s>,
+}
+impl<'s> TypedExprRef<'s> {
+    #[inline]
+    pub fn loaded<'a>(self, ctx: &mut SimplificationContext<'a, 's>) -> Self {
+        match self.ty {
+            ConcreteType::Ref(inner) | ConcreteType::MutableRef(inner) => {
+                let new_id = ctx.add(SimplifiedExpression::LoadRef(self.id), *inner.clone());
+
+                Self {
+                    id: new_id,
+                    ty: *inner,
+                }
+            }
+            _ => self,
+        }
+    }
+}
+impl ExprRef {
+    #[inline(always)]
+    pub const fn typed<'s>(self, ty: ConcreteType<'s>) -> TypedExprRef<'s> {
+        TypedExprRef { id: self, ty }
+    }
+}
+
+pub struct SimplifyResult {
+    pub result: RegisterRef,
+    pub start_block: usize,
+    pub end_block: usize,
+}
+
 pub struct SimplificationContext<'a, 's> {
     pub symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>,
     pub vars: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
 }
 impl<'a, 's> SimplificationContext<'a, 's> {
+    #[inline]
+    pub fn new(symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>) -> Self {
+        Self {
+            symbol_scope_arena,
+            vars: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn new_derived(&self) -> Self {
+        Self {
+            symbol_scope_arena: self.symbol_scope_arena,
+            vars: Vec::new(),
+        }
+    }
+
     pub fn add(&mut self, expr: SimplifiedExpression<'a, 's>, ty: ConcreteType<'s>) -> ExprRef {
         self.vars.push((expr, ty));
 
@@ -230,337 +560,289 @@ impl<'a, 's> SimplificationContext<'a, 's> {
 }
 pub fn simplify_expression<'a, 's>(
     ast: ExpressionNode<'s>,
-    ctx: &mut SimplificationContext<'a, 's>,
+    block_ctx: &mut BlockGenerationContext<'a, 's>,
     symbol_scope: &'a SymbolScope<'a, 's>,
-) -> (ExprRef, ConcreteType<'s>) {
+) -> SimplifyResult {
     match ast {
         ExpressionNode::Binary(left, op, right) => {
-            let (left, lt) = simplify_expression(*left, ctx, symbol_scope);
-            let (right, rt) = simplify_expression(*right, ctx, symbol_scope);
+            let left = simplify_expression(*left, block_ctx, symbol_scope);
+            let right = simplify_expression(*right, block_ctx, symbol_scope);
+
+            assert!(
+                block_ctx.try_chain(left.end_block, right.start_block),
+                "left multi branch?"
+            );
 
             if op.slice.starts_with('`') && op.slice.ends_with('`') {
                 // infix funcall
-                let (f, ft) = emit_varref(
+
+                let mut function_load_inst = BlockInstructionEmitter::new(block_ctx);
+                let f = emit_varref(
                     SourceRef {
                         slice: &op.slice[1..op.slice.len() - 1],
                         line: op.line,
                         col: op.col,
                     },
-                    ctx,
+                    &mut function_load_inst,
                     symbol_scope,
                 );
+                let f = match f.ty(function_load_inst.generation_context) {
+                    ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
+                        function_load_inst.load_ref(f)
+                    }
+                    _ => f,
+                };
 
-                return funcall(f, ft, vec![left, right], vec![lt, rt], ctx);
+                let function_load_block =
+                    function_load_inst.create_block(BlockFlowInstruction::Undetermined);
+
+                let (result, perform_block) =
+                    funcall(f, vec![left.result, right.result], block_ctx);
+                assert!(
+                    block_ctx.try_chain(right.end_block, function_load_block),
+                    "right multi branch?"
+                );
+                assert!(block_ctx.try_chain(function_load_block, perform_block));
+
+                return SimplifyResult {
+                    result,
+                    start_block: left.start_block,
+                    end_block: perform_block,
+                };
             }
 
-            binary_op(left, lt, SourceRef::from(&op), right, rt, ctx)
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let left_value = inst.loaded(left.result);
+            let right_value = inst.loaded(right.result);
+            let result = binary_op(left_value, SourceRef::from(&op), right_value, &mut inst);
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(right.end_block, perform_block),
+                "right multi branch?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: left.start_block,
+                end_block: perform_block,
+            }
         }
         ExpressionNode::Prefixed(op, expr) => {
-            let (expr, et) = simplify_expression(*expr, ctx, symbol_scope);
+            let expr = simplify_expression(*expr, block_ctx, symbol_scope);
 
-            match op.slice {
-                "+" if et.scalar_type().is_some() => (expr, et),
-                "-" => match et.scalar_type() {
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let expr_value = inst.loaded(expr.result);
+
+            let result = match op.slice {
+                "+" if expr_value.ty(inst.generation_context).is_scalar_type() => expr_value,
+                "-" => match expr_value.ty(inst.generation_context).scalar_type() {
                     Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::UInt) => {
                         let target_type: ConcreteType = IntrinsicScalarType::SInt
-                            .of_vector(et.vector_elements().unwrap())
+                            .of_vector(
+                                expr_value
+                                    .ty(inst.generation_context)
+                                    .vector_elements()
+                                    .unwrap(),
+                            )
                             .unwrap()
                             .into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::Cast(expr, target_type.clone()),
-                            target_type.clone(),
-                        );
+                        let expr = inst.cast(expr_value, target_type.clone());
 
-                        (
-                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
-                            target_type,
-                        )
+                        inst.intrinsic_unary_op(expr, IntrinsicUnaryOperation::Neg, target_type)
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let target_type: ConcreteType = IntrinsicType::SInt.into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                expr,
-                                IntrinsicType::SInt,
-                            ),
-                            target_type.clone(),
-                        );
+                        let expr =
+                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::SInt);
 
-                        (
-                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::Neg,
+                            IntrinsicType::SInt.into(),
                         )
                     }
                     Some(IntrinsicScalarType::UnknownNumberClass) => {
-                        let target_type: ConcreteType = IntrinsicType::Float.into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                expr,
-                                IntrinsicType::Float,
-                            ),
-                            target_type.clone(),
-                        );
+                        let expr =
+                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::Float);
 
-                        (
-                            ctx.add(SimplifiedExpression::Neg(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::Neg,
+                            IntrinsicType::Float.into(),
                         )
                     }
-                    Some(_) => (ctx.add(SimplifiedExpression::Neg(expr), et.clone()), et),
+                    Some(_) => inst.intrinsic_unary_op(
+                        expr_value,
+                        IntrinsicUnaryOperation::Neg,
+                        expr_value.ty(inst.generation_context).clone(),
+                    ),
                     None => panic!("Error: cannot apply prefixed - to the term"),
                 },
-                "!" => match et.scalar_type() {
+                "!" => match expr_value.ty(inst.generation_context).scalar_type() {
                     Some(IntrinsicScalarType::SInt)
                     | Some(IntrinsicScalarType::UInt)
                     | Some(IntrinsicScalarType::Float) => {
                         let target_type: ConcreteType = IntrinsicScalarType::Bool
-                            .of_vector(et.vector_elements().unwrap())
+                            .of_vector(
+                                expr_value
+                                    .ty(inst.generation_context)
+                                    .vector_elements()
+                                    .unwrap(),
+                            )
                             .unwrap()
                             .into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::Cast(expr, target_type.clone()),
-                            target_type.clone(),
-                        );
+                        let expr = inst.cast(expr_value, target_type.clone());
 
-                        (
-                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::LogNot,
+                            target_type.clone(),
                         )
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let target_type: ConcreteType = IntrinsicType::Bool.into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                expr,
-                                IntrinsicType::UInt,
-                            ),
-                            target_type.clone(),
-                        );
-                        let expr = ctx.add(
-                            SimplifiedExpression::Cast(expr, IntrinsicType::Bool.into()),
-                            target_type.clone(),
-                        );
+                        let expr =
+                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::UInt);
+                        let expr = inst.cast(expr, IntrinsicType::Bool.into());
 
-                        (
-                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::LogNot,
+                            IntrinsicType::Bool.into(),
                         )
                     }
                     Some(IntrinsicScalarType::UnknownNumberClass) => {
-                        let target_type: ConcreteType = IntrinsicType::Bool.into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                expr,
-                                IntrinsicType::Float,
-                            ),
-                            target_type.clone(),
-                        );
-                        let expr = ctx.add(
-                            SimplifiedExpression::Cast(expr, IntrinsicType::Bool.into()),
-                            target_type.clone(),
-                        );
+                        let expr =
+                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::Float);
+                        let expr = inst.cast(expr, IntrinsicType::Bool.into());
 
-                        (
-                            ctx.add(SimplifiedExpression::LogNot(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::LogNot,
+                            IntrinsicType::Bool.into(),
                         )
                     }
-                    Some(_) => (ctx.add(SimplifiedExpression::LogNot(expr), et.clone()), et),
+                    Some(_) => inst.intrinsic_unary_op(
+                        expr_value,
+                        IntrinsicUnaryOperation::LogNot,
+                        expr_value.ty(inst.generation_context).clone(),
+                    ),
                     None => panic!("Error: cannot apply prefixed ! to the term"),
                 },
-                "~" => match et.scalar_type() {
+                "~" => match expr_value.ty(inst.generation_context).scalar_type() {
                     Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::SInt) => {
                         let target_type: ConcreteType = IntrinsicScalarType::UInt
-                            .of_vector(et.vector_elements().unwrap())
+                            .of_vector(
+                                expr_value
+                                    .ty(inst.generation_context)
+                                    .vector_elements()
+                                    .unwrap(),
+                            )
                             .unwrap()
                             .into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::Cast(expr, target_type.clone()),
-                            target_type.clone(),
-                        );
+                        let expr = inst.cast(expr_value, target_type.clone());
 
-                        (
-                            ctx.add(SimplifiedExpression::BitNot(expr), target_type.clone()),
-                            target_type,
-                        )
+                        inst.intrinsic_unary_op(expr, IntrinsicUnaryOperation::BitNot, target_type)
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let target_type: ConcreteType = IntrinsicType::UInt.into();
-                        let expr = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                expr,
-                                IntrinsicType::UInt,
-                            ),
-                            target_type.clone(),
-                        );
+                        let expr =
+                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::UInt);
 
-                        (
-                            ctx.add(SimplifiedExpression::BitNot(expr), target_type.clone()),
-                            target_type,
+                        inst.intrinsic_unary_op(
+                            expr,
+                            IntrinsicUnaryOperation::BitNot,
+                            IntrinsicType::UInt.into(),
                         )
                     }
-                    Some(IntrinsicScalarType::UInt) => {
-                        (ctx.add(SimplifiedExpression::BitNot(expr), et.clone()), et)
-                    }
+                    Some(IntrinsicScalarType::UInt) => inst.intrinsic_unary_op(
+                        expr_value,
+                        IntrinsicUnaryOperation::BitNot,
+                        expr_value.ty(inst.generation_context).clone(),
+                    ),
                     _ => panic!("Error: cannot apply prefixed ~ to the term"),
                 },
                 x => panic!("Error: cannot apply prefixed op {x} to the term"),
-            }
-        }
-        ExpressionNode::Lifted(_, x, _) => simplify_expression(*x, ctx, symbol_scope),
-        ExpressionNode::Blocked(stmts, x) => {
-            let new_symbol_scope = ctx
-                .symbol_scope_arena
-                .alloc(SymbolScope::new(Some(symbol_scope), false));
-            let mut new_ctx = SimplificationContext {
-                symbol_scope_arena: ctx.symbol_scope_arena,
-                vars: Vec::new(),
             };
 
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(expr.end_block, perform_block),
+                "expr multiple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: expr.start_block,
+                end_block: perform_block,
+            }
+        }
+        ExpressionNode::Lifted(_, x, _) => simplify_expression(*x, block_ctx, symbol_scope),
+        ExpressionNode::Blocked(stmts, x) => {
+            let new_symbol_scope = block_ctx.symbol_scope_arena.alloc(symbol_scope.new_child());
+            let mut first_block = None;
+            let mut last_block = None;
+
             for s in stmts {
-                match s {
-                    StatementNode::Let {
-                        varname_token,
-                        expr,
-                        mut_token,
-                        ..
-                    } => {
-                        let (res, ty) = simplify_expression(expr, &mut new_ctx, new_symbol_scope);
-                        let vid = new_symbol_scope.declare_local_var(
-                            SourceRef::from(&varname_token),
-                            ty.clone(),
-                            res,
-                            mut_token.is_some(),
-                        );
-                        new_ctx.add(
-                            SimplifiedExpression::InitializeVar(PtrEq(new_symbol_scope), vid),
-                            ty,
-                        );
+                let (start_block, end_block) = transform_statement(s, new_symbol_scope, block_ctx);
+                if first_block.is_none() {
+                    first_block = Some(start_block);
+                }
+                if let Some(b) = last_block {
+                    assert!(block_ctx.try_chain(b, start_block), "multi out?");
+                }
+
+                last_block = Some(end_block);
+            }
+
+            match x {
+                Some(x) => {
+                    let res = simplify_expression(*x, block_ctx, new_symbol_scope);
+                    if let Some(b) = last_block {
+                        assert!(block_ctx.try_chain(b, res.start_block), "multi out?");
                     }
-                    StatementNode::OpEq {
-                        varname_token,
-                        opeq_token,
-                        expr,
-                    } => {
-                        let Some((vscope, vid)) = new_symbol_scope.lookup(varname_token.slice)
-                        else {
-                            panic!("Error: assigning to undefined variable");
-                        };
-                        let (vid, vty) = match vid {
-                            VarLookupResult::ScopeLocalVar(x, vty, true) => (x, vty),
-                            VarLookupResult::ScopeLocalVar(_, _, false) => {
-                                panic!("Error: cannot assign to immutable variable")
-                            }
-                            VarLookupResult::FunctionInputVar(_, _) => {
-                                panic!("Error: cannot assign to function input")
-                            }
-                            VarLookupResult::IntrinsicFunctions(_) => {
-                                panic!("Error: cannot assign to fuction")
-                            }
-                            VarLookupResult::IntrinsicTypeConstructor(_) => {
-                                panic!("Error: cannot assign to intrinsic type construct")
-                            }
-                            VarLookupResult::UserDefinedFunction(_) => {
-                                panic!("Error: cannot assign to function")
-                            }
-                        };
 
-                        match opeq_token.slice {
-                            "=" => {
-                                let (res, ty) =
-                                    simplify_expression(expr, &mut new_ctx, new_symbol_scope);
-                                if ty != vty {
-                                    panic!("Error: assigning different type value");
-                                }
+                    SimplifyResult {
+                        result: res.result,
+                        start_block: first_block.unwrap_or(res.start_block),
+                        end_block: res.end_block,
+                    }
+                }
+                None => {
+                    // return unit
+                    let result = block_ctx.alloc_register(IntrinsicType::Unit.into());
+                    let block = block_ctx.add(Block {
+                        instructions: vec![BlockInstruction::ConstUnit(result)],
+                        flow: BlockFlowInstruction::Undetermined,
+                    });
+                    if let Some(b) = last_block {
+                        assert!(block_ctx.try_chain(b, block), "multi out?");
+                    }
 
-                                new_ctx.add(
-                                    SimplifiedExpression::StoreVar(PtrEq(vscope), vid, res),
-                                    IntrinsicType::Unit.into(),
-                                );
-                            }
-                            "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "&&="
-                            | "||=" | "^^=" => {
-                                let (left, lty) = emit_varref(
-                                    SourceRef::from(&varname_token),
-                                    &mut new_ctx,
-                                    vscope,
-                                );
-                                let (right, rty) =
-                                    simplify_expression(expr, &mut new_ctx, new_symbol_scope);
-                                let (res, resty) = binary_op(
-                                    left,
-                                    lty,
-                                    SourceRef {
-                                        slice: &opeq_token.slice[..opeq_token.slice.len() - 1],
-                                        col: opeq_token.col,
-                                        line: opeq_token.line,
-                                    },
-                                    right,
-                                    rty,
-                                    &mut new_ctx,
-                                );
-                                if resty != vty {
-                                    panic!("Error: assigning different type value");
-                                }
-
-                                new_ctx.add(
-                                    SimplifiedExpression::StoreVar(PtrEq(vscope), vid, res),
-                                    IntrinsicType::Unit.into(),
-                                );
-                            }
-                            _ => unreachable!("unknown binary opeq"),
-                        }
+                    SimplifyResult {
+                        result,
+                        start_block: first_block.unwrap_or(block),
+                        end_block: block,
                     }
                 }
             }
-
-            let (last_id, last_ty) = simplify_expression(*x, &mut new_ctx, new_symbol_scope);
-            (
-                ctx.add(
-                    SimplifiedExpression::ScopedBlock {
-                        symbol_scope: PtrEq(new_symbol_scope),
-                        expressions: new_ctx.vars,
-                        returning: last_id,
-                        capturing: Vec::new(),
-                    },
-                    last_ty.clone(),
-                ),
-                last_ty,
-            )
         }
         ExpressionNode::MemberRef(base, _, name) => {
-            let (base, base_ty) = simplify_expression(*base, ctx, symbol_scope);
+            let base = simplify_expression(*base, block_ctx, symbol_scope);
 
-            match base_ty {
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let result = match base.result.ty(inst.generation_context) {
                 ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                     (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                     (_, Some(1)) => panic!("scalar value cannot be swizzled"),
-                    (Some(scalar), Some(count)) => match swizzle_indices(name.slice, count) {
-                        Some([Some(a), None, None, None]) => (
-                            ctx.add(SimplifiedExpression::Swizzle1(base, a), scalar.into()),
-                            scalar.into(),
-                        ),
-                        Some([Some(a), Some(b), None, None]) => (
-                            ctx.add(
-                                SimplifiedExpression::Swizzle2(base, a, b),
-                                scalar.of_vector(2).unwrap().into(),
-                            ),
-                            scalar.of_vector(2).unwrap().into(),
-                        ),
-                        Some([Some(a), Some(b), Some(c), None]) => (
-                            ctx.add(
-                                SimplifiedExpression::Swizzle3(base, a, b, c),
-                                scalar.of_vector(3).unwrap().into(),
-                            ),
-                            scalar.of_vector(3).unwrap().into(),
-                        ),
-                        Some([Some(a), Some(b), Some(c), Some(d)]) => (
-                            ctx.add(
-                                SimplifiedExpression::Swizzle4(base, a, b, c, d),
-                                scalar.of_vector(4).unwrap().into(),
-                            ),
-                            scalar.of_vector(4).unwrap().into(),
-                        ),
+                    (Some(_), Some(count)) => match swizzle_indices(name.slice, count) {
+                        Some([Some(a), None, None, None]) => inst.swizzle(base.result, vec![a]),
+                        Some([Some(a), Some(b), None, None]) => {
+                            inst.swizzle(base.result, vec![a, b])
+                        }
+                        Some([Some(a), Some(b), Some(c), None]) => {
+                            inst.swizzle(base.result, vec![a, b, c])
+                        }
+                        Some([Some(a), Some(b), Some(c), Some(d)]) => {
+                            inst.swizzle(base.result, vec![a, b, c, d])
+                        }
                         Some(_) => panic!("invalid swizzle ref"),
                         None => panic!("too many swizzle components"),
                     },
@@ -578,16 +860,21 @@ pub fn simplify_expression<'a, 's>(
                             let target_member =
                                 members.iter().find(|x| x.name.0.slice == name.slice);
                             match target_member {
-                                Some(x) => (
-                                    ctx.add(
-                                        SimplifiedExpression::MemberRef(
-                                            base,
-                                            SourceRefSliceEq(SourceRef::from(&name)),
-                                        ),
-                                        x.ty.clone(),
-                                    ),
-                                    x.ty.clone(),
-                                ),
+                                Some(x) => {
+                                    if x.mutable {
+                                        inst.member_mutable_ref(
+                                            base.result,
+                                            SourceRef::from(&name),
+                                            x.ty.clone(),
+                                        )
+                                    } else {
+                                        inst.member_ref(
+                                            base.result,
+                                            SourceRef::from(&name),
+                                            x.ty.clone(),
+                                        )
+                                    }
+                                }
                                 None => {
                                     panic!("Struct {ty_name} has no member named '{}'", name.slice);
                                 }
@@ -595,114 +882,314 @@ pub fn simplify_expression<'a, 's>(
                         }
                     }
                 }
-                ConcreteType::Struct(members) => {
-                    let target_member = members.iter().find(|x| x.name.0.slice == name.slice);
-                    match target_member {
-                        Some(x) => (
-                            ctx.add(
-                                SimplifiedExpression::MemberRef(
-                                    base,
-                                    SourceRefSliceEq(SourceRef::from(&name)),
-                                ),
-                                x.ty.clone(),
-                            ),
-                            x.ty.clone(),
-                        ),
-                        None => {
-                            panic!("Struct has no member named '{}'", name.slice);
+                ConcreteType::Ref(ref inner) => match &**inner {
+                    ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
+                        (None, _) | (_, None) => panic!("cannot member ref to complex data"),
+                        (_, Some(1)) => panic!("scalar value cannot be swizzled"),
+                        (Some(_), Some(count)) => match swizzle_indices(name.slice, count) {
+                            Some([Some(a), None, None, None]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a])
+                            }
+                            Some([Some(a), Some(b), None, None]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b])
+                            }
+                            Some([Some(a), Some(b), Some(c), None]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b, c])
+                            }
+                            Some([Some(a), Some(b), Some(c), Some(d)]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b, c, d])
+                            }
+                            Some(_) => panic!("invalid swizzle ref"),
+                            None => panic!("too many swizzle components"),
+                        },
+                    },
+                    ConcreteType::Struct(members) => {
+                        let target_member = members.iter().find(|x| x.name.0.slice == name.slice);
+
+                        match target_member {
+                            Some(x) => {
+                                if x.mutable {
+                                    inst.member_mutable_ref(
+                                        base.result,
+                                        SourceRef::from(&name),
+                                        x.ty.clone(),
+                                    )
+                                } else {
+                                    inst.member_ref(
+                                        base.result,
+                                        SourceRef::from(&name),
+                                        x.ty.clone(),
+                                    )
+                                }
+                            }
+                            None => {
+                                panic!("Struct has no member named '{}'", name.slice);
+                            }
                         }
                     }
-                }
-                _ => {
-                    eprintln!("unsupported member ref op for type {base_ty:?}");
+                    ty => {
+                        panic!("Error: unsupported member ref op for type {ty:?}");
+                    }
+                },
+                ConcreteType::MutableRef(ref inner) => match &**inner {
+                    ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
+                        (None, _) | (_, None) => panic!("cannot member ref to complex data"),
+                        (_, Some(1)) => panic!("scalar value cannot be swizzled"),
+                        (Some(_), Some(count)) => match swizzle_indices(name.slice, count) {
+                            Some([Some(a), None, None, None]) => {
+                                let base = inst.load_ref(base.result);
 
-                    (
-                        ctx.add(
-                            SimplifiedExpression::MemberRef(
-                                base,
-                                SourceRefSliceEq(SourceRef::from(&name)),
+                                inst.swizzle(base, vec![a])
+                            }
+                            Some([Some(a), Some(b), None, None]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b])
+                            }
+                            Some([Some(a), Some(b), Some(c), None]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b, c])
+                            }
+                            Some([Some(a), Some(b), Some(c), Some(d)]) => {
+                                let base = inst.load_ref(base.result);
+
+                                inst.swizzle(base, vec![a, b, c, d])
+                            }
+                            Some(_) => panic!("invalid swizzle ref"),
+                            None => panic!("too many swizzle components"),
+                        },
+                    },
+                    ConcreteType::Struct(members) => {
+                        let target_member = members.iter().find(|x| x.name.0.slice == name.slice);
+
+                        match target_member {
+                            Some(x) => inst.member_mutable_ref(
+                                base.result,
+                                SourceRef::from(&name),
+                                x.ty.clone(),
                             ),
-                            ConcreteType::Never,
-                        ),
-                        ConcreteType::Never,
-                    )
+                            None => {
+                                panic!("Struct has no member named '{}'", name.slice);
+                            }
+                        }
+                    }
+                    ty => {
+                        panic!("Error: unsupported member ref op for type {ty:?}")
+                    }
+                },
+                ty => {
+                    panic!("Error: unsupported member ref op for type {ty:?}");
                 }
+            };
+
+            let perform_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(base.end_block, perform_blk),
+                "base mutliple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_blk,
+            }
+        }
+        ExpressionNode::ArrayIndex(base, _, index, _) => {
+            let base = simplify_expression(*base, block_ctx, symbol_scope);
+            let index = simplify_expression(*index, block_ctx, symbol_scope);
+
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let index_value = inst.loaded(index.result);
+            let result = match base.result.ty(inst.generation_context) {
+                ConcreteType::Ref(inner) => match &**inner {
+                    ConcreteType::Array(elm, _) => {
+                        inst.array_ref(base.result, index_value, *elm.clone())
+                    }
+                    _ => panic!("Error: cannot indexing this type: {inner:?}"),
+                },
+                ConcreteType::MutableRef(inner) => match &**inner {
+                    ConcreteType::Array(elm, _) => {
+                        inst.array_mutable_ref(base.result, index_value, *elm.clone())
+                    }
+                    _ => panic!("Error: cannot indexing this type: {inner:?}"),
+                },
+                ConcreteType::Array(_, _) => {
+                    unimplemented!("rhs value direct indexing")
+                }
+                ty => panic!("Error: cannot indexing this type: {ty:?}"),
+            };
+
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            assert!(
+                block_ctx.try_chain(base.end_block, index.start_block),
+                "base multiple out?"
+            );
+            assert!(
+                block_ctx.try_chain(index.end_block, perform_block),
+                "index multiple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_block,
             }
         }
         ExpressionNode::Funcall {
             base_expr, args, ..
         } => {
-            let (base_expr, base_ty) = simplify_expression(*base_expr, ctx, symbol_scope);
-            let (args, arg_types): (Vec<_>, Vec<_>) = args
+            let base = simplify_expression(*base_expr, block_ctx, symbol_scope);
+            let (args, arg_block_range): (Vec<_>, Vec<_>) = args
                 .into_iter()
-                .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
+                .map(|(x, _)| simplify_expression(x, block_ctx, symbol_scope))
+                .map(|r| (r.result, (r.start_block, r.end_block)))
                 .unzip();
 
-            funcall(base_expr, base_ty, args, arg_types, ctx)
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let base_value = inst.loaded(base.result);
+            let base_load_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            let (result, perform_block) = funcall(base_value, args, block_ctx);
+            if !arg_block_range.is_empty() {
+                let mut before_block = base.end_block;
+                for &(start, end) in &arg_block_range {
+                    assert!(block_ctx.try_chain(before_block, start), "multiple out?");
+                    before_block = end;
+                }
+                assert!(
+                    block_ctx.try_chain(before_block, base_load_block),
+                    "multiple out?"
+                );
+                assert!(block_ctx.try_chain(base_load_block, perform_block));
+            } else {
+                assert!(
+                    block_ctx.try_chain(base.end_block, base_load_block),
+                    "multiple out?"
+                );
+                assert!(block_ctx.try_chain(base_load_block, perform_block));
+            }
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_block,
+            }
         }
         ExpressionNode::FuncallSingle(base_expr, arg) => {
-            let (base_expr, base_ty) = simplify_expression(*base_expr, ctx, symbol_scope);
-            let (arg, arg_ty) = simplify_expression(*arg, ctx, symbol_scope);
+            let base = simplify_expression(*base_expr, block_ctx, symbol_scope);
+            let arg = simplify_expression(*arg, block_ctx, symbol_scope);
 
-            funcall(base_expr, base_ty, vec![arg], vec![arg_ty], ctx)
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let base_value = inst.loaded(base.result);
+            let base_load_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            let (result, perform_block) = funcall(base_value, vec![arg.result], block_ctx);
+            assert!(
+                block_ctx.try_chain(base.end_block, arg.start_block),
+                "multiple out?"
+            );
+            assert!(
+                block_ctx.try_chain(arg.end_block, base_load_block),
+                "multiple out?"
+            );
+            assert!(block_ctx.try_chain(base_load_block, perform_block));
+
+            SimplifyResult {
+                result,
+                start_block: base.start_block,
+                end_block: perform_block,
+            }
         }
         ExpressionNode::Number(t) => {
             let has_hex_prefix = t.slice.starts_with("0x") || t.slice.starts_with("0X");
             let has_float_suffix = t.slice.ends_with(['f', 'F']);
             let has_fpart = t.slice.contains('.');
 
-            let (expr, ty) = if has_hex_prefix {
-                (
-                    SimplifiedExpression::ConstInt(SourceRefSliceEq::from(&t)),
-                    ConcreteType::UnknownIntClass,
-                )
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let res = if has_hex_prefix {
+                inst.const_int(SourceRef::from(&t))
             } else if has_float_suffix {
-                (
-                    SimplifiedExpression::ConstFloat(
-                        SourceRefSliceEq(SourceRef::from(&t)),
-                        ConstModifiers::empty(),
-                    ),
-                    IntrinsicType::Float.into(),
-                )
+                inst.const_float(SourceRef::from(&t))
             } else if has_fpart {
-                (
-                    SimplifiedExpression::ConstNumber(SourceRefSliceEq::from(&t)),
-                    ConcreteType::UnknownNumberClass,
-                )
+                inst.const_number(SourceRef::from(&t))
             } else {
-                (
-                    SimplifiedExpression::ConstInt(SourceRefSliceEq::from(&t)),
-                    ConcreteType::UnknownIntClass,
-                )
+                inst.const_int(SourceRef::from(&t))
             };
 
-            (ctx.add(expr, ty.clone()), ty)
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+            SimplifyResult {
+                result: res,
+                start_block: perform_block,
+                end_block: perform_block,
+            }
         }
-        ExpressionNode::Var(x) => emit_varref(SourceRef::from(&x), ctx, symbol_scope),
+        ExpressionNode::Var(x) => {
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+
+            let res = emit_varref(SourceRef::from(&x), &mut inst, symbol_scope);
+
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            SimplifyResult {
+                result: res,
+                start_block: perform_block,
+                end_block: perform_block,
+            }
+        }
         ExpressionNode::Tuple(_, xs, _) => {
-            let (xs, xs_types): (Vec<_>, Vec<_>) = xs
+            let (xs, eval_block_ranges): (Vec<_>, Vec<_>) = xs
                 .into_iter()
-                .map(|(x, _)| simplify_expression(x, ctx, symbol_scope))
+                .map(|(x, _)| simplify_expression(x, block_ctx, symbol_scope))
+                .map(|r| (r.result, (r.start_block, r.end_block)))
                 .unzip();
 
-            let ty = ConcreteType::Tuple(xs_types);
-            (
-                ctx.add(SimplifiedExpression::ConstructTuple(xs), ty.clone()),
-                ty,
-            )
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let res = inst.construct_tuple(xs);
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            let start_block;
+            if let Some(&(start, mut last_block)) = eval_block_ranges.first() {
+                start_block = start;
+
+                for &(start, end) in &eval_block_ranges[1..] {
+                    assert!(block_ctx.try_chain(last_block, start), "multiple out?");
+                    last_block = end;
+                }
+                assert!(
+                    block_ctx.try_chain(last_block, perform_block),
+                    "multiple out?"
+                );
+            } else {
+                start_block = perform_block;
+            }
+
+            SimplifyResult {
+                result: res,
+                start_block,
+                end_block: perform_block,
+            }
         }
         ExpressionNode::StructValue {
             ty,
             mut initializers,
             ..
         } => {
-            let ty = ConcreteType::build(symbol_scope, &HashSet::new(), ty.clone())
+            let ty = ConcreteType::build(symbol_scope, &HashSet::new(), *ty.clone())
                 .instantiate(symbol_scope);
             let ConcreteType::Struct(ref members) = ty else {
                 panic!("Error: cannot construct a structure of this type");
             };
 
-            let initializers = members
+            let (initializers, initializer_eval_block_ranges): (Vec<_>, Vec<_>) = members
                 .iter()
                 .map(|m| {
                     let initializer_pos = initializers
@@ -710,21 +1197,40 @@ pub fn simplify_expression<'a, 's>(
                         .position(|i| i.0.slice == m.name.0.slice)
                         .expect("initializers have extra member");
                     let initializer = initializers.remove(initializer_pos);
-                    let (ix, it) = simplify_expression(initializer.2, ctx, symbol_scope);
-                    if it != m.ty {
-                        panic!("initializer value type mismatched with member type");
+                    let v = simplify_expression(initializer.2, block_ctx, symbol_scope);
+                    if v.result.ty(block_ctx) != &m.ty {
+                        panic!("initializer value type does not match with member type");
                     }
 
-                    ix
+                    (v.result, (v.start_block, v.end_block))
                 })
-                .collect::<Vec<_>>();
-            (
-                ctx.add(
-                    SimplifiedExpression::ConstructStructValue(initializers),
-                    ty.clone(),
-                ),
-                ty,
-            )
+                .unzip();
+
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let res = inst.construct_struct(initializers, ty);
+            let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            let start_block;
+            if let Some(&(start, mut last_block)) = initializer_eval_block_ranges.first() {
+                start_block = start;
+
+                for &(start, end) in &initializer_eval_block_ranges[1..] {
+                    assert!(block_ctx.try_chain(last_block, start), "multiple out?");
+                    last_block = end;
+                }
+                assert!(
+                    block_ctx.try_chain(last_block, perform_block),
+                    "multiple out?"
+                );
+            } else {
+                start_block = perform_block;
+            }
+
+            SimplifyResult {
+                result: res,
+                start_block,
+                end_block: perform_block,
+            }
         }
         ExpressionNode::If {
             condition,
@@ -732,95 +1238,270 @@ pub fn simplify_expression<'a, 's>(
             else_expr,
             ..
         } => {
-            let (condition, cty) = simplify_expression(*condition, ctx, symbol_scope);
-            let (mut then_expr, tty) = simplify_expression(*then_expr, ctx, symbol_scope);
-            let (mut else_expr, ety) = match else_expr {
-                None => (
-                    ctx.add(SimplifiedExpression::ConstUnit, IntrinsicType::Unit.into()),
-                    IntrinsicType::Unit.into(),
-                ),
-                Some(x) => simplify_expression(*x, ctx, symbol_scope),
+            let condition = simplify_expression(*condition, block_ctx, symbol_scope);
+            let then_expr = simplify_expression(*then_expr, block_ctx, symbol_scope);
+            let else_expr = match else_expr {
+                None => {
+                    let result_register = block_ctx.alloc_register(IntrinsicType::Unit.into());
+                    let perform_block = block_ctx.add(Block {
+                        instructions: vec![BlockInstruction::ConstUnit(result_register)],
+                        flow: BlockFlowInstruction::Undetermined,
+                    });
+
+                    SimplifyResult {
+                        result: result_register,
+                        start_block: perform_block,
+                        end_block: perform_block,
+                    }
+                }
+                Some(x) => simplify_expression(*x, block_ctx, symbol_scope),
             };
 
-            let condition = match cty {
+            let condition = match condition.result.ty(block_ctx) {
                 ConcreteType::Intrinsic(IntrinsicType::Bool) => condition,
-                _ => ctx.add(
-                    SimplifiedExpression::Cast(condition, IntrinsicType::Bool.into()),
-                    IntrinsicType::Bool.into(),
-                ),
+                _ => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let result = inst.cast(condition.result, IntrinsicType::Bool.into());
+                    let cast_block = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(condition.end_block, cast_block),
+                        "condition multiple out?"
+                    );
+
+                    SimplifyResult {
+                        result,
+                        start_block: condition.start_block,
+                        end_block: cast_block,
+                    }
+                }
             };
 
-            let res_ty = match (tty, ety) {
-                (a, b) if a == b => a,
+            let (res_ty, then, r#else) = match (
+                then_expr.result.ty(block_ctx),
+                else_expr.result.ty(block_ctx),
+            ) {
+                (a, b) if a == b => (a.clone(), then_expr, else_expr),
+                (ConcreteType::Intrinsic(IntrinsicType::Unit), _) => {
+                    (IntrinsicType::Unit.into(), then_expr, else_expr)
+                }
+                (_, ConcreteType::Intrinsic(IntrinsicType::Unit)) => {
+                    (IntrinsicType::Unit.into(), then_expr, else_expr)
+                }
                 // TODO: 他の変換は必要になったら書く
-                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::Float)) => {
-                    then_expr = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                            then_expr,
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::SInt)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::SInt);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
                     );
-                    IntrinsicType::Float.into()
+
+                    (
+                        IntrinsicType::SInt.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::SInt), ConcreteType::UnknownIntClass) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::SInt);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::SInt.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::UInt)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::UInt);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::UInt.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::UInt), ConcreteType::UnknownIntClass) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::UInt);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::UInt.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::Float)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Float.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
                 }
                 (
                     ConcreteType::UnknownNumberClass,
                     ConcreteType::Intrinsic(IntrinsicType::Float),
                 ) => {
-                    then_expr = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                            then_expr,
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
                     );
-                    IntrinsicType::Float.into()
+
+                    (
+                        IntrinsicType::Float.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
                 }
                 (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
-                    else_expr = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                            else_expr,
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
                     );
-                    IntrinsicType::Float.into()
+
+                    (
+                        IntrinsicType::Float.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
                 }
                 (
                     ConcreteType::Intrinsic(IntrinsicType::Float),
                     ConcreteType::UnknownNumberClass,
                 ) => {
-                    else_expr = ctx.add(
-                        SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                            else_expr,
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
+                    let mut inst = BlockInstructionEmitter::new(block_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
                     );
-                    IntrinsicType::Float.into()
+
+                    (
+                        IntrinsicType::Float.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
                 }
                 _ => {
-                    eprintln!("Error: if then block and else block has different result type");
-                    ConcreteType::Never
+                    panic!("Error: if then block and else block has different result type");
                 }
             };
 
-            (
-                ctx.add(
-                    SimplifiedExpression::Select(condition, then_expr, else_expr),
-                    res_ty.clone(),
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            let result = inst.phi(
+                [
+                    (then.end_block, then.result),
+                    (r#else.end_block, r#else.result),
+                ]
+                .into_iter()
+                .collect(),
+                res_ty.clone(),
+            );
+            let merge_block = inst.create_block(BlockFlowInstruction::Undetermined);
+
+            assert!(
+                block_ctx.block_mut(condition.end_block).try_set_branch(
+                    condition.result,
+                    then.start_block,
+                    r#else.start_block
                 ),
-                res_ty,
-            )
+                "already chained?"
+            );
+            assert!(
+                block_ctx.try_chain(then.end_block, merge_block),
+                "then multiple out?"
+            );
+            assert!(
+                block_ctx.try_chain(r#else.end_block, merge_block),
+                "else multiple out?"
+            );
+
+            SimplifyResult {
+                result,
+                start_block: condition.start_block,
+                end_block: merge_block,
+            }
         }
     }
 }
 
 fn emit_varref<'a, 's>(
     name: SourceRef<'s>,
-    ctx: &mut SimplificationContext<'a, 's>,
+    inst: &mut BlockInstructionEmitter<'_, 'a, 's>,
     symbol_scope: &'a SymbolScope<'a, 's>,
-) -> (ExprRef, ConcreteType<'s>) {
+) -> RegisterRef {
     let Some((scope, v)) = symbol_scope.lookup(name.slice) else {
         panic!(
             "Error: referencing undefined symbol '{}' {name:?}",
@@ -829,96 +1510,47 @@ fn emit_varref<'a, 's>(
     };
 
     match v {
-        VarLookupResult::IntrinsicFunctions(xs) => {
-            let oty = ConcreteType::OverloadedFunctions(
-                xs.iter()
-                    .map(|x| (x.args.clone(), Box::new(x.output.clone())))
-                    .collect(),
-            );
-
-            (
-                ctx.add(
-                    SimplifiedExpression::IntrinsicFunctions(xs.to_vec()),
-                    oty.clone(),
-                ),
-                oty,
-            )
+        VarLookupResult::IntrinsicFunctions(xs) => inst.intrinsic_function_ref(xs.to_vec()),
+        VarLookupResult::IntrinsicTypeConstructor(t) => inst.intrinsic_type_constructor_ref(t),
+        VarLookupResult::ScopeLocalVar(vid, _, false) => inst.scope_local_var_ref(scope, vid),
+        VarLookupResult::ScopeLocalVar(vid, _, true) => {
+            inst.scope_local_var_mutable_ref(scope, vid)
         }
-        VarLookupResult::IntrinsicTypeConstructor(t) => (
-            ctx.add(
-                SimplifiedExpression::IntrinsicTypeConstructor(t),
-                ConcreteType::IntrinsicTypeConstructor(t),
-            ),
-            ConcreteType::IntrinsicTypeConstructor(t),
-        ),
-        VarLookupResult::ScopeLocalVar(vid, ty, _) => {
-            let ty = ty.clone().instantiate(scope);
-
-            (
-                ctx.add(
-                    SimplifiedExpression::LoadVar(PtrEq(scope), VarId::ScopeLocal(vid)),
-                    ty.clone(),
-                ),
-                ty,
-            )
-        }
-        VarLookupResult::FunctionInputVar(vid, ty) => {
-            let ty = ty.clone().instantiate(scope);
-
-            (
-                ctx.add(
-                    SimplifiedExpression::LoadVar(PtrEq(scope), VarId::FunctionInput(vid)),
-                    ty.clone().instantiate(scope),
-                ),
-                ty.clone(),
-            )
+        VarLookupResult::FunctionInputVar(vid, _, false) => inst.function_input_var_ref(scope, vid),
+        VarLookupResult::FunctionInputVar(vid, _, true) => {
+            inst.function_input_var_mutable_ref(scope, vid)
         }
         VarLookupResult::UserDefinedFunction(fs) => {
-            let ty = ConcreteType::Function {
-                args: fs.inputs.iter().map(|(_, _, t)| t.clone()).collect(),
-                output: match fs.output.len() {
-                    0 => None,
-                    1 => Some(Box::new(fs.output[0].1.clone())),
-                    _ => Some(Box::new(ConcreteType::Tuple(
-                        fs.output.iter().map(|(_, t)| t.clone()).collect(),
-                    ))),
-                },
-            }
-            .instantiate(scope);
-
-            (
-                ctx.add(
-                    SimplifiedExpression::RefFunction(PtrEq(scope), fs.occurence.slice),
-                    ty.clone(),
-                ),
-                ty,
-            )
+            inst.user_defined_function_ref(scope, fs.occurence.clone())
         }
     }
 }
 
-fn binary_op<'a, 's>(
-    left_expr: ExprRef,
-    left_ty: ConcreteType<'s>,
+pub fn binary_op<'a, 's>(
+    left: RegisterRef,
     op: SourceRef<'s>,
-    right_expr: ExprRef,
-    right_ty: ConcreteType<'s>,
-    ctx: &mut SimplificationContext<'a, 's>,
-) -> (ExprRef, ConcreteType<'s>) {
+    right: RegisterRef,
+    inst: &mut BlockInstructionEmitter<'_, 'a, 's>,
+) -> RegisterRef {
     if matches!(
         op.slice,
         "^^" | "+" | "-" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">"
     ) {
-        // pow(gen2 conversion)
+        // gen2 conversion
         let conv = match op.slice {
-            "^^" => left_ty.clone().pow_op_type_conversion(right_ty.clone()),
-            "+" | "-" | "/" | "%" => left_ty
+            "^^" => left
+                .ty(inst.generation_context)
                 .clone()
-                .arithmetic_compare_op_type_conversion(right_ty.clone()),
+                .pow_op_type_conversion(right.ty(inst.generation_context).clone()),
+            "+" | "-" | "/" | "%" => left
+                .ty(inst.generation_context)
+                .clone()
+                .arithmetic_compare_op_type_conversion(right.ty(inst.generation_context).clone()),
             // 比較演算の出力は必ずBoolになる
-            "==" | "!=" | "<=" | ">=" | "<" | ">" => left_ty
+            "==" | "!=" | "<=" | ">=" | "<" | ">" => left
+                .ty(inst.generation_context)
                 .clone()
-                .arithmetic_compare_op_type_conversion(right_ty.clone())
+                .arithmetic_compare_op_type_conversion(right.ty(inst.generation_context).clone())
                 .map(|(conv_left, conv_right, t)| {
                     (
                         conv_left,
@@ -935,8 +1567,10 @@ fn binary_op<'a, 's>(
             Some(x) => x,
             None => {
                 eprintln!(
-                    "Error: cannot apply binary op {} between terms ({left_ty:?} and {right_ty:?})",
-                    op.slice
+                    "Error: cannot apply binary op {} between terms ({:?} and {:?})",
+                    op.slice,
+                    left.ty(inst.generation_context),
+                    right.ty(inst.generation_context)
                 );
 
                 (
@@ -948,331 +1582,268 @@ fn binary_op<'a, 's>(
         };
 
         let left = match left_conv {
-            BinaryOpTermConversion::NoConversion => left_expr,
-            BinaryOpTermConversion::Cast(to) => {
-                ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into())
+            BinaryOpTermConversion::NoConversion => left,
+            BinaryOpTermConversion::Cast(to) => inst.cast(left, to.into()),
+            BinaryOpTermConversion::Instantiate(it) => {
+                inst.instantiate_intrinsic_type_class(left, it)
             }
-            BinaryOpTermConversion::Instantiate(it) => ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
-                it.into(),
-            ),
-            BinaryOpTermConversion::Distribute(to) => ctx.add(
-                SimplifiedExpression::ConstructIntrinsicComposite(to, vec![left_expr]),
-                to.into(),
-            ),
-            BinaryOpTermConversion::CastAndDistribute(to, count) => {
-                let last_type = to.of_vector(count as _).unwrap();
-                let left = ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into());
-                ctx.add(
-                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![left]),
-                    last_type.into(),
-                )
+            BinaryOpTermConversion::Distribute(to) => {
+                inst.construct_intrinsic_composite(to, vec![left])
             }
-            BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
-                let last_type = it.of_vector(count as _).unwrap();
-                let left = ctx.add(
-                    SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
-                    it.into(),
-                );
-                ctx.add(
-                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![left]),
-                    last_type.into(),
-                )
+            BinaryOpTermConversion::CastAndDistribute(elm_type, count) => {
+                let vec_type = elm_type.of_vector(count as _).unwrap();
+                let left = inst.cast(left, elm_type.into());
+                inst.construct_intrinsic_composite(vec_type, vec![left])
             }
-            BinaryOpTermConversion::PromoteUnknownNumber => ctx.add(
-                SimplifiedExpression::ConstIntToNumber(left_expr),
-                ConcreteType::UnknownNumberClass,
-            ),
+            BinaryOpTermConversion::InstantiateAndDistribute(elm_type, count) => {
+                let vec_type = elm_type.of_vector(count as _).unwrap();
+                let left = inst.instantiate_intrinsic_type_class(left, elm_type);
+                inst.construct_intrinsic_composite(vec_type, vec![left])
+            }
+            BinaryOpTermConversion::PromoteUnknownNumber => inst.promote_int_to_number(left),
         };
         let right = match right_conv {
-            BinaryOpTermConversion::NoConversion => right_expr,
-            BinaryOpTermConversion::Cast(to) => {
-                ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into())
+            BinaryOpTermConversion::NoConversion => right,
+            BinaryOpTermConversion::Cast(to) => inst.cast(right, to.into()),
+            BinaryOpTermConversion::Instantiate(it) => {
+                inst.instantiate_intrinsic_type_class(right, it)
             }
-            BinaryOpTermConversion::Instantiate(it) => ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
-                it.into(),
-            ),
-            BinaryOpTermConversion::Distribute(to) => ctx.add(
-                SimplifiedExpression::ConstructIntrinsicComposite(to, vec![right_expr]),
-                to.into(),
-            ),
-            BinaryOpTermConversion::CastAndDistribute(to, count) => {
-                let last_type = to.of_vector(count as _).unwrap();
-                let x = ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into());
-                ctx.add(
-                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
-                    last_type.into(),
-                )
+            BinaryOpTermConversion::Distribute(to) => {
+                inst.construct_intrinsic_composite(to, vec![right])
             }
-            BinaryOpTermConversion::InstantiateAndDistribute(it, count) => {
-                let last_type = it.of_vector(count as _).unwrap();
-                let x = ctx.add(
-                    SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
-                    it.into(),
-                );
-                ctx.add(
-                    SimplifiedExpression::ConstructIntrinsicComposite(last_type, vec![x]),
-                    last_type.into(),
-                )
+            BinaryOpTermConversion::CastAndDistribute(elm_type, count) => {
+                let vec_type = elm_type.of_vector(count as _).unwrap();
+                let right = inst.cast(right, elm_type.into());
+                inst.construct_intrinsic_composite(vec_type, vec![right])
             }
-            BinaryOpTermConversion::PromoteUnknownNumber => ctx.add(
-                SimplifiedExpression::ConstIntToNumber(right_expr),
-                ConcreteType::UnknownNumberClass,
-            ),
+            BinaryOpTermConversion::InstantiateAndDistribute(elm_type, count) => {
+                let vec_type = elm_type.of_vector(count as _).unwrap();
+                let right = inst.instantiate_intrinsic_type_class(right, elm_type);
+                inst.construct_intrinsic_composite(vec_type, vec![right])
+            }
+            BinaryOpTermConversion::PromoteUnknownNumber => inst.promote_int_to_number(right),
         };
 
-        return (
-            ctx.add(
-                match op.slice {
-                    "^^" => SimplifiedExpression::Pow(left, right),
-                    "+" => SimplifiedExpression::Add(left, right),
-                    "-" => SimplifiedExpression::Sub(left, right),
-                    "/" => SimplifiedExpression::Div(left, right),
-                    "%" => SimplifiedExpression::Rem(left, right),
-                    "&" => SimplifiedExpression::BitAnd(left, right),
-                    "|" => SimplifiedExpression::BitOr(left, right),
-                    "^" => SimplifiedExpression::BitXor(left, right),
-                    "==" => SimplifiedExpression::Eq(left, right),
-                    "!=" => SimplifiedExpression::Ne(left, right),
-                    ">=" => SimplifiedExpression::Ge(left, right),
-                    "<=" => SimplifiedExpression::Le(left, right),
-                    ">" => SimplifiedExpression::Gt(left, right),
-                    "<" => SimplifiedExpression::Lt(left, right),
-                    _ => unreachable!("unknown binary op"),
-                },
-                result_ty.clone(),
-            ),
-            result_ty,
-        );
+        let op = match op.slice {
+            "^^" => IntrinsicBinaryOperation::Pow,
+            "+" => IntrinsicBinaryOperation::Add,
+            "-" => IntrinsicBinaryOperation::Sub,
+            "*" => IntrinsicBinaryOperation::Mul,
+            "/" => IntrinsicBinaryOperation::Div,
+            "%" => IntrinsicBinaryOperation::Rem,
+            "&" => IntrinsicBinaryOperation::BitAnd,
+            "|" => IntrinsicBinaryOperation::BitOr,
+            "^" => IntrinsicBinaryOperation::BitXor,
+            "<<" => IntrinsicBinaryOperation::LeftShift,
+            ">>" => IntrinsicBinaryOperation::RightShift,
+            "==" => IntrinsicBinaryOperation::Eq,
+            "!=" => IntrinsicBinaryOperation::Ne,
+            ">=" => IntrinsicBinaryOperation::Ge,
+            "<=" => IntrinsicBinaryOperation::Le,
+            ">" => IntrinsicBinaryOperation::Gt,
+            "<" => IntrinsicBinaryOperation::Lt,
+            "&&" => IntrinsicBinaryOperation::LogAnd,
+            "||" => IntrinsicBinaryOperation::LogOr,
+            _ => unreachable!("unknown binary op"),
+        };
+
+        return inst.intrinsic_binary_op(left, op, right, result_ty);
     }
 
-    let ((left_expr, left_ty), (right_expr, right_ty)) =
-        if op.slice == "*" && left_ty.is_scalar_type() && right_ty.is_vector_type() {
-            // scalar times vectorの演算はないのでオペランドだけ逆にする（評価順は維持する）
-            ((right_expr, right_ty), (left_expr, left_ty))
-        } else {
-            ((left_expr, left_ty), (right_expr, right_ty))
-        };
+    let (left, right) = if op.slice == "*"
+        && left.ty(inst.generation_context).is_scalar_type()
+        && right.ty(inst.generation_context).is_vector_type()
+    {
+        // scalar times vectorの演算はないのでオペランドだけ逆にする（評価順は維持する）
+        (right, left)
+    } else {
+        (left, right)
+    };
 
     let r = match op.slice {
         // 行列とかの掛け算があるので特別扱い
-        "*" => left_ty
+        "*" => left
+            .ty(inst.generation_context)
             .clone()
-            .multiply_op_type_conversion(right_ty.clone()),
-        "&" | "|" | "^" => left_ty.clone().bitwise_op_type_conversion(right_ty.clone()),
-        "&&" | "||" => left_ty.clone().logical_op_type_conversion(right_ty.clone()),
+            .multiply_op_type_conversion(right.ty(inst.generation_context).clone()),
+        "&" | "|" | "^" | ">>" | "<<" => left
+            .ty(inst.generation_context)
+            .clone()
+            .bitwise_op_type_conversion(right.ty(inst.generation_context).clone()),
+        "&&" | "||" => left
+            .ty(inst.generation_context)
+            .clone()
+            .logical_op_type_conversion(right.ty(inst.generation_context).clone()),
         _ => None,
     };
     let (conv, res) = match r {
         Some(x) => x,
         None => {
             eprintln!(
-                "Error: cannot apply binary op {} between terms ({left_ty:?} and {right_ty:?})",
-                op.slice
+                "Error: cannot apply binary op {} between terms ({:?} and {:?})",
+                op.slice,
+                left.ty(inst.generation_context),
+                right.ty(inst.generation_context)
             );
             (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
         }
     };
 
     let (left, right) = match conv {
-        BinaryOpTypeConversion::NoConversion => (left_expr, right_expr),
+        BinaryOpTypeConversion::NoConversion => (left, right),
         BinaryOpTypeConversion::CastLeftHand(to) => {
-            let left = ctx.add(SimplifiedExpression::Cast(left_expr, to.into()), to.into());
+            let left = inst.cast(left, to.into());
 
-            (left, right_expr)
+            (left, right)
         }
         BinaryOpTypeConversion::CastRightHand(to) => {
-            let right = ctx.add(SimplifiedExpression::Cast(right_expr, to.into()), to.into());
+            let right = inst.cast(right, to.into());
 
-            (left_expr, right)
+            (left, right)
         }
         BinaryOpTypeConversion::InstantiateAndCastLeftHand(it) => {
-            let left = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
-                it.into(),
-            );
-            let left = ctx.add(SimplifiedExpression::Cast(left, res.clone()), res.clone());
+            let left = inst.instantiate_intrinsic_type_class(left, it);
+            let left = inst.cast(left, res.clone());
 
-            (left, right_expr)
+            (left, right)
         }
         BinaryOpTypeConversion::InstantiateAndCastRightHand(it) => {
-            let right = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
-                it.into(),
-            );
-            let right = ctx.add(SimplifiedExpression::Cast(right, res.clone()), res.clone());
+            let right = inst.instantiate_intrinsic_type_class(right, it);
+            let right = inst.cast(right, res.clone());
 
-            (left_expr, right)
+            (left, right)
         }
         BinaryOpTypeConversion::InstantiateLeftHand(it) => {
-            let left = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
-                it.into(),
-            );
+            let left = inst.instantiate_intrinsic_type_class(left, it);
 
-            (left, right_expr)
+            (left, right)
         }
         BinaryOpTypeConversion::InstantiateRightHand(it) => {
-            let right = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
-                it.into(),
-            );
+            let right = inst.instantiate_intrinsic_type_class(right, it);
 
-            (left_expr, right)
+            (left, right)
         }
         BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(it) => {
-            let left = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(left_expr, it),
-                it.into(),
-            );
-            let right = ctx.add(
-                SimplifiedExpression::Cast(right_expr, res.clone()),
-                res.clone(),
-            );
+            let left = inst.instantiate_intrinsic_type_class(left, it);
+            let right = inst.cast(right, res.clone());
 
             (left, right)
         }
         BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(it) => {
-            let right = ctx.add(
-                SimplifiedExpression::InstantiateIntrinsicTypeClass(right_expr, it),
-                it.into(),
-            );
-            let left = ctx.add(
-                SimplifiedExpression::Cast(left_expr, res.clone()),
-                res.clone(),
-            );
+            let right = inst.instantiate_intrinsic_type_class(right, it);
+            let left = inst.cast(left, res.clone());
 
             (left, right)
         }
     };
 
-    (
-        ctx.add(
-            match op.slice {
-                "+" => SimplifiedExpression::Add(left, right),
-                "-" => SimplifiedExpression::Sub(left, right),
-                "*" => SimplifiedExpression::Mul(left, right),
-                "/" => SimplifiedExpression::Div(left, right),
-                "%" => SimplifiedExpression::Rem(left, right),
-                "&" => SimplifiedExpression::BitAnd(left, right),
-                "|" => SimplifiedExpression::BitOr(left, right),
-                "^" => SimplifiedExpression::BitXor(left, right),
-                "==" => SimplifiedExpression::Eq(left, right),
-                "!=" => SimplifiedExpression::Ne(left, right),
-                ">=" => SimplifiedExpression::Ge(left, right),
-                "<=" => SimplifiedExpression::Le(left, right),
-                ">" => SimplifiedExpression::Gt(left, right),
-                "<" => SimplifiedExpression::Lt(left, right),
-                "&&" => SimplifiedExpression::LogAnd(left, right),
-                "||" => SimplifiedExpression::LogOr(left, right),
-                _ => unreachable!("unknown binary op"),
-            },
-            res.clone(),
-        ),
-        res,
-    )
+    let op = match op.slice {
+        "^^" => IntrinsicBinaryOperation::Pow,
+        "+" => IntrinsicBinaryOperation::Add,
+        "-" => IntrinsicBinaryOperation::Sub,
+        "*" => IntrinsicBinaryOperation::Mul,
+        "/" => IntrinsicBinaryOperation::Div,
+        "%" => IntrinsicBinaryOperation::Rem,
+        "&" => IntrinsicBinaryOperation::BitAnd,
+        "|" => IntrinsicBinaryOperation::BitOr,
+        "^" => IntrinsicBinaryOperation::BitXor,
+        "<<" => IntrinsicBinaryOperation::LeftShift,
+        ">>" => IntrinsicBinaryOperation::RightShift,
+        "==" => IntrinsicBinaryOperation::Eq,
+        "!=" => IntrinsicBinaryOperation::Ne,
+        ">=" => IntrinsicBinaryOperation::Ge,
+        "<=" => IntrinsicBinaryOperation::Le,
+        ">" => IntrinsicBinaryOperation::Gt,
+        "<" => IntrinsicBinaryOperation::Lt,
+        "&&" => IntrinsicBinaryOperation::LogAnd,
+        "||" => IntrinsicBinaryOperation::LogOr,
+        _ => unreachable!("unknown binary op"),
+    };
+
+    inst.intrinsic_binary_op(left, op, right, res)
 }
 
 fn funcall<'a, 's>(
-    base_expr: ExprRef,
-    base_ty: ConcreteType<'s>,
-    mut args: Vec<ExprRef>,
-    arg_types: Vec<ConcreteType<'s>>,
-    ctx: &mut SimplificationContext<'a, 's>,
-) -> (ExprRef, ConcreteType<'s>) {
-    let res_ty = match base_ty {
-        ConcreteType::IntrinsicTypeConstructor(t) => {
+    callee: RegisterRef,
+    mut args: Vec<RegisterRef>,
+    block_ctx: &mut BlockGenerationContext<'a, 's>,
+) -> (RegisterRef, usize) {
+    match block_ctx.register_type(callee) {
+        &ConcreteType::IntrinsicTypeConstructor(t) => {
             let element_ty = t.scalar_type().unwrap();
-            for (t, a) in arg_types.iter().zip(args.iter_mut()) {
-                match (t, &element_ty) {
-                    // TODO: 他の返還は必要になったら書く
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            for a in args.iter_mut() {
+                match (a.ty(inst.generation_context), &element_ty) {
+                    // TODO: 他の変換は必要になったら書く
                     (ConcreteType::UnknownIntClass, IntrinsicScalarType::Float) => {
-                        *a = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                *a,
-                                IntrinsicType::Float,
-                            ),
-                            IntrinsicType::Float.into(),
-                        );
+                        *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
                     }
                     (ConcreteType::UnknownNumberClass, IntrinsicScalarType::Float) => {
-                        *a = ctx.add(
-                            SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                *a,
-                                IntrinsicType::Float,
-                            ),
-                            IntrinsicType::Float.into(),
-                        );
+                        *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
                     }
                     _ => (),
                 }
             }
 
-            t.into()
+            let instructions = inst.into_instructions();
+            let result_register = block_ctx.alloc_register(t.into());
+            let eval_block = block_ctx.add(Block {
+                instructions,
+                flow: BlockFlowInstruction::Funcall {
+                    callee,
+                    args,
+                    result: result_register,
+                    after_return: None,
+                },
+            });
+
+            (result_register, eval_block)
         }
-        ConcreteType::Function {
-            args: def_arg_types,
-            output,
-        } if def_arg_types.len() == arg_types.len() => {
+        &ConcreteType::Function {
+            args: ref def_arg_types,
+            ref output,
+        } if def_arg_types.len() == args.len() => {
             let mut matches = true;
-            for ((dt, t), a) in def_arg_types
-                .iter()
-                .zip(arg_types.iter())
-                .zip(args.iter_mut())
-            {
+            let def_arg_types = def_arg_types.clone();
+            let output = output.clone();
+            let mut inst = BlockInstructionEmitter::new(block_ctx);
+            for (dt, a) in def_arg_types.iter().zip(args.iter_mut()) {
                 matches = matches
-                    && match (t, &dt) {
+                    && match (a.ty(inst.generation_context), &dt) {
                         (
                             ConcreteType::UnknownIntClass,
                             ConcreteType::Intrinsic(IntrinsicType::SInt),
                         ) => {
-                            *a = ctx.add(
-                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                    *a,
-                                    IntrinsicType::SInt,
-                                ),
-                                IntrinsicType::SInt.into(),
-                            );
+                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::SInt);
                             true
                         }
                         (
                             ConcreteType::UnknownIntClass,
                             ConcreteType::Intrinsic(IntrinsicType::UInt),
                         ) => {
-                            *a = ctx.add(
-                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                    *a,
-                                    IntrinsicType::UInt,
-                                ),
-                                IntrinsicType::UInt.into(),
-                            );
+                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::UInt);
                             true
                         }
                         (
                             ConcreteType::UnknownIntClass,
                             ConcreteType::Intrinsic(IntrinsicType::Float),
                         ) => {
-                            *a = ctx.add(
-                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                    *a,
-                                    IntrinsicType::Float,
-                                ),
-                                IntrinsicType::Float.into(),
-                            );
+                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
                             true
                         }
                         (
                             ConcreteType::UnknownNumberClass,
                             ConcreteType::Intrinsic(IntrinsicType::Float),
                         ) => {
-                            *a = ctx.add(
-                                SimplifiedExpression::InstantiateIntrinsicTypeClass(
-                                    *a,
-                                    IntrinsicType::Float,
-                                ),
-                                IntrinsicType::Float.into(),
-                            );
+                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
+                            true
+                        }
+                        (ConcreteType::Ref(c), c2) if &**c == *c2 => {
+                            *a = inst.load_ref(*a);
+                            true
+                        }
+                        (ConcreteType::MutableRef(c), c2) if &**c == *c2 => {
+                            *a = inst.load_ref(*a);
                             true
                         }
                         (t, _) => t == dt,
@@ -1280,36 +1851,168 @@ fn funcall<'a, 's>(
             }
 
             if !matches {
-                eprintln!("Error: argument types mismatched");
-                ConcreteType::Never
-            } else {
-                output.map_or(IntrinsicType::Unit.into(), |x| *x)
+                panic!("Error: argument types mismatched");
             }
-        }
-        ConcreteType::Function { args, .. } => {
-            eprintln!("Error: argument types mismatched({args:?} and {arg_types:?})");
-            ConcreteType::Never
-        }
-        ConcreteType::OverloadedFunctions(xs) => {
-            let matching_overload = xs
-                .iter()
-                .find(|(args, _)| args.iter().zip(arg_types.iter()).all(|(a, b)| a == b));
 
-            match matching_overload {
-                Some((_, r)) => *r.clone(),
-                None => panic!("Error: no matching overloads found"),
+            let instructions = inst.into_instructions();
+            let result_register = block_ctx.alloc_register(
+                output
+                    .as_ref()
+                    .map_or_else(|| IntrinsicType::Unit.into(), |x| *x.clone()),
+            );
+            let eval_block = block_ctx.add(Block {
+                instructions,
+                flow: BlockFlowInstruction::Funcall {
+                    callee,
+                    args,
+                    result: result_register,
+                    after_return: None,
+                },
+            });
+
+            (result_register, eval_block)
+        }
+        &ConcreteType::Function {
+            args: ref def_args, ..
+        } => {
+            panic!(
+                "Error: argument types mismatched({def_args:?} and {:?})",
+                args.iter().map(|a| a.ty(block_ctx)).collect::<Vec<_>>()
+            );
+        }
+        &ConcreteType::OverloadedFunctions(ref xs) => {
+            let arg_types = args
+                .iter()
+                .map(|a| a.ty(block_ctx).clone())
+                .collect::<Vec<_>>();
+            let matching_overloads = resolve_overload(xs, &arg_types).collect::<Vec<_>>();
+            println!("matching overloads: {matching_overloads:?}");
+            let exact_matches = matching_overloads
+                .iter()
+                .filter_map(|(n, r)| r.is_exact_match().then_some(*n))
+                .collect::<Vec<_>>();
+            match &exact_matches[..] {
+                &[] => {
+                    let instantiated_matches = matching_overloads
+                        .iter()
+                        .filter(|(_, r)| !r.is_exact_match())
+                        .collect::<Vec<_>>();
+                    match &instantiated_matches[..] {
+                        &[] => panic!("Error: no matching overloads found: args={arg_types:?}, candidates={xs:?}"),
+                        &[(n, r)] => {
+                            let output = *xs[*n].1.clone();
+                            let mut inst = BlockInstructionEmitter::new(block_ctx);
+                            for (t, a) in r.args_promotion.iter().zip(args.iter_mut()) {
+                                match t {
+                                    None => (),
+                                    &Some(OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(it)) => {
+                                        *a = inst.instantiate_intrinsic_type_class(*a, it);
+                                    },
+                                    Some(OverloadArgumentPromotionType::Dereference) => {
+                                        *a = inst.load_ref(*a);
+                                    }
+                                }
+                            }
+
+                            let instructions = inst.into_instructions();
+                            let result_register = block_ctx.alloc_register(output);
+                            let eval_block = block_ctx.add(Block {
+                                instructions,
+                                flow: BlockFlowInstruction::Funcall {
+                                    callee, args, result: result_register, after_return: None
+                                }
+                            });
+
+                            (result_register, eval_block)
+                        },
+                        &[..] => panic!("Error: multiple candidates matches to the usage: args={arg_types:?}, candidates={xs:?}")
+                    }
+                },
+                &[n] => {
+                    let result_register = block_ctx.alloc_register(*xs[n].1.clone());
+                    let eval_block = block_ctx.add(Block {
+                        instructions: vec![],
+                        flow: BlockFlowInstruction::Funcall {
+                            callee, args, result: result_register, after_return: None
+                        }
+                    });
+
+                    (result_register, eval_block)
+                },
+                &[..] => panic!("Error: multiple candidates matches to the usage: args={arg_types:?}, candidates={xs:?}")
             }
         }
         _ => panic!("Error: not applyable type"),
-    };
+    }
+}
 
-    (
-        ctx.add(
-            SimplifiedExpression::Funcall(base_expr, args),
-            res_ty.clone(),
-        ),
-        res_ty,
-    )
+#[derive(Debug, Clone)]
+pub enum OverloadArgumentPromotionType {
+    InstantiateIntrinsicTypeClass(IntrinsicType),
+    Dereference,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverloadMatchingRequirements {
+    pub args_promotion: Vec<Option<OverloadArgumentPromotionType>>,
+}
+impl OverloadMatchingRequirements {
+    #[inline(always)]
+    pub fn is_exact_match(&self) -> bool {
+        self.args_promotion.iter().all(Option::is_none)
+    }
+}
+fn resolve_overload<'v, 's>(
+    candidates: &'v [(Vec<ConcreteType<'s>>, Box<ConcreteType<'s>>)],
+    inputs: &'v [ConcreteType<'s>],
+) -> impl Iterator<Item = (usize, OverloadMatchingRequirements)> + 'v {
+    candidates.iter().enumerate().filter_map(|(n, (args, _))| {
+        let mut args_promotion = Vec::with_capacity(args.len());
+        for (a, i) in args.iter().zip(inputs.iter()) {
+            match (a, i) {
+                (x, y) if x == y => args_promotion.push(None),
+                (ConcreteType::Intrinsic(IntrinsicType::UInt), ConcreteType::UnknownIntClass) => {
+                    args_promotion.push(Some(
+                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                            IntrinsicType::UInt,
+                        ),
+                    ))
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::SInt), ConcreteType::UnknownIntClass) => {
+                    args_promotion.push(Some(
+                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                            IntrinsicType::SInt,
+                        ),
+                    ))
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
+                    args_promotion.push(Some(
+                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                            IntrinsicType::Float,
+                        ),
+                    ))
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                    ConcreteType::UnknownNumberClass,
+                ) => args_promotion.push(Some(
+                    OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                        IntrinsicType::Float,
+                    ),
+                )),
+                (c, ConcreteType::Ref(c2)) if c == &**c2 => {
+                    args_promotion.push(Some(OverloadArgumentPromotionType::Dereference))
+                }
+                (c, ConcreteType::MutableRef(c2)) if c == &**c2 => {
+                    args_promotion.push(Some(OverloadArgumentPromotionType::Dereference))
+                }
+                // not match
+                _ => return None,
+            }
+        }
+
+        Some((n, OverloadMatchingRequirements { args_promotion }))
+    })
 }
 
 pub fn print_simp_expr(
@@ -1327,11 +2030,16 @@ pub fn print_simp_expr(
             capturing,
         } => {
             if capturing.is_empty() {
-                writeln!(sink, "  {}%{vid}: {ty:?} = Scope {{", "  ".repeat(nested)).unwrap();
+                writeln!(
+                    sink,
+                    "  {}%{vid}: {ty:?} = Scope[{symbol_scope:?}] {{",
+                    "  ".repeat(nested)
+                )
+                .unwrap();
             } else {
                 writeln!(
                     sink,
-                    "  {}%{vid}: {ty:?} = Scope(capturing {}) {{",
+                    "  {}%{vid}: {ty:?} = Scope[{symbol_scope:?}](capturing {}) {{",
                     "  ".repeat(nested),
                     capturing
                         .iter()
@@ -1367,6 +2075,58 @@ pub fn print_simp_expr(
                 print_simp_expr(sink, x, t, n, nested + 1);
             }
             writeln!(sink, "  {}returning {returning:?}", "  ".repeat(nested + 1)).unwrap();
+            writeln!(sink, "  {}}}", "  ".repeat(nested)).unwrap();
+        }
+        SimplifiedExpression::LoopBlock {
+            expressions,
+            symbol_scope,
+            capturing,
+        } => {
+            if capturing.is_empty() {
+                writeln!(
+                    sink,
+                    "  {}%{vid}: {ty:?} = Loop[{symbol_scope:?}] {{",
+                    "  ".repeat(nested)
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    sink,
+                    "  {}%{vid}: {ty:?} = Loop[{symbol_scope:?}](capturing {}) {{",
+                    "  ".repeat(nested),
+                    capturing
+                        .iter()
+                        .map(|x| format!("{x:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .unwrap();
+            }
+            writeln!(sink, "  {}Function Inputs:", "  ".repeat(nested + 1)).unwrap();
+            for (n, a) in symbol_scope.0.function_input_vars.iter().enumerate() {
+                writeln!(
+                    sink,
+                    "  {}  {n} = {}: {:?}",
+                    "  ".repeat(nested + 1),
+                    a.occurence.slice,
+                    a.ty
+                )
+                .unwrap();
+            }
+            writeln!(sink, "  {}Local Vars:", "  ".repeat(nested + 1)).unwrap();
+            for (n, a) in symbol_scope.0.local_vars.borrow().iter().enumerate() {
+                writeln!(
+                    sink,
+                    "  {}  {n} = {}: {:?}",
+                    "  ".repeat(nested + 1),
+                    a.occurence.slice,
+                    a.ty
+                )
+                .unwrap();
+            }
+            for (n, (x, t)) in expressions.iter().enumerate() {
+                print_simp_expr(sink, x, t, n, nested + 1);
+            }
             writeln!(sink, "  {}}}", "  ".repeat(nested)).unwrap();
         }
         _ => writeln!(sink, "  {}%{vid}: {ty:?} = {x:?}", "  ".repeat(nested)).unwrap(),

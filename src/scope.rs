@@ -38,6 +38,18 @@ impl<'a, 's> SymbolScope<'a, 's> {
         }
     }
 
+    #[inline(always)]
+    pub fn new_child(&'a self) -> Self {
+        Self::new(Some(self), false)
+    }
+
+    pub fn new_function_inlined(&self) -> Self {
+        Self {
+            function_input_vars: Vec::new(),
+            ..self.clone()
+        }
+    }
+
     pub fn new_intrinsics() -> Self {
         let mut intrinsic_symbols = HashMap::new();
         let mut var_id_by_name = HashMap::new();
@@ -149,6 +161,93 @@ impl<'a, 's> SymbolScope<'a, 's> {
                 },
             ],
         );
+        intrinsic_symbols.insert(
+            "log2",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Math.Log2",
+                args: vec![IntrinsicType::Float.into()],
+                output: IntrinsicType::Float.into(),
+                is_pure: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "exp2",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Math.Exp2",
+                args: vec![IntrinsicType::Float.into()],
+                output: IntrinsicType::Float.into(),
+                is_pure: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "max",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Max#UInt",
+                args: vec![IntrinsicType::UInt.into(), IntrinsicType::UInt.into()],
+                output: IntrinsicType::UInt.into(),
+                is_pure: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "min",
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Max#UInt",
+                    args: vec![IntrinsicType::UInt.into(), IntrinsicType::UInt.into()],
+                    output: IntrinsicType::UInt.into(),
+                    is_pure: true,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Max#Float",
+                    args: vec![IntrinsicType::Float.into(), IntrinsicType::Float.into()],
+                    output: IntrinsicType::Float.into(),
+                    is_pure: true,
+                },
+            ],
+        );
+        intrinsic_symbols.insert(
+            "clamp",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Clamp",
+                args: vec![
+                    IntrinsicType::Float.into(),
+                    IntrinsicType::Float.into(),
+                    IntrinsicType::Float.into(),
+                ],
+                output: IntrinsicType::Float.into(),
+                is_pure: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "barrier",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.ExecutionBarrier",
+                args: vec![],
+                output: IntrinsicType::Unit.into(),
+                is_pure: false,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "loadPixelAt",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Image.Load#Image2D",
+                args: vec![IntrinsicType::Image2D.into(), IntrinsicType::UInt2.into()],
+                output: IntrinsicType::Float4.into(),
+                is_pure: true,
+            }],
+        );
+        intrinsic_symbols.insert(
+            "atomicAdd",
+            vec![IntrinsicFunctionSymbol {
+                name: "Cloth.Intrinsic.Atomic.Add#UInt",
+                args: vec![
+                    ConcreteType::from(IntrinsicType::UInt).mutable_ref(),
+                    IntrinsicType::UInt.into(),
+                ],
+                output: IntrinsicType::Unit.into(),
+                is_pure: false,
+            }],
+        );
         var_id_by_name.insert(
             "Float4",
             VarId::IntrinsicTypeConstructor(IntrinsicType::Float4),
@@ -160,6 +259,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
         var_id_by_name.insert(
             "Float2",
             VarId::IntrinsicTypeConstructor(IntrinsicType::Float2),
+        );
+        var_id_by_name.insert("UInt", VarId::IntrinsicTypeConstructor(IntrinsicType::UInt));
+        var_id_by_name.insert(
+            "UInt2",
+            VarId::IntrinsicTypeConstructor(IntrinsicType::UInt2),
         );
 
         Self {
@@ -304,12 +408,18 @@ impl<'a, 's> SymbolScope<'a, 's> {
         .ok()
     }
 
-    pub fn declare_function_input(&mut self, name: SourceRef<'s>, ty: ConcreteType<'s>) -> VarId {
+    pub fn declare_function_input(
+        &mut self,
+        name: SourceRef<'s>,
+        ty: ConcreteType<'s>,
+        mutable: bool,
+    ) -> VarId {
         match self.var_id_by_name.borrow_mut().entry(name.slice) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 self.function_input_vars.push(FunctionInputVariable {
                     occurence: name.clone(),
                     ty,
+                    mutable,
                 });
                 let vid = VarId::FunctionInput(self.function_input_vars.len() - 1);
                 v.insert(vid);
@@ -351,7 +461,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
         match self.var_id_by_name.borrow().get(name) {
             Some(VarId::FunctionInput(x)) => Some((
                 self,
-                VarLookupResult::FunctionInputVar(*x, &self.function_input_vars[*x].ty),
+                VarLookupResult::FunctionInputVar(
+                    *x,
+                    &self.function_input_vars[*x].ty,
+                    self.function_input_vars[*x].mutable,
+                ),
             )),
             Some(VarId::ScopeLocal(x)) => Some((
                 self,
@@ -383,6 +497,14 @@ impl<'a, 's> SymbolScope<'a, 's> {
             },
         }
     }
+
+    pub fn nearest_function_scope(&self) -> Option<&Self> {
+        if self.is_toplevel_function {
+            Some(self)
+        } else {
+            self.parent.and_then(Self::nearest_function_scope)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -394,7 +516,7 @@ pub enum VarId {
 
 #[derive(Debug, Clone)]
 pub enum VarLookupResult<'x, 's> {
-    FunctionInputVar(usize, &'x ConcreteType<'s>),
+    FunctionInputVar(usize, &'x ConcreteType<'s>, bool),
     ScopeLocalVar(usize, ConcreteType<'s>, bool),
     IntrinsicFunctions(&'x [IntrinsicFunctionSymbol]),
     IntrinsicTypeConstructor(IntrinsicType),

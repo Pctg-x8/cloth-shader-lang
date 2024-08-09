@@ -1,7 +1,9 @@
-use expr::SimplifiedExpression;
+use block::Block;
+use expr::{SimplifiedExpression, TypedExprRef};
 
 use crate::{concrete_type::ConcreteType, scope::SymbolScope};
 
+pub mod block;
 pub mod expr;
 pub mod opt;
 
@@ -18,7 +20,6 @@ impl core::fmt::Debug for ExprRef {
 #[derive(Debug, Clone)]
 pub struct FunctionBody<'a, 's> {
     pub symbol_scope: &'a SymbolScope<'a, 's>,
-    pub expressions: Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
-    pub returning: ExprRef,
-    pub returning_type: ConcreteType<'s>,
+    pub registers: Vec<ConcreteType<'s>>,
+    pub blocks: Vec<Block<'a, 's>>,
 }

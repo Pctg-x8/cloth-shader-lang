@@ -1,0 +1,424 @@
+matching overloads: [(1, OverloadMatchingRequirements { args_promotion: [None, None] })]
+Generated(lum, last_start_block=0 last_eval_block=10):
+Registers: 
+  r0: IntrinsicTypeConstructor(Float3)
+  r1: UnknownNumberClass
+  r2: UnknownNumberClass
+  r3: UnknownNumberClass
+  r4: Intrinsic(Float)
+  r5: Intrinsic(Float)
+  r6: Intrinsic(Float)
+  r7: Intrinsic(Float3)
+  r8: Ref(Intrinsic(Float4))
+  r9: Intrinsic(Float4)
+  r10: Intrinsic(Float3)
+  r11: OverloadedFunctions([([Intrinsic(Float4), Intrinsic(Float4)], Intrinsic(Float)), ([Intrinsic(Float3), Intrinsic(Float3)], Intrinsic(Float)), ([Intrinsic(Float2), Intrinsic(Float2)], Intrinsic(Float))])
+  r12: Intrinsic(Float)
+b0: {
+  r0 = IntrinsicTypeConstructorRef<Float3>
+
+  goto -> b1
+}
+b1: {
+  r1 = ConstNumber(SourceRef { slice: "0.2125", line: 17, col: 32 }, mod=ConstModifiers(0x0))
+
+  goto -> b2
+}
+b2: {
+  r2 = ConstNumber(SourceRef { slice: "0.7154", line: 17, col: 40 }, mod=ConstModifiers(0x0))
+
+  goto -> b3
+}
+b3: {
+  r3 = ConstNumber(SourceRef { slice: "0.0721", line: 17, col: 48 }, mod=ConstModifiers(0x0))
+
+  goto -> b4
+}
+b4: {
+  goto -> b5
+}
+b5: {
+  r4 = Instantiate(r1 as Float)
+  r5 = Instantiate(r2 as Float)
+  r6 = Instantiate(r3 as Float)
+
+  r7 = (r0)(r4, r5, r6) -> b6
+}
+b6: {
+  r8 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3385ab80)
+
+  goto -> b7
+}
+b7: {
+  r9 = Load r8
+  r10 = r9.xyz
+
+  goto -> b8
+}
+b8: {
+  r11 = IntrinsicFunctionRef<IntrinsicFunctionSymbol { name: "Cloth.Intrinsic.Dot#Float4", args: [Intrinsic(Float4), Intrinsic(Float4)], output: Intrinsic(Float), is_pure: true }, IntrinsicFunctionSymbol { name: "Cloth.Intrinsic.Dot#Float3", args: [Intrinsic(Float3), Intrinsic(Float3)], output: Intrinsic(Float), is_pure: true }, IntrinsicFunctionSymbol { name: "Cloth.Intrinsic.Dot#Float2", args: [Intrinsic(Float2), Intrinsic(Float2)], output: Intrinsic(Float), is_pure: true }>
+
+  goto -> b9
+}
+b9: {
+  r12 = (r11)(r7, r10) -> b10
+}
+b10: {
+  return r12
+}
+matching overloads: [(0, OverloadMatchingRequirements { args_promotion: [None] })]
+Generated(ev100, last_start_block=0 last_eval_block=8):
+Registers: 
+  r0: OverloadedFunctions([([Intrinsic(Float)], Intrinsic(Float))])
+  r1: Ref(Intrinsic(Float))
+  r2: Intrinsic(Float)
+  r3: Intrinsic(Float)
+  r4: Intrinsic(Float)
+  r5: Intrinsic(Float)
+  r6: Intrinsic(Float)
+  r7: Intrinsic(Float)
+b0: {
+  r0 = IntrinsicFunctionRef<IntrinsicFunctionSymbol { name: "Cloth.Intrinsic.Math.Log2", args: [Intrinsic(Float)], output: Intrinsic(Float), is_pure: true }>
+
+  goto -> b1
+}
+b1: {
+  r1 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb338155b8)
+
+  goto -> b2
+}
+b2: {
+  r2 = ConstFloat(SourceRef { slice: "100.0f", line: 20, col: 39 }, mod=ConstModifiers(0x0))
+
+  goto -> b3
+}
+b3: {
+  r3 = Load r1
+  r4 = Mul(r3, r2)
+
+  goto -> b4
+}
+b4: {
+  r5 = ConstFloat(SourceRef { slice: "12.5f", line: 20, col: 48 }, mod=ConstModifiers(0x0))
+
+  goto -> b5
+}
+b5: {
+  r6 = Div(r4, r5)
+
+  goto -> b6
+}
+b6: {
+  goto -> b7
+}
+b7: {
+  r7 = (r0)(r6) -> b8
+}
+b8: {
+  return r7
+}
+matching overloads: [(0, OverloadMatchingRequirements { args_promotion: [None, Some(InstantiateIntrinsicTypeClass(Float)), Some(InstantiateIntrinsicTypeClass(Float))] })]
+Generated(computeBinIndex, last_start_block=0 last_eval_block=30):
+Registers: 
+  r0: Ref(Intrinsic(Float))
+  r1: UnknownNumberClass
+  r2: Intrinsic(Float)
+  r3: Intrinsic(Float)
+  r4: Intrinsic(Bool)
+  r5: UnknownIntClass
+  r6: OverloadedFunctions([([Intrinsic(Float), Intrinsic(Float), Intrinsic(Float)], Intrinsic(Float))])
+  r7: Function { args: [Intrinsic(Float)], output: Some(Intrinsic(Float)) }
+  r8: Ref(Intrinsic(Float))
+  r9: Intrinsic(Float)
+  r10: Intrinsic(Float)
+  r11: Ref(Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(LocalInvocationIndex), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "localIndex", line: 3, col: 25 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(GlobalInvocationID), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "globalIndex", line: 4, col: 23 }, ty: Intrinsic(UInt3) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: true, storage_buffer: false, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "localHistogramBuffer", line: 5, col: 24 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(0), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "histogramBuffer", line: 6, col: 50 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(1), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: Some(Rgba16f) }, mutable: false, name: SourceRef { slice: "src", line: 7, col: 52 }, ty: Intrinsic(Image2D) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(0), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "minEv", line: 8, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(4), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "inverseEvRange", line: 9, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(8), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "srcSize", line: 10, col: 19 }, ty: Intrinsic(UInt2) }]))
+  r12: Ref(Intrinsic(Float))
+  r13: Intrinsic(Float)
+  r14: Intrinsic(Float)
+  r15: Ref(Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(LocalInvocationIndex), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "localIndex", line: 3, col: 25 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(GlobalInvocationID), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "globalIndex", line: 4, col: 23 }, ty: Intrinsic(UInt3) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: true, storage_buffer: false, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "localHistogramBuffer", line: 5, col: 24 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(0), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "histogramBuffer", line: 6, col: 50 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(1), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: Some(Rgba16f) }, mutable: false, name: SourceRef { slice: "src", line: 7, col: 52 }, ty: Intrinsic(Image2D) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(0), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "minEv", line: 8, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(4), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "inverseEvRange", line: 9, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(8), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "srcSize", line: 10, col: 19 }, ty: Intrinsic(UInt2) }]))
+  r16: Ref(Intrinsic(Float))
+  r17: Intrinsic(Float)
+  r18: Intrinsic(Float)
+  r19: UnknownNumberClass
+  r20: UnknownNumberClass
+  r21: Intrinsic(Float)
+  r22: Intrinsic(Float)
+  r23: Intrinsic(Float)
+  r24: MutableRef(Intrinsic(Float))
+  r25: IntrinsicTypeConstructor(UInt)
+  r26: Ref(Intrinsic(Float))
+  r27: UnknownNumberClass
+  r28: Intrinsic(Float)
+  r29: Intrinsic(Float)
+  r30: Intrinsic(Float)
+  r31: UnknownNumberClass
+  r32: Intrinsic(Float)
+  r33: Intrinsic(Float)
+  r34: Intrinsic(UInt)
+  r35: Intrinsic(UInt)
+  r36: Intrinsic(UInt)
+b0: {
+  r0 = FunctionInputVarRef(1) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb33815848)
+
+  goto -> b1
+}
+b1: {
+  r1 = ConstNumber(SourceRef { slice: "0.005", line: 23, col: 11 }, mod=ConstModifiers(0x0))
+
+  goto -> b2
+}
+b2: {
+  r2 = Load r0
+  r3 = Instantiate(r1 as Float)
+  r4 = Lt(r2, r3)
+
+  branch r4 ? -> b3 : -> b4
+}
+b3: {
+  r5 = ConstInt(SourceRef { slice: "0", line: 25, col: 4 }, mod=ConstModifiers(0x0))
+
+  goto -> b28
+}
+b4: {
+  r6 = IntrinsicFunctionRef<IntrinsicFunctionSymbol { name: "Cloth.Intrinsic.Clamp", args: [Intrinsic(Float), Intrinsic(Float), Intrinsic(Float)], output: Intrinsic(Float), is_pure: true }>
+
+  goto -> b5
+}
+b5: {
+  r7 = UserDefinedFunctionRef(SourceRef { slice: "ev100", line: 20, col: 0 }) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3385aa38)
+
+  goto -> b6
+}
+b6: {
+  r8 = FunctionInputVarRef(1) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb33815848)
+
+  goto -> b7
+}
+b7: {
+  goto -> b8
+}
+b8: {
+  r9 = Load r8
+
+  r10 = (r7)(r9) -> b9
+}
+b9: {
+  r11 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb33815848)
+
+  goto -> b10
+}
+b10: {
+  r12 = ref r11.(SourceRef { slice: "minEv", line: 27, col: 39 })
+
+  goto -> b11
+}
+b11: {
+  r13 = Load r12
+  r14 = Sub(r10, r13)
+
+  goto -> b12
+}
+b12: {
+  r15 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb33815848)
+
+  goto -> b13
+}
+b13: {
+  r16 = ref r15.(SourceRef { slice: "inverseEvRange", line: 27, col: 52 })
+
+  goto -> b14
+}
+b14: {
+  r17 = Load r16
+  r18 = Mul(r14, r17)
+
+  goto -> b15
+}
+b15: {
+  r19 = ConstNumber(SourceRef { slice: "0.0", line: 27, col: 68 }, mod=ConstModifiers(0x0))
+
+  goto -> b16
+}
+b16: {
+  r20 = ConstNumber(SourceRef { slice: "1.0", line: 27, col: 73 }, mod=ConstModifiers(0x0))
+
+  goto -> b17
+}
+b17: {
+  goto -> b18
+}
+b18: {
+  r21 = Instantiate(r19 as Float)
+  r22 = Instantiate(r20 as Float)
+
+  r23 = (r6)(r18, r21, r22) -> b19
+}
+b19: {
+  r24 = ScopeLocalVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381a440)
+
+  *r24 = r23 -> b20
+}
+b20: {
+  r25 = IntrinsicTypeConstructorRef<UInt>
+
+  goto -> b21
+}
+b21: {
+  r26 = ScopeLocalVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381a440)
+
+  goto -> b22
+}
+b22: {
+  r27 = ConstNumber(SourceRef { slice: "254.0", line: 28, col: 17 }, mod=ConstModifiers(0x0))
+
+  goto -> b23
+}
+b23: {
+  r28 = Load r26
+  r29 = Instantiate(r27 as Float)
+  r30 = Mul(r28, r29)
+
+  goto -> b24
+}
+b24: {
+  r31 = ConstNumber(SourceRef { slice: "1.0", line: 28, col: 25 }, mod=ConstModifiers(0x0))
+
+  goto -> b25
+}
+b25: {
+  r32 = Instantiate(r31 as Float)
+  r33 = Add(r30, r32)
+
+  goto -> b26
+}
+b26: {
+  goto -> b27
+}
+b27: {
+  r34 = (r25)(r33) -> b29
+}
+b28: {
+  r35 = Instantiate(r5 as UInt)
+
+  goto -> b29
+}
+b29: {
+  r36 = phi [27 -> r34, 28 -> r35]
+
+  goto -> b30
+}
+b30: {
+  return r36
+}
+Generated(computeEv100FromBinIndex, last_start_block=0 last_eval_block=9):
+Registers: 
+  r0: Ref(Intrinsic(UInt))
+  r1: UnknownNumberClass
+  r2: Intrinsic(UInt)
+  r3: Intrinsic(Float)
+  r4: Intrinsic(Float)
+  r5: Intrinsic(Float)
+  r6: Ref(Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(LocalInvocationIndex), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "localIndex", line: 50, col: 25 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: true, storage_buffer: false, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "maxValues", line: 51, col: 24 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(0), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "histogramBuffer", line: 52, col: 50 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(1), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "globalWorkBuffer", line: 53, col: 50 }, ty: Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposure", line: 13, col: 2 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "histogramMaxValue", line: 14, col: 2 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "avgEv100", line: 15, col: 2 }, ty: Intrinsic(Float) }]) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(0), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "totalPixelCount", line: 54, col: 19 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(4), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "minEv", line: 55, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(8), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "evRange", line: 56, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(12), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "smoothCoeff", line: 57, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(16), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "filterPercentLow", line: 58, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(20), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "filterPercentHigh", line: 59, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(24), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposureMinEv", line: 60, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(28), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposureMaxEv", line: 61, col: 20 }, ty: Intrinsic(Float) }]))
+  r7: Ref(Intrinsic(Float))
+  r8: Intrinsic(Float)
+  r9: Intrinsic(Float)
+  r10: Ref(Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: Some(LocalInvocationIndex), workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "localIndex", line: 50, col: 25 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: true, storage_buffer: false, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "maxValues", line: 51, col: 24 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(0), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "histogramBuffer", line: 52, col: 50 }, ty: Array(Intrinsic(UInt), 256) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: Some(0), descriptor_set_binding: Some(1), input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: true, image_format_specifier: None }, mutable: true, name: SourceRef { slice: "globalWorkBuffer", line: 53, col: 50 }, ty: Struct([UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposure", line: 13, col: 2 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "histogramMaxValue", line: 14, col: 2 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: None, compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "avgEv100", line: 15, col: 2 }, ty: Intrinsic(Float) }]) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(0), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "totalPixelCount", line: 54, col: 19 }, ty: Intrinsic(UInt) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(4), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "minEv", line: 55, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(8), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "evRange", line: 56, col: 19 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(12), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "smoothCoeff", line: 57, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(16), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "filterPercentLow", line: 58, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(20), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "filterPercentHigh", line: 59, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(24), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposureMinEv", line: 60, col: 20 }, ty: Intrinsic(Float) }, UserDefinedStructMember { attribute: SymbolAttribute { module_entry_point: false, shader_model: None, descriptor_set_location: None, descriptor_set_binding: None, input_attachment_index: None, push_constant_offset: Some(28), compute_shader_local_size: None, bound_location: None, bound_builtin_io: None, workgroup_shared: false, storage_buffer: false, image_format_specifier: None }, mutable: false, name: SourceRef { slice: "exposureMaxEv", line: 61, col: 20 }, ty: Intrinsic(Float) }]))
+  r11: Ref(Intrinsic(Float))
+  r12: Intrinsic(Float)
+  r13: Intrinsic(Float)
+b0: {
+  r0 = FunctionInputVarRef(1) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381a818)
+
+  goto -> b1
+}
+b1: {
+  r1 = ConstNumber(SourceRef { slice: "254.0", line: 31, col: 14 }, mod=ConstModifiers(0x0))
+
+  goto -> b2
+}
+b2: {
+  r2 = Load r0
+  r3 = r2 as Intrinsic(Float)
+  r4 = Instantiate(r1 as Float)
+  r5 = Div(r3, r4)
+
+  goto -> b3
+}
+b3: {
+  r6 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381a818)
+
+  goto -> b4
+}
+b4: {
+  r7 = ref r6.(SourceRef { slice: "evRange", line: 31, col: 27 })
+
+  goto -> b5
+}
+b5: {
+  r8 = Load r7
+  r9 = Mul(r5, r8)
+
+  goto -> b6
+}
+b6: {
+  r10 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381a818)
+
+  goto -> b7
+}
+b7: {
+  r11 = ref r10.(SourceRef { slice: "minEv", line: 31, col: 41 })
+
+  goto -> b8
+}
+b8: {
+  r12 = Load r11
+  r13 = Add(r9, r12)
+
+  goto -> b9
+}
+b9: {
+  return r13
+}
+Generated(clear, last_start_block=0 last_eval_block=6):
+Registers: 
+  r0: MutableRef(Array(Intrinsic(UInt), 256))
+  r1: Ref(Intrinsic(UInt))
+  r2: Intrinsic(UInt)
+  r3: MutableRef(Intrinsic(UInt))
+  r4: UnknownIntClass
+  r5: Intrinsic(UInt)
+  r6: Intrinsic(Unit)
+b0: {
+  r0 = FunctionInputVarRef(1) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381aaa8)
+
+  goto -> b1
+}
+b1: {
+  r1 = FunctionInputVarRef(0) in ptr<cloth_shader_lang::scope::SymbolScope>(0x1eb3381aaa8)
+
+  goto -> b2
+}
+b2: {
+  r2 = Load r1
+  r3 = ref r0[r2]
+
+  goto -> b3
+}
+b3: {
+  r4 = ConstInt(SourceRef { slice: "0", line: 35, col: 32 }, mod=ConstModifiers(0x0))
+
+  goto -> b4
+}
+b4: {
+  r5 = Instantiate(r4 as UInt)
+
+  *r3 = r5 -> b5
+}
+b5: {
+  r6 = ()
+
+  goto -> b6
+}
+b6: {
+  return r6
+}

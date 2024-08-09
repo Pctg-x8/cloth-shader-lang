@@ -125,6 +125,8 @@ pub enum ExecutionModel {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Builtin {
     Position = 0,
+    GlobalInvocationId = 28,
+    LocalInvocationIndex = 29,
     VertexIndex = 42,
     InstanceIndex = 43,
 }
@@ -180,4 +182,18 @@ pub enum Capability {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum ExecutionMode {
     OriginUpperLeft = 7,
+}
+
+#[repr(u32)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum Scope {
+    Workgroup = 2,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+    pub struct MemorySemantics : u32 {
+        const ACQUIRE_RELEASE = 0x0008;
+        const WORKGROUP_MEMORY = 0x0100;
+    }
 }

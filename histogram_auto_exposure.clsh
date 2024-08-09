@@ -1,0 +1,104 @@
+module peridot.marble_editor.histogram_auto_exposure
+
+struct HistogramCollectEnv:
+  [LocalInvocationIndex] localIndex: UInt
+  [GlobalInvocationID] globalIndex: UInt3
+  [WorkgroupShared] mut localHistogramBuffer: UInt[16 * 16]
+  [DescriptorSet 0, Binding 0, StorageBuffer] mut histogramBuffer: UInt[16 * 16]
+  [DescriptorSet 0, Binding 1, ImageFormat Rgba16F] src: Image2D
+  [PushConstant 0] minEv: Float
+  [PushConstant 4] inverseEvRange: Float
+  [PushConstant 8] srcSize: UInt2
+
+struct PostEffectGlobalWorkBuffer:
+  exposure: Float
+  histogramMaxValue: UInt
+  avgEv100: Float
+
+lum c: Float4 -> Float = Float3(0.2125, 0.7154, 0.0721) `dot` c.rgb
+
+# https://google.github.io/filament/Filament.md.html#mjx-eqn-ev100L
+ev100 lum: Float -> Float = log2(lum * 100.0f / 12.5f)
+
+computeBinIndex (env: HistogramCollectEnv, lum: Float) -> UInt =
+  if lum < 0.005 then
+    # avoid log(0)
+    0
+  else
+    let evRel = clamp((ev100 lum - env.minEv) * env.inverseEvRange, 0.0, 1.0)
+    UInt(evRel * 254.0 + 1.0)
+
+computeEv100FromBinIndex (env: HistogramAggregateEnv, binIndex: UInt) -> Float =
+  (binIndex / 254.0) * env.evRange + env.minEv
+
+[ComputeShader(256, 1, 1)]
+clear ([LocalInvocationIndex] localIndex: UInt, [DescriptorSet 0, Binding 0, StorageBuffer] mut histogramBuffer: UInt[256]) does
+  histogramBuffer[localIndex] = 0
+
+[ComputeShader(16, 16, 1)]
+collect env: HistogramCollectEnv does
+  env.localHistogramBuffer[env.localIndex] = 0
+  barrier()
+
+  if env.globalIndex.x < env.srcSize.x && env.globalIndex.y < env.srcSize.y then
+    let binIndex = env `computeBinIndex` lum(env.src `loadPixelAt` env.globalIndex.xy)
+    env.localHistogramBuffer[binIndex] `atomicAdd` 1
+  barrier()
+
+  atomicAdd(env.histogramBuffer[env.localIndex], env.localHistogramBuffer[env.localIndex])
+
+struct HistogramAggregateEnv:
+  [LocalInvocationIndex] localIndex: UInt
+  [WorkgroupShared] mut maxValues: UInt[256]
+  [DescriptorSet 0, Binding 0, StorageBuffer] mut histogramBuffer: UInt[256]
+  [DescriptorSet 0, Binding 1, StorageBuffer] mut globalWorkBuffer: PostEffectGlobalWorkBuffer
+  [PushConstant 0] totalPixelCount: UInt
+  [PushConstant 4] minEv: Float
+  [PushConstant 8] evRange: Float
+  [PushConstant 12] smoothCoeff: Float
+  [PushConstant 16] filterPercentLow: Float
+  [PushConstant 20] filterPercentHigh: Float
+  [PushConstant 24] exposureMinEv: Float
+  [PushConstant 28] exposureMaxEv: Float
+
+[ComputeShader(256, 1, 1)]
+aggregate env: HistogramAggregateEnv does
+  let thisBinPixels = env.histogramBuffer[env.localIndex]
+  env.maxValues[env.localIndex] = thisBinPixels
+  barrier()
+
+  let mut cutoff = 16 * 16 >> 1
+  while cutoff > 0 do
+    if env.localIndex < cutoff then
+      env.maxValues[env.localIndex] = env.maxValues[env.localIndex] `max` env.maxValues[env.localIndex + cutoff]
+
+    barrier()
+    cutoff >>= 1
+  
+  if env.localIndex == 0 then
+    # final computation is only in single thread
+
+    let mut percentileFilterRange = UInt2(
+      UInt((env.totalPixelCount - thisBinPixels) * env.filterPercentLow),
+      UInt((env.totalPixelCount - thisBinPixels) * env.filterPercentHigh)
+    )
+    let mut accumulator = Float2(0.0)
+    let mut i = 1
+    while i < 256 do
+      let mut lumPixels = env.histogramBuffer[i]
+
+      let lowerTrim = lumPixels `min` percentileFilterRange.x
+      lumPixels -= lowerTrim
+      percentileFilterRange -= UInt2(lowerTrim)
+
+      lumPixels = lumPixels `min` percentileFilterRange.y
+      percentileFilterRange.y -= lumPixels
+
+      accumulator += Float2(lumPixels * env `computeEv100FromBinIndex` (i - 1), lumPixels)
+    
+    let weightedAvgEv100 = clamp(accumulator.x / accumulator.y, env.exposureMinEv, env.exposureMaxEv)
+    let newExposure = 1.0 / (exp2 weightedAvgEv100 * 1.2f)
+
+    env.globalWorkBuffer.exposure += (newExposure - env.globalWorkBuffer.exposure) * env.smoothCoeff
+    env.globalWorkBuffer.avgEv100 += (weightedAvgEv100 - env.globalWorkBuffer.avgEv100) * env.smoothCoeff
+    env.globalWorkBuffer.histogramMaxValue = env.maxValues[0]

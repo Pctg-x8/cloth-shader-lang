@@ -21,6 +21,7 @@ pub struct IntrinsicFunctionSymbol {
 pub struct FunctionInputVariable<'s> {
     pub occurence: SourceRef<'s>,
     pub ty: ConcreteType<'s>,
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +36,7 @@ pub struct LocalVariable<'s> {
 pub struct UserDefinedFunctionSymbol<'s> {
     pub occurence: SourceRef<'s>,
     pub attribute: SymbolAttribute,
-    pub inputs: Vec<(SymbolAttribute, SourceRef<'s>, ConcreteType<'s>)>,
+    pub inputs: Vec<(SymbolAttribute, bool, SourceRef<'s>, ConcreteType<'s>)>,
     pub output: Vec<(SymbolAttribute, ConcreteType<'s>)>,
 }
 impl<'s> UserDefinedFunctionSymbol<'s> {

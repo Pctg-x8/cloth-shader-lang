@@ -390,6 +390,14 @@ impl Type {
     }
 
     #[inline(always)]
+    pub fn dereferenced(self) -> Option<Self> {
+        match self {
+            Self::Pointer(_, t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
     pub fn scalar_or_vector(self) -> Option<ScalarOrVectorType> {
         match self {
             Self::Scalar(x) => Some(ScalarOrVectorType::Scalar(x)),

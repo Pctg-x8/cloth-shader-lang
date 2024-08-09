@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    parser::TypeSyntax, scope::SymbolScope, source_ref::SourceRefSliceEq, spirv as spv,
-    symbol::meta::SymbolAttribute, utils::roundup2,
+    const_expr::reduce_const_expr, parser::TypeSyntax, scope::SymbolScope,
+    source_ref::SourceRefSliceEq, spirv as spv, symbol::meta::SymbolAttribute, utils::roundup2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +63,12 @@ pub enum IntrinsicType {
     Float4x2,
     Float4x3,
     Float4x4,
-    Sampler1D,
-    Sampler2D,
-    Sampler3D,
     Texture1D,
     Texture2D,
     Texture3D,
+    Image1D,
+    Image2D,
+    Image3D,
     SubpassInput,
 }
 impl IntrinsicType {
@@ -133,9 +133,9 @@ impl IntrinsicType {
             // unit(void) cannot be a member of uniform struct
             Self::Unit => false,
             // samplers/image refs cannot be a member of uniform struct
-            Self::Sampler1D
-            | Self::Sampler2D
-            | Self::Sampler3D
+            Self::Image1D
+            | Self::Image2D
+            | Self::Image3D
             | Self::Texture1D
             | Self::Texture2D
             | Self::Texture3D
@@ -161,9 +161,9 @@ impl IntrinsicType {
             | Self::Float4x3
             | Self::Float4x4 => Some(16),
             // samplers/image refs cannot be a member of uniform struct
-            Self::Sampler1D
-            | Self::Sampler2D
-            | Self::Sampler3D
+            Self::Image1D
+            | Self::Image2D
+            | Self::Image3D
             | Self::Texture1D
             | Self::Texture2D
             | Self::Texture3D
@@ -187,9 +187,9 @@ impl IntrinsicType {
             | Self::Float4x3
             | Self::Float4x4 => Some(16),
             // samplers/image refs cannot be a member of uniform struct
-            Self::Sampler1D
-            | Self::Sampler2D
-            | Self::Sampler3D
+            Self::Image1D
+            | Self::Image2D
+            | Self::Image3D
             | Self::Texture1D
             | Self::Texture2D
             | Self::Texture3D
@@ -251,9 +251,9 @@ impl IntrinsicType {
             Self::Float4x2 => Self::Float.make_spv_type().of_matrix(4, 2),
             Self::Float4x3 => Self::Float.make_spv_type().of_matrix(4, 3),
             Self::Float4x4 => Self::Float.make_spv_type().of_matrix(4, 4),
-            Self::Sampler1D => unreachable!("deprecated"),
-            Self::Sampler2D => unreachable!("deprecated"),
-            Self::Sampler3D => unreachable!("deprecated"),
+            Self::Image1D => unimplemented!(),
+            Self::Image2D => unimplemented!(),
+            Self::Image3D => unimplemented!(),
             Self::Texture1D => unimplemented!(),
             Self::Texture2D => unimplemented!(),
             Self::Texture3D => unimplemented!(),
@@ -275,12 +275,15 @@ pub enum ConcreteType<'s> {
     },
     Struct(Vec<UserDefinedStructMember<'s>>),
     Tuple(Vec<ConcreteType<'s>>),
+    Array(Box<ConcreteType<'s>>, u32),
     Function {
         args: Vec<ConcreteType<'s>>,
         output: Option<Box<ConcreteType<'s>>>,
     },
     IntrinsicTypeConstructor(IntrinsicType),
     OverloadedFunctions(Vec<(Vec<ConcreteType<'s>>, Box<ConcreteType<'s>>)>),
+    Ref(Box<ConcreteType<'s>>),
+    MutableRef(Box<ConcreteType<'s>>),
     Never,
 }
 impl<'s> ConcreteType<'s> {
@@ -289,54 +292,44 @@ impl<'s> ConcreteType<'s> {
         sibling_scope_opaque_symbols: &HashSet<&'s str>,
         t: TypeSyntax<'s>,
     ) -> Self {
-        match t.name_token.slice {
-            "UInt" => Self::Intrinsic(IntrinsicType::UInt),
-            "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
-            "UInt3" => Self::Intrinsic(IntrinsicType::UInt3),
-            "UInt4" => Self::Intrinsic(IntrinsicType::UInt4),
-            "SInt" | "Int" => Self::Intrinsic(IntrinsicType::SInt),
-            "SInt2" | "Int2" => Self::Intrinsic(IntrinsicType::SInt2),
-            "SInt3" | "Int3" => Self::Intrinsic(IntrinsicType::SInt3),
-            "SInt4" | "Int4" => Self::Intrinsic(IntrinsicType::SInt4),
-            "Float" => Self::Intrinsic(IntrinsicType::Float),
-            "Float2" => Self::Intrinsic(IntrinsicType::Float2),
-            "Float3" => Self::Intrinsic(IntrinsicType::Float3),
-            "Float4" => Self::Intrinsic(IntrinsicType::Float4),
-            "Float2x2" => Self::Intrinsic(IntrinsicType::Float2x2),
-            "Float2x3" => Self::Intrinsic(IntrinsicType::Float2x3),
-            "Float2x4" => Self::Intrinsic(IntrinsicType::Float2x4),
-            "Float3x2" => Self::Intrinsic(IntrinsicType::Float3x2),
-            "Float3x3" => Self::Intrinsic(IntrinsicType::Float3x3),
-            "Float3x4" => Self::Intrinsic(IntrinsicType::Float3x4),
-            "Float4x2" => Self::Intrinsic(IntrinsicType::Float4x2),
-            "Float4x3" => Self::Intrinsic(IntrinsicType::Float4x3),
-            "Float4x4" => Self::Intrinsic(IntrinsicType::Float4x4),
-            "Sampler1D" => Self::Intrinsic(IntrinsicType::Sampler1D),
-            "Sampler2D" => Self::Intrinsic(IntrinsicType::Sampler2D),
-            "Sampler3D" => Self::Intrinsic(IntrinsicType::Sampler3D),
-            "Texture1D" => Self::Intrinsic(IntrinsicType::Texture1D),
-            "Texture2D" => Self::Intrinsic(IntrinsicType::Texture2D),
-            "Texture3D" => Self::Intrinsic(IntrinsicType::Texture3D),
-            "SubpassInput" => Self::Intrinsic(IntrinsicType::SubpassInput),
-            name => {
-                if sibling_scope_opaque_symbols.contains(name) {
-                    ConcreteType::UserDefined {
-                        name: t.name_token.slice,
-                        generic_args: t
-                            .generic_args
-                            .map_or_else(Vec::new, |x| x.args)
-                            .into_iter()
-                            .map(|x| {
-                                ConcreteType::build(symbol_scope, sibling_scope_opaque_symbols, x.0)
-                            })
-                            .collect(),
-                    }
-                } else {
-                    match symbol_scope.lookup_user_defined_type(name) {
-                        Some(_) => ConcreteType::UserDefined {
-                            name: t.name_token.slice,
-                            generic_args: t
-                                .generic_args
+        match t {
+            TypeSyntax::Simple {
+                name_token,
+                generic_args,
+            } => match name_token.slice {
+                "UInt" => Self::Intrinsic(IntrinsicType::UInt),
+                "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
+                "UInt3" => Self::Intrinsic(IntrinsicType::UInt3),
+                "UInt4" => Self::Intrinsic(IntrinsicType::UInt4),
+                "SInt" | "Int" => Self::Intrinsic(IntrinsicType::SInt),
+                "SInt2" | "Int2" => Self::Intrinsic(IntrinsicType::SInt2),
+                "SInt3" | "Int3" => Self::Intrinsic(IntrinsicType::SInt3),
+                "SInt4" | "Int4" => Self::Intrinsic(IntrinsicType::SInt4),
+                "Float" => Self::Intrinsic(IntrinsicType::Float),
+                "Float2" => Self::Intrinsic(IntrinsicType::Float2),
+                "Float3" => Self::Intrinsic(IntrinsicType::Float3),
+                "Float4" => Self::Intrinsic(IntrinsicType::Float4),
+                "Float2x2" => Self::Intrinsic(IntrinsicType::Float2x2),
+                "Float2x3" => Self::Intrinsic(IntrinsicType::Float2x3),
+                "Float2x4" => Self::Intrinsic(IntrinsicType::Float2x4),
+                "Float3x2" => Self::Intrinsic(IntrinsicType::Float3x2),
+                "Float3x3" => Self::Intrinsic(IntrinsicType::Float3x3),
+                "Float3x4" => Self::Intrinsic(IntrinsicType::Float3x4),
+                "Float4x2" => Self::Intrinsic(IntrinsicType::Float4x2),
+                "Float4x3" => Self::Intrinsic(IntrinsicType::Float4x3),
+                "Float4x4" => Self::Intrinsic(IntrinsicType::Float4x4),
+                "Image1D" => Self::Intrinsic(IntrinsicType::Image1D),
+                "Image2D" => Self::Intrinsic(IntrinsicType::Image2D),
+                "Image3D" => Self::Intrinsic(IntrinsicType::Image3D),
+                "Texture1D" => Self::Intrinsic(IntrinsicType::Texture1D),
+                "Texture2D" => Self::Intrinsic(IntrinsicType::Texture2D),
+                "Texture3D" => Self::Intrinsic(IntrinsicType::Texture3D),
+                "SubpassInput" => Self::Intrinsic(IntrinsicType::SubpassInput),
+                name => {
+                    if sibling_scope_opaque_symbols.contains(name) {
+                        ConcreteType::UserDefined {
+                            name: name_token.slice,
+                            generic_args: generic_args
                                 .map_or_else(Vec::new, |x| x.args)
                                 .into_iter()
                                 .map(|x| {
@@ -347,11 +340,38 @@ impl<'s> ConcreteType<'s> {
                                     )
                                 })
                                 .collect(),
-                        },
-                        None => panic!("Error: referencing undefined type: {}", t.name_token.slice),
+                        }
+                    } else {
+                        match symbol_scope.lookup_user_defined_type(name) {
+                            Some(_) => ConcreteType::UserDefined {
+                                name: name_token.slice,
+                                generic_args: generic_args
+                                    .map_or_else(Vec::new, |x| x.args)
+                                    .into_iter()
+                                    .map(|x| {
+                                        ConcreteType::build(
+                                            symbol_scope,
+                                            sibling_scope_opaque_symbols,
+                                            x.0,
+                                        )
+                                    })
+                                    .collect(),
+                            },
+                            None => {
+                                panic!("Error: referencing undefined type: {}", name_token.slice)
+                            }
+                        }
                     }
                 }
-            }
+            },
+            TypeSyntax::Array(base, _, length, _) => Self::Array(
+                Box::new(Self::build(
+                    symbol_scope,
+                    sibling_scope_opaque_symbols,
+                    *base,
+                )),
+                reduce_const_expr(&length).into_u32(),
+            ),
         }
     }
 
@@ -364,6 +384,7 @@ impl<'s> ConcreteType<'s> {
                             .iter()
                             .map(|x| UserDefinedStructMember {
                                 attribute: x.attribute.clone(),
+                                mutable: x.mutable,
                                 name: x.name.clone(),
                                 ty: x.ty.clone().instantiate(scope),
                             })
@@ -447,6 +468,10 @@ impl<'s> ConcreteType<'s> {
     pub fn make_spv_type(&self, scope: &SymbolScope<'_, 's>) -> spv::Type {
         match self {
             Self::Intrinsic(it) => it.make_spv_type(),
+            &Self::Array(ref t, len) => spv::Type::Array {
+                element_type: Box::new(t.make_spv_type(scope)),
+                length: Box::new(spv::TypeArrayLength::ConstExpr(len.into())),
+            },
             Self::Tuple(xs) => spv::Type::Struct {
                 decorations: vec![],
                 member_types: xs
@@ -531,6 +556,10 @@ impl<'s> ConcreteType<'s> {
                         .collect(),
                 },
             },
+            Self::Ref(_) => {
+                unreachable!("ref type")
+            }
+            Self::MutableRef(_) => unreachable!("mutable ref type"),
             Self::IntrinsicTypeConstructor(_) => {
                 unreachable!("non-reduced intrinsic type construction")
             }
@@ -540,6 +569,33 @@ impl<'s> ConcreteType<'s> {
             Self::UnknownIntClass => unreachable!("left UnknownIntClass"),
             Self::UnknownNumberClass => unreachable!("left UnknownNumberClass"),
             Self::OverloadedFunctions(_) => unreachable!("unresolved overloads"),
+        }
+    }
+
+    #[inline(always)]
+    pub fn imm_ref(self) -> Self {
+        Self::Ref(Box::new(self))
+    }
+
+    #[inline(always)]
+    pub fn mutable_ref(self) -> Self {
+        Self::MutableRef(Box::new(self))
+    }
+
+    #[inline(always)]
+    pub fn dereference(self) -> Option<Self> {
+        match self {
+            Self::Ref(inner) => Some(*inner),
+            Self::MutableRef(inner) => Some(*inner),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn as_dereferenced(&self) -> Option<&Self> {
+        match self {
+            Self::Ref(inner) | Self::MutableRef(inner) => Some(&**inner),
+            _ => None,
         }
     }
 }
@@ -2109,6 +2165,7 @@ impl<'s> ConcreteType<'s> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UserDefinedStructMember<'s> {
     pub attribute: SymbolAttribute,
+    pub mutable: bool,
     pub name: SourceRefSliceEq<'s>,
     pub ty: ConcreteType<'s>,
 }

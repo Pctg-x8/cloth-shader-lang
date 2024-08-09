@@ -4,8 +4,12 @@ use entrypoint::ShaderEntryPointDescription;
 
 use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
-    ir::expr::{ConstModifiers, SimplifiedExpression},
+    ir::{
+        expr::{ConstModifiers, SimplifiedExpression},
+        ExprRef,
+    },
     ref_path::RefPath,
+    scope::SymbolScope,
     spirv as spv,
 };
 
@@ -1343,7 +1347,7 @@ pub fn emit_entry_point_spv_ops<'s>(
         interface_global_vars: Vec::new(),
     };
 
-    for a in ep.output_variables.iter() {
+    for a in ep.global_variables.outputs.iter() {
         let gvid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Output);
         ctx.decorate(gvid, &a.decorations);
 
@@ -1351,7 +1355,7 @@ pub fn emit_entry_point_spv_ops<'s>(
         entry_point_maps.interface_global_vars.push(gvid);
     }
 
-    for a in ep.input_variables.iter() {
+    for a in ep.global_variables.inputs.iter() {
         let vid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Input);
         ctx.decorate(vid, &a.decorations);
 
@@ -1362,7 +1366,7 @@ pub fn emit_entry_point_spv_ops<'s>(
         entry_point_maps.interface_global_vars.push(vid);
     }
 
-    for a in ep.uniform_variables.iter() {
+    for a in ep.global_variables.uniforms.iter() {
         let storage_class = match a.ty {
             spv::Type::Image { .. } | spv::Type::SampledImage { .. } => {
                 spv::asm::StorageClass::UniformConstant
@@ -1379,11 +1383,12 @@ pub fn emit_entry_point_spv_ops<'s>(
         entry_point_maps.interface_global_vars.push(vid);
     }
 
-    if !ep.push_constant_variables.is_empty() {
+    if !ep.global_variables.push_constants.is_empty() {
         let block_ty = spv::Type::Struct {
             decorations: vec![spv::Decorate::Block],
             member_types: ep
-                .push_constant_variables
+                .global_variables
+                .push_constants
                 .iter()
                 .map(|x| {
                     let mut decorations = vec![spv::Decorate::Offset(x.offset)];
@@ -1402,7 +1407,7 @@ pub fn emit_entry_point_spv_ops<'s>(
                 .collect(),
         };
         let block_var = ctx.declare_global_variable(block_ty, spv::asm::StorageClass::PushConstant);
-        for (n, a) in ep.push_constant_variables.iter().enumerate() {
+        for (n, a) in ep.global_variables.push_constants.iter().enumerate() {
             entry_point_maps.refpath_to_global_var.insert(
                 a.original_refpath.clone(),
                 GlobalAccessType::PushConstantStruct {
@@ -1415,6 +1420,16 @@ pub fn emit_entry_point_spv_ops<'s>(
         entry_point_maps.interface_global_vars.push(block_var);
     }
 
+    for v in ep.global_variables.workgroup_shared_vars.iter() {
+        let storage_class = spv::asm::StorageClass::Workgroup;
+        let vid = ctx.declare_global_variable(v.ty.clone(), storage_class);
+
+        entry_point_maps.refpath_to_global_var.insert(
+            v.original_refpath.clone(),
+            GlobalAccessType::Direct(vid, v.ty.clone(), storage_class),
+        );
+    }
+
     entry_point_maps
 }
 
@@ -1422,8 +1437,8 @@ pub fn emit_function_body_spv_ops(
     body: &[(SimplifiedExpression, ConcreteType)],
     ctx: &mut SpvFunctionBodyEmissionContext,
 ) {
-    for (n, (b, _)) in body.iter().enumerate() {
-        if !b.is_pure() {
+    for (n, (_, _)) in body.iter().enumerate() {
+        if !ExprRef(n).is_pure(body) {
             emit_expr_spv_ops(body, n, ctx);
         }
     }
@@ -2069,6 +2084,29 @@ fn emit_expr_spv_ops(
                 rt.into(),
             ))
         }
+        SimplifiedExpression::CanonicalPathRef(rp) => {
+            match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
+                Some(&GlobalAccessType::Direct(gv, ref vty, storage_class)) => {
+                    Some((gv, vty.clone().of_pointer(storage_class)))
+                }
+                Some(&GlobalAccessType::PushConstantStruct {
+                    struct_var,
+                    member_index,
+                    ref member_ty,
+                }) => {
+                    let member_ty = member_ty
+                        .clone()
+                        .of_pointer(spv::asm::StorageClass::PushConstant);
+
+                    let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
+                    Some((
+                        ctx.access_chain(member_ty.clone(), struct_var, vec![ac_index_id]),
+                        member_ty,
+                    ))
+                }
+                None => panic!("no corresponding canonical refpath found? {rp:?}"),
+            }
+        }
         SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
                 Some(GlobalAccessType::Direct(gv, vty, _)) => {
@@ -2324,6 +2362,81 @@ fn emit_expr_spv_ops(
                 coordinate: args[1],
             });
             Some((result, rt))
+        }
+        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.ExecutionBarrier", _, args) => {
+            assert!(args.is_empty());
+
+            // とりあえずGLSLに倣って固定値で出してるけどこれでいいんだろうか
+            let execution_scope = ctx
+                .module_ctx
+                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+            let memory_scope = ctx
+                .module_ctx
+                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+            let semantics = ctx.module_ctx.request_const_id(spv::Constant::from(
+                (spv::asm::MemorySemantics::ACQUIRE_RELEASE
+                    | spv::asm::MemorySemantics::WORKGROUP_MEMORY)
+                    .bits(),
+            ));
+            ctx.ops.push(spv::Instruction::ControlBarrier {
+                execution: execution_scope,
+                memory: memory_scope,
+                semantics,
+            });
+            None
+        }
+        SimplifiedExpression::ChainedRef(base, xs) => {
+            let (base, bty) = emit_expr_spv_ops(body, base.0, ctx).unwrap();
+            let xs = xs
+                .iter()
+                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap().0)
+                .collect::<Vec<_>>();
+
+            let spv::Type::Pointer(storage_class, _) = bty else {
+                unreachable!()
+            };
+            let term_type = match body[expr_id].1 {
+                ConcreteType::Ref(ref inner) => &**inner,
+                ConcreteType::MutableRef(ref inner) => &**inner,
+                _ => unreachable!(),
+            };
+
+            // TODO: ここの型生成方法あとで考える
+            let rt = term_type
+                .clone()
+                .make_spv_type(&SymbolScope::new_intrinsics())
+                .of_pointer(storage_class);
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::AccessChain {
+                base,
+                result_type,
+                result,
+                indexes: xs,
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::LoadRef(r) => {
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+
+            let rt = rt.dereferenced().unwrap();
+            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+            ctx.ops.push(spv::Instruction::Load {
+                result_type,
+                result,
+                pointer: r,
+            });
+            Some((result, rt))
+        }
+        SimplifiedExpression::StoreRef(r, v) => {
+            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+            let (v, vt) = emit_expr_spv_ops(body, v.0, ctx).unwrap();
+            assert_eq!(rt.dereferenced(), Some(vt));
+            ctx.ops.push(spv::Instruction::Store {
+                pointer: r,
+                object: v,
+            });
+
+            None
         }
         SimplifiedExpression::StoreOutput(x, o) => {
             let (x, _xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();

@@ -723,6 +723,11 @@ pub enum Instruction<IdType = Id> {
         result: IdType,
     },
     Return,
+    ControlBarrier {
+        execution: IdType,
+        memory: IdType,
+        semantics: IdType,
+    },
 }
 impl<IdType> Instruction<IdType> {
     pub fn relocate<IdType2>(
@@ -1646,6 +1651,15 @@ impl<IdType> Instruction<IdType> {
                 result: relocator(result),
             },
             Self::Return => Instruction::Return,
+            Self::ControlBarrier {
+                execution,
+                memory,
+                semantics,
+            } => Instruction::ControlBarrier {
+                execution: relocator(execution),
+                memory: relocator(memory),
+                semantics: relocator(semantics),
+            },
         }
     }
 }
@@ -2591,6 +2605,11 @@ impl Instruction<Id> {
             ]),
             &Self::Label { result } => w.push_array([Self::opcode(2, 248), result]),
             &Self::Return => w.push(Self::opcode(1, 253)),
+            &Self::ControlBarrier {
+                execution,
+                memory,
+                semantics,
+            } => w.push_array([Self::opcode(4, 224), execution, memory, semantics]),
         }
     }
 }
