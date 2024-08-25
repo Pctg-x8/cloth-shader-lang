@@ -5,12 +5,21 @@ use entrypoint::ShaderEntryPointDescription;
 use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
     ir::{
+        block::{
+            Block, BlockFlowInstruction, BlockInstruction, BlockRef, IntrinsicBinaryOperation,
+            IntrinsicUnaryOperation, RegisterRef,
+        },
         expr::{ConstModifiers, SimplifiedExpression},
-        ExprRef,
+        ExprRef, FunctionBody,
     },
     ref_path::RefPath,
     scope::SymbolScope,
     spirv as spv,
+    symbol::{
+        meta::{BuiltinInputOutput, SymbolAttribute},
+        UserDefinedFunctionSymbol,
+    },
+    utils::roundup2,
 };
 
 pub mod entrypoint;
@@ -41,6 +50,9 @@ pub struct SpvModuleEmissionContext {
     pub latest_function_id: spv::Id,
     pub defined_const_map: HashMap<spv::Constant, SpvSectionLocalId>,
     pub defined_type_map: HashMap<spv::Type, SpvSectionLocalId>,
+    pub defined_descriptor_set_bound_global_vars:
+        HashMap<(u32, u32, spv::Type, spv::asm::StorageClass), SpvSectionLocalId>,
+    pub defined_push_constant_global_vars: HashMap<spv::Type, SpvSectionLocalId>,
 }
 impl SpvModuleEmissionContext {
     pub fn new() -> Self {
@@ -61,6 +73,8 @@ impl SpvModuleEmissionContext {
             latest_function_id: 0,
             defined_const_map: HashMap::new(),
             defined_type_map: HashMap::new(),
+            defined_descriptor_set_bound_global_vars: HashMap::new(),
+            defined_push_constant_global_vars: HashMap::new(),
         }
     }
 
@@ -151,7 +165,7 @@ impl SpvModuleEmissionContext {
         ty: spv::Type,
         storage_class: spv::asm::StorageClass,
     ) -> SpvSectionLocalId {
-        let ptr_ty = self.request_type_id(ty.of_pointer(storage_class));
+        let ptr_ty = self.request_type_id(ty.of_pointer(storage_class).into());
         let id = self.new_global_variable_id();
         self.global_variable_ops.push(spv::Instruction::Variable {
             result_type: ptr_ty,
@@ -160,6 +174,33 @@ impl SpvModuleEmissionContext {
             initializer: None,
         });
 
+        id
+    }
+
+    pub fn request_descriptor_set_bound_global_var(
+        &mut self,
+        set: u32,
+        binding: u32,
+        ty: spv::Type,
+        storage_class: spv::asm::StorageClass,
+    ) -> SpvSectionLocalId {
+        let k = (set, binding, ty, storage_class);
+        if let Some(&v) = self.defined_descriptor_set_bound_global_vars.get(&k) {
+            return v;
+        }
+
+        let id = self.declare_global_variable(k.2.clone(), k.3);
+        self.defined_descriptor_set_bound_global_vars.insert(k, id);
+        id
+    }
+
+    pub fn request_push_constant_global_var(&mut self, ty: spv::Type) -> SpvSectionLocalId {
+        if let Some(&v) = self.defined_push_constant_global_vars.get(&ty) {
+            return v;
+        }
+
+        let id = self.declare_global_variable(ty.clone(), spv::asm::StorageClass::PushConstant);
+        self.defined_push_constant_global_vars.insert(ty, id);
         id
     }
 
@@ -269,6 +310,13 @@ impl SpvModuleEmissionContext {
                 let id = self.new_type_const_id();
                 self.type_const_ops
                     .push(spv::Instruction::TypeVoid { result: id });
+                self.defined_type_map.insert(t, id);
+                id
+            }
+            spv::Type::Bool => {
+                let id = self.new_type_const_id();
+                self.type_const_ops
+                    .push(spv::Instruction::TypeBool { result: id });
                 self.defined_type_map.insert(t, id);
                 id
             }
@@ -426,12 +474,12 @@ impl SpvModuleEmissionContext {
                 self.defined_type_map.insert(t, id);
                 id
             }
-            spv::Type::Pointer(storage_class, ref base_type) => {
-                let base_type = self.request_type_id(*base_type.clone());
+            spv::Type::Pointer(ref p) => {
+                let base_type = self.request_type_id(p.base.clone());
                 let id = self.new_type_const_id();
                 self.type_const_ops.push(spv::Instruction::TypePointer {
                     result: id,
-                    storage_class,
+                    storage_class: p.storage_class,
                     base_type,
                 });
                 self.defined_type_map.insert(t, id);
@@ -476,16 +524,14 @@ impl SpvModuleEmissionContext {
 
 pub struct SpvFunctionBodyEmissionContext<'m> {
     pub module_ctx: &'m mut SpvModuleEmissionContext,
-    pub entry_point_maps: ShaderEntryPointMaps,
     pub ops: Vec<spv::Instruction<SpvSectionLocalId>>,
     pub latest_id: spv::Id,
     pub emitted_expression_id: HashMap<usize, Option<(SpvSectionLocalId, spv::Type)>>,
 }
 impl<'s, 'm> SpvFunctionBodyEmissionContext<'m> {
-    pub fn new(module_ctx: &'m mut SpvModuleEmissionContext, maps: ShaderEntryPointMaps) -> Self {
+    pub fn new(module_ctx: &'m mut SpvModuleEmissionContext) -> Self {
         Self {
             module_ctx,
-            entry_point_maps: maps,
             ops: Vec::new(),
             latest_id: 0,
             emitted_expression_id: HashMap::new(),
@@ -1276,7 +1322,7 @@ impl<'s, 'm> SpvFunctionBodyEmissionContext<'m> {
         indices: Vec<SpvSectionLocalId>,
     ) -> SpvSectionLocalId {
         let ptr = self.access_chain(
-            output_type.clone().of_pointer(storage_class),
+            output_type.clone().of_pointer(storage_class).into(),
             root_ptr,
             indices,
         );
@@ -1325,163 +1371,546 @@ enum GlobalAccessType {
     },
 }
 
-pub struct ShaderEntryPointMaps {
-    refpath_to_global_var: HashMap<RefPath, GlobalAccessType>,
-    output_global_vars: Vec<SpvSectionLocalId>,
-    interface_global_vars: Vec<SpvSectionLocalId>,
-}
-impl ShaderEntryPointMaps {
-    pub fn iter_interface_global_vars<'s>(
-        &'s self,
-    ) -> impl Iterator<Item = &'s SpvSectionLocalId> + 's {
-        self.interface_global_vars.iter()
-    }
-}
-pub fn emit_entry_point_spv_ops<'s>(
-    ep: &ShaderEntryPointDescription<'s>,
-    ctx: &mut SpvModuleEmissionContext,
-) -> ShaderEntryPointMaps {
-    let mut entry_point_maps = ShaderEntryPointMaps {
-        refpath_to_global_var: HashMap::new(),
-        output_global_vars: Vec::new(),
-        interface_global_vars: Vec::new(),
-    };
-
-    for a in ep.global_variables.outputs.iter() {
-        let gvid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Output);
-        ctx.decorate(gvid, &a.decorations);
-
-        entry_point_maps.output_global_vars.push(gvid);
-        entry_point_maps.interface_global_vars.push(gvid);
-    }
-
-    for a in ep.global_variables.inputs.iter() {
-        let vid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Input);
-        ctx.decorate(vid, &a.decorations);
-
-        entry_point_maps.refpath_to_global_var.insert(
-            a.original_refpath.clone(),
-            GlobalAccessType::Direct(vid, a.ty.clone(), spv::asm::StorageClass::Input),
-        );
-        entry_point_maps.interface_global_vars.push(vid);
-    }
-
-    for a in ep.global_variables.uniforms.iter() {
-        let storage_class = match a.ty {
-            spv::Type::Image { .. } | spv::Type::SampledImage { .. } => {
-                spv::asm::StorageClass::UniformConstant
-            }
-            _ => spv::asm::StorageClass::Uniform,
-        };
-        let vid = ctx.declare_global_variable(a.ty.clone(), storage_class);
-        ctx.decorate(vid, &a.decorations);
-
-        entry_point_maps.refpath_to_global_var.insert(
-            a.original_refpath.clone(),
-            GlobalAccessType::Direct(vid, a.ty.clone(), storage_class),
-        );
-        entry_point_maps.interface_global_vars.push(vid);
-    }
-
-    if !ep.global_variables.push_constants.is_empty() {
-        let block_ty = spv::Type::Struct {
+fn spv_type(c: &ConcreteType, symbol_attr: &SymbolAttribute) -> spv::Type {
+    match c {
+        ConcreteType::Intrinsic(IntrinsicType::Unit) => spv::Type::Void,
+        ConcreteType::Intrinsic(IntrinsicType::Bool) => spv::Type::Bool,
+        ConcreteType::Intrinsic(IntrinsicType::SInt) => spv::Type::sint(32),
+        ConcreteType::Intrinsic(IntrinsicType::UInt) => spv::Type::uint(32),
+        ConcreteType::Intrinsic(IntrinsicType::Float) => spv::Type::float(32),
+        ConcreteType::Intrinsic(IntrinsicType::SInt2) => spv::Type::sint(32).of_vector(2),
+        ConcreteType::Intrinsic(IntrinsicType::UInt2) => spv::Type::uint(32).of_vector(2),
+        ConcreteType::Intrinsic(IntrinsicType::Float2) => spv::Type::float(32).of_vector(2),
+        ConcreteType::Intrinsic(IntrinsicType::SInt3) => spv::Type::sint(32).of_vector(3),
+        ConcreteType::Intrinsic(IntrinsicType::UInt3) => spv::Type::uint(32).of_vector(3),
+        ConcreteType::Intrinsic(IntrinsicType::Float3) => spv::Type::float(32).of_vector(3),
+        ConcreteType::Intrinsic(IntrinsicType::SInt4) => spv::Type::sint(32).of_vector(4),
+        ConcreteType::Intrinsic(IntrinsicType::UInt4) => spv::Type::uint(32).of_vector(4),
+        ConcreteType::Intrinsic(IntrinsicType::Float4) => spv::Type::float(32).of_vector(4),
+        ConcreteType::Intrinsic(IntrinsicType::Float2x2) => spv::Type::float(32).of_matrix(2, 2),
+        ConcreteType::Intrinsic(IntrinsicType::Float2x3) => spv::Type::float(32).of_matrix(2, 3),
+        ConcreteType::Intrinsic(IntrinsicType::Float2x4) => spv::Type::float(32).of_matrix(2, 4),
+        ConcreteType::Intrinsic(IntrinsicType::Float3x2) => spv::Type::float(32).of_matrix(3, 2),
+        ConcreteType::Intrinsic(IntrinsicType::Float3x3) => spv::Type::float(32).of_matrix(3, 3),
+        ConcreteType::Intrinsic(IntrinsicType::Float3x4) => spv::Type::float(32).of_matrix(3, 4),
+        ConcreteType::Intrinsic(IntrinsicType::Float4x2) => spv::Type::float(32).of_matrix(4, 2),
+        ConcreteType::Intrinsic(IntrinsicType::Float4x3) => spv::Type::float(32).of_matrix(4, 3),
+        ConcreteType::Intrinsic(IntrinsicType::Float4x4) => spv::Type::float(32).of_matrix(4, 4),
+        ConcreteType::Intrinsic(IntrinsicType::Image2D) => spv::Type::Image {
+            sampled_type: spv::ImageComponentType::Scalar(spv::ScalarType::Float(32)),
+            dim: spv::asm::Dim::Dim2,
+            depth: Some(false),
+            arrayed: false,
+            multisampled: false,
+            sampled: spv::asm::TypeImageSampled::WithReadWriteOps,
+            image_format: match symbol_attr.image_format_specifier {
+                Some(fmt) => fmt,
+                None => spv::asm::ImageFormat::Rgba8,
+            },
+            access_qualifier: None,
+        },
+        ConcreteType::Intrinsic(it) => unimplemented!("IntrinsicType: {it:?}"),
+        ConcreteType::Generic(_, _) | ConcreteType::GenericVar(_) => {
+            unreachable!("pre instantiated type")
+        }
+        ConcreteType::UnknownIntClass | ConcreteType::UnknownNumberClass => {
+            unreachable!("pre instantiated type classes")
+        }
+        ConcreteType::UserDefined { .. } => unreachable!("pre instantiated user defined type"),
+        ConcreteType::Struct(members) => spv::Type::Struct {
             decorations: vec![spv::Decorate::Block],
-            member_types: ep
-                .global_variables
-                .push_constants
+            member_types: members
                 .iter()
-                .map(|x| {
-                    let mut decorations = vec![spv::Decorate::Offset(x.offset)];
-                    if let spv::Type::Matrix(ref r, _) = x.ty {
-                        decorations.extend([
-                            spv::Decorate::ColMajor,
-                            spv::Decorate::MatrixStride(r.matrix_stride().unwrap()),
-                        ]);
-                    }
+                .scan(0, |top, m| {
+                    let offset = roundup2(*top, m.ty.std140_alignment().unwrap());
+                    *top = offset + m.ty.std140_size().unwrap();
 
-                    spv::TypeStructMember {
-                        ty: x.ty.clone(),
-                        decorations,
-                    }
+                    Some(spv::TypeStructMember {
+                        ty: spv_type(&m.ty, &m.attribute),
+                        decorations: vec![spv::Decorate::Offset(offset as _)],
+                    })
                 })
                 .collect(),
-        };
-        let block_var = ctx.declare_global_variable(block_ty, spv::asm::StorageClass::PushConstant);
-        for (n, a) in ep.global_variables.push_constants.iter().enumerate() {
-            entry_point_maps.refpath_to_global_var.insert(
-                a.original_refpath.clone(),
-                GlobalAccessType::PushConstantStruct {
-                    struct_var: block_var,
-                    member_index: n as _,
-                    member_ty: a.ty.clone(),
-                },
-            );
+        },
+        ConcreteType::Tuple(xs) => spv::Type::Struct {
+            decorations: Vec::new(),
+            member_types: xs
+                .iter()
+                .map(|x| spv::TypeStructMember {
+                    ty: spv_type(x, &SymbolAttribute::default()),
+                    decorations: Vec::new(),
+                })
+                .collect(),
+        },
+        ConcreteType::Array(t, n) => spv::Type::Array {
+            element_type: Box::new(spv_type(&t, &SymbolAttribute::default())),
+            length: Box::new(spv::TypeArrayLength::ConstExpr(spv::Constant::from(*n))),
+        },
+        ConcreteType::Function { .. } => unimplemented!("function type"),
+        ConcreteType::IntrinsicTypeConstructor(_) => unreachable!("IntrinsicTypeConstructor"),
+        ConcreteType::OverloadedFunctions(_) => unreachable!("Unresolved overloaded functions"),
+        ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
+            unreachable!("Pointer without storage class")
         }
-        entry_point_maps.interface_global_vars.push(block_var);
+        ConcreteType::Never => unreachable!("never"),
+    }
+}
+
+pub struct ShaderInterfaceVariableMaps {
+    pub builtins: HashMap<spv::asm::Builtin, (SpvSectionLocalId, spv::PointerType)>,
+    pub descriptors: HashMap<(u32, u32), (SpvSectionLocalId, spv::PointerType)>,
+    pub push_constant: Option<(SpvSectionLocalId, spv::PointerType)>,
+    pub push_constant_offset_to_index: HashMap<u32, u32>,
+    pub workgroup_shared_memory: HashMap<RefPath, (SpvSectionLocalId, spv::PointerType)>,
+}
+impl ShaderInterfaceVariableMaps {
+    pub fn iter_interface_global_vars(&self) -> impl Iterator<Item = &SpvSectionLocalId> {
+        self.builtins
+            .values()
+            .map(|(v, _)| v)
+            .chain(self.descriptors.values().map(|(v, _)| v))
+            .chain(self.push_constant.iter().map(|(v, _)| v))
+    }
+}
+
+pub fn emit_shader_interface_vars<'s>(
+    f: &UserDefinedFunctionSymbol,
+    fbody: &FunctionBody,
+    ctx: &mut SpvModuleEmissionContext,
+) -> ShaderInterfaceVariableMaps {
+    let mut maps = ShaderInterfaceVariableMaps {
+        builtins: HashMap::new(),
+        descriptors: HashMap::new(),
+        push_constant: None,
+        push_constant_offset_to_index: HashMap::new(),
+        workgroup_shared_memory: HashMap::new(),
+    };
+    let mut push_constants = Vec::new();
+
+    fn process(
+        path: RefPath,
+        attr: &SymbolAttribute,
+        ty: &ConcreteType,
+        maps: &mut ShaderInterfaceVariableMaps,
+        push_constant_entries: &mut Vec<(u32, spv::Type)>,
+        ctx: &mut SpvModuleEmissionContext,
+    ) {
+        let descriptor = match attr {
+            &SymbolAttribute {
+                descriptor_set_location: Some(set),
+                descriptor_set_binding: Some(binding),
+                storage_buffer: true,
+                ..
+            } => Some((set, binding, spv::asm::StorageClass::StorageBuffer)),
+            &SymbolAttribute {
+                descriptor_set_location: Some(set),
+                descriptor_set_binding: Some(binding),
+                ..
+            } => Some((set, binding, spv::asm::StorageClass::Uniform)),
+            _ => None,
+        };
+        let push_constant = match attr {
+            &SymbolAttribute {
+                push_constant_offset: Some(offset),
+                ..
+            } => Some(offset),
+            _ => None,
+        };
+        let builtin = match attr {
+            &SymbolAttribute {
+                bound_builtin_io: Some(BuiltinInputOutput::VertexID),
+                ..
+            } => Some(spv::asm::Builtin::VertexIndex),
+            &SymbolAttribute {
+                bound_builtin_io: Some(BuiltinInputOutput::InstanceID),
+                ..
+            } => Some(spv::asm::Builtin::InstanceIndex),
+            &SymbolAttribute {
+                bound_builtin_io: Some(BuiltinInputOutput::GlobalInvocationID),
+                ..
+            } => Some(spv::asm::Builtin::GlobalInvocationId),
+            &SymbolAttribute {
+                bound_builtin_io: Some(BuiltinInputOutput::LocalInvocationIndex),
+                ..
+            } => Some(spv::asm::Builtin::LocalInvocationIndex),
+            &SymbolAttribute {
+                bound_builtin_io: Some(BuiltinInputOutput::Position),
+                ..
+            } => Some(spv::asm::Builtin::Position),
+            _ => None,
+        };
+        let workgroup_shared = attr.workgroup_shared;
+
+        match (descriptor, push_constant, builtin, workgroup_shared) {
+            (Some((set, binding, sc)), None, None, false) => {
+                match maps.descriptors.entry((set, binding)) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let st = spv_type(ty, attr);
+                        let gvid = ctx.request_descriptor_set_bound_global_var(
+                            set,
+                            binding,
+                            st.clone(),
+                            sc,
+                        );
+                        e.insert((gvid, st.of_pointer(sc)));
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        assert_eq!(e.get().1, spv_type(ty, attr).of_pointer(sc));
+                    }
+                }
+            }
+            (None, Some(o), None, false) => {
+                push_constant_entries.push((o, spv_type(ty, attr)));
+            }
+            (None, None, Some(b), false) => {
+                if let std::collections::hash_map::Entry::Vacant(e) = maps.builtins.entry(b) {
+                    let st = spv_type(ty, attr);
+                    let varid =
+                        ctx.declare_global_variable(st.clone(), spv::asm::StorageClass::Input);
+                    e.insert((varid, st.of_pointer(spv::asm::StorageClass::Input)));
+                }
+            }
+            (None, None, None, true) => {
+                let st = spv_type(ty, attr);
+                match maps.workgroup_shared_memory.entry(path) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let id = ctx
+                            .declare_global_variable(st.clone(), spv::asm::StorageClass::Workgroup);
+                        v.insert((id, st.of_pointer(spv::asm::StorageClass::Workgroup)));
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        assert_eq!(e.get().1, st.of_pointer(spv::asm::StorageClass::Workgroup));
+                    }
+                }
+            }
+            (None, None, None, false) => match ty {
+                ConcreteType::Struct(members) => {
+                    for (n, m) in members.iter().enumerate() {
+                        process(
+                            RefPath::Member(Box::new(path.clone()), n),
+                            &m.attribute,
+                            &m.ty,
+                            maps,
+                            push_constant_entries,
+                            ctx,
+                        );
+                    }
+                }
+                _ => (),
+            },
+            _ => panic!("Error: conflicting input attribute"),
+        }
     }
 
-    for v in ep.global_variables.workgroup_shared_vars.iter() {
-        let storage_class = spv::asm::StorageClass::Workgroup;
-        let vid = ctx.declare_global_variable(v.ty.clone(), storage_class);
-
-        entry_point_maps.refpath_to_global_var.insert(
-            v.original_refpath.clone(),
-            GlobalAccessType::Direct(vid, v.ty.clone(), storage_class),
+    for (n, (attr, _, _, ty)) in f.inputs.iter().enumerate() {
+        process(
+            RefPath::FunctionInput(n),
+            attr,
+            ty,
+            &mut maps,
+            &mut push_constants,
+            ctx,
         );
     }
 
-    entry_point_maps
-}
-
-pub fn emit_function_body_spv_ops(
-    body: &[(SimplifiedExpression, ConcreteType)],
-    ctx: &mut SpvFunctionBodyEmissionContext,
-) {
-    for (n, (_, _)) in body.iter().enumerate() {
-        if !ExprRef(n).is_pure(body) {
-            emit_expr_spv_ops(body, n, ctx);
-        }
-    }
-}
-
-fn emit_expr_spv_ops(
-    body: &[(SimplifiedExpression, ConcreteType)],
-    expr_id: usize,
-    ctx: &mut SpvFunctionBodyEmissionContext,
-) -> Option<(SpvSectionLocalId, spv::Type)> {
-    if let Some(r) = ctx.emitted_expression_id.get(&expr_id) {
-        return r.clone();
-    }
-
-    let result = match &body[expr_id].0 {
-        SimplifiedExpression::Select(c, t, e) => {
-            let (c, ct) = emit_expr_spv_ops(body, c.0, ctx).unwrap();
-
-            let requires_control_flow_branching = ct != spv::Type::Scalar(spv::ScalarType::Bool)
-                || matches!(
-                    (&body[t.0].0, &body[e.0].0),
-                    (SimplifiedExpression::ScopedBlock { .. }, _)
-                        | (_, SimplifiedExpression::ScopedBlock { .. })
-                );
-
-            if requires_control_flow_branching {
-                // impure select
-                unimplemented!("Control Flow Branching strategy");
-            } else {
-                let (t, tt) = emit_expr_spv_ops(body, t.0, ctx).unwrap();
-                let (e, et) = emit_expr_spv_ops(body, e.0, ctx).unwrap();
-                assert_eq!(tt, et);
-
-                Some(ctx.select(tt.clone(), c, t, e))
+    if !push_constants.is_empty() {
+        let mut member_types = Vec::new();
+        push_constants.sort_by_key(|&(o, _)| o);
+        for (o, st) in push_constants {
+            match maps.push_constant_offset_to_index.entry(o) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    member_types.push(spv::TypeStructMember {
+                        ty: st,
+                        decorations: vec![spv::Decorate::Offset(o)],
+                    });
+                    e.insert(member_types.len() as u32 - 1);
+                }
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    assert_eq!(&member_types[*e.get() as usize].ty, &st);
+                }
             }
         }
-        SimplifiedExpression::ConstructIntrinsicComposite(it, args) => {
+
+        let pc_st = spv::Type::Struct {
+            decorations: vec![spv::Decorate::Block],
+            member_types,
+        };
+        let varid = ctx.request_push_constant_global_var(pc_st.clone());
+        maps.push_constant = Some((
+            varid,
+            pc_st.of_pointer(spv::asm::StorageClass::PushConstant),
+        ));
+    }
+
+    maps
+}
+
+pub fn emit_entry_point_spv_ops2<'s>(
+    shaderif_variable_maps: &ShaderInterfaceVariableMaps,
+    f: &FunctionBody,
+    ctx: &mut SpvModuleEmissionContext,
+) {
+    emit_block(
+        shaderif_variable_maps,
+        &f.constants,
+        &f.blocks,
+        BlockRef(0),
+        &mut SpvFunctionBodyEmissionContext::new(ctx),
+    );
+}
+
+pub fn emit_block<'a, 's>(
+    shader_if: &ShaderInterfaceVariableMaps,
+    consts: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    blocks: &[Block<'a, 's>],
+    n: BlockRef,
+    ctx: &mut SpvFunctionBodyEmissionContext,
+) {
+    match blocks[n.0].flow {
+        BlockFlowInstruction::Goto(next) => {
+            eprintln!("Warn: goto block has no effect");
+            emit_block(shader_if, consts, blocks, next, ctx);
+        }
+        BlockFlowInstruction::StoreRef { ptr, value, after } => {
+            let (ptr, ptr_ty) =
+                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, ptr, ctx)
+                    .unwrap();
+            let (value, value_ty) =
+                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, value, ctx)
+                    .unwrap();
+            assert_eq!(ptr_ty.clone().dereferenced().unwrap(), value_ty);
+            ctx.ops.push(spv::Instruction::Store {
+                pointer: ptr,
+                object: value,
+            });
+
+            emit_block(shader_if, consts, blocks, after.unwrap(), ctx);
+        }
+        BlockFlowInstruction::IntrinsicImpureFuncall {
+            identifier: "Cloth.Intrinsic.ExecutionBarrier",
+            ref args,
+            after_return,
+            ..
+        } => {
+            assert!(args.is_empty());
+
+            // とりあえずGLSLに倣って固定値で出してるけどこれでいいんだろうか
+            let execution_scope = ctx
+                .module_ctx
+                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+            let memory_scope = ctx
+                .module_ctx
+                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+            let semantics = ctx.module_ctx.request_const_id(spv::Constant::from(
+                (spv::asm::MemorySemantics::ACQUIRE_RELEASE
+                    | spv::asm::MemorySemantics::WORKGROUP_MEMORY)
+                    .bits(),
+            ));
+            ctx.ops.push(spv::Instruction::ControlBarrier {
+                execution: execution_scope,
+                memory: memory_scope,
+                semantics,
+            });
+
+            emit_block(shader_if, consts, blocks, after_return.unwrap(), ctx);
+        }
+        BlockFlowInstruction::IntrinsicImpureFuncall { identifier, .. } => {
+            unimplemented!("Unknown intrinsic: {identifier}")
+        }
+        BlockFlowInstruction::Funcall {
+            callee: RegisterRef(callee),
+            ref args,
+            result: RegisterRef(result),
+            after_return,
+        } => {
+            unimplemented!("funcall");
+            // let (callee, callee_ty) =
+            //     emit_block_instruction(shader_if, &block.instructions, callee, ctx).unwrap();
+            // let (args, args_ty) = args
+            //     .iter()
+            //     .map(|RegisterRef(a)| {
+            //         emit_block_instruction(shader_if, &block.instructions, a, ctx).unwrap()
+            //     })
+            //     .collect::<Vec<_>>();
+        }
+        BlockFlowInstruction::Conditional {
+            source,
+            r#true,
+            r#false,
+            merge,
+        } => {
+            let (source, source_ty) =
+                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, source, ctx)
+                    .unwrap();
+            assert_eq!(source_ty, spv::Type::Bool);
+            // 抜け先を作るのにマージブロックが必要だが、true/falseブロックが具体的にいくつインストラクション数あるかがわからない......
+            // IRをもう一個作ってブロックを崩していったほうがよさそう
+
+            let merge_label = ctx.new_id();
+            ctx.ops.push(spv::Instruction::Label {
+                result: merge_label,
+            });
+            emit_block(shader_if, consts, blocks, merge, ctx);
+        }
+        BlockFlowInstruction::ConditionalLoop { .. } => unimplemented!("conditional loop"),
+        BlockFlowInstruction::Break => unimplemented!("break"),
+        BlockFlowInstruction::Continue => unimplemented!("continue"),
+        BlockFlowInstruction::Return(r) => {
+            match emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, r, ctx) {
+                None => ctx.ops.push(spv::Instruction::Return),
+                Some((_, spv::Type::Void)) => ctx.ops.push(spv::Instruction::Return),
+                Some(_) => unimplemented!("Return with Value"),
+            }
+        }
+        BlockFlowInstruction::Undetermined => unreachable!("undetermined destination?"),
+    }
+}
+
+pub fn emit_block_instruction<'a, 's>(
+    shader_if: &ShaderInterfaceVariableMaps,
+    consts: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    insts: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    n: RegisterRef,
+    ctx: &mut SpvFunctionBodyEmissionContext,
+) -> Option<(SpvSectionLocalId, spv::Type)> {
+    match consts.get(&n).unwrap_or_else(|| &insts[&n]) {
+        BlockInstruction::ConstUnit => None,
+        BlockInstruction::ConstInt(_) => unreachable!("not reduced const lit"),
+        BlockInstruction::ConstNumber(_) => unreachable!("not reduced const lit"),
+        BlockInstruction::ConstSInt(ref l) => {
+            let value = l.instantiate();
+            let const_id = ctx.module_ctx.request_const_id(spv::Constant::from(value));
+
+            Some((const_id, spv::Type::sint(32)))
+        }
+        BlockInstruction::ConstUInt(ref l) => {
+            let value = l.instantiate();
+            let const_id = ctx.module_ctx.request_const_id(spv::Constant::from(value));
+
+            Some((const_id, spv::Type::uint(32)))
+        }
+        BlockInstruction::ConstFloat(ref l) => {
+            let value = l.instantiate();
+            let const_id = ctx.module_ctx.request_const_id(spv::Constant::from(value));
+
+            Some((const_id, spv::Type::float(32)))
+        }
+        &BlockInstruction::ImmBool(v) => {
+            let const_id = ctx.module_ctx.request_const_id(if v {
+                spv::Constant::True {
+                    result_type: spv::Type::Bool,
+                }
+            } else {
+                spv::Constant::False {
+                    result_type: spv::Type::Bool,
+                }
+            });
+
+            Some((const_id, spv::Type::Bool))
+        }
+        BlockInstruction::ImmInt(_) => unreachable!("not reduced const lit"),
+        &BlockInstruction::ImmSInt(v) => {
+            let const_id = ctx.module_ctx.request_const_id(spv::Constant::from(v));
+
+            Some((const_id, spv::Type::sint(32)))
+        }
+        &BlockInstruction::ImmUInt(v) => {
+            let const_id = ctx.module_ctx.request_const_id(spv::Constant::from(v));
+
+            Some((const_id, spv::Type::uint(32)))
+        }
+        &BlockInstruction::Cast(src, ref ty) => {
+            let (x, xt) = emit_block_instruction(shader_if, consts, insts, src, ctx).unwrap();
+
+            Some(match xt {
+                spv::Type::Scalar(spv::ScalarType::Int(32, true)) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
+                        ctx.convert_sint_to_float(None, x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Scalar(spv::ScalarType::Int(32, false)) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
+                        ctx.convert_uint_to_float(None, x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Scalar(spv::ScalarType::Float(32)) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::SInt) => {
+                        ctx.convert_float_to_sint(None, x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::UInt) => {
+                        ctx.convert_float_to_uint(None, x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Vector(spv::ScalarType::Int(32, true), c) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
+                        ctx.convert_sint_to_float(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::Float3)
+                        if c == spv::VectorSize::Three =>
+                    {
+                        ctx.convert_sint_to_float(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::Float4)
+                        if c == spv::VectorSize::Four =>
+                    {
+                        ctx.convert_sint_to_float(Some(c), x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Vector(spv::ScalarType::Int(32, false), c) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
+                        ctx.convert_uint_to_float(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::Float3)
+                        if c == spv::VectorSize::Three =>
+                    {
+                        ctx.convert_uint_to_float(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::Float4)
+                        if c == spv::VectorSize::Four =>
+                    {
+                        ctx.convert_uint_to_float(Some(c), x)
+                    }
+                    _ => unreachable!(),
+                },
+                spv::Type::Vector(spv::ScalarType::Float(32), c) => match ty {
+                    ConcreteType::Intrinsic(IntrinsicType::SInt2) if c == spv::VectorSize::Two => {
+                        ctx.convert_float_to_sint(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::UInt2) if c == spv::VectorSize::Two => {
+                        ctx.convert_float_to_uint(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::SInt3)
+                        if c == spv::VectorSize::Three =>
+                    {
+                        ctx.convert_float_to_sint(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::UInt3)
+                        if c == spv::VectorSize::Three =>
+                    {
+                        ctx.convert_float_to_uint(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::SInt4) if c == spv::VectorSize::Four => {
+                        ctx.convert_float_to_sint(Some(c), x)
+                    }
+                    ConcreteType::Intrinsic(IntrinsicType::UInt4) if c == spv::VectorSize::Four => {
+                        ctx.convert_float_to_uint(Some(c), x)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            })
+        }
+        &BlockInstruction::ConstructIntrinsicComposite(ty, ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|&x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|&x| emit_block_instruction(shader_if, consts, insts, x, ctx).unwrap())
                 .unzip();
 
-            match it {
+            match ty {
                 IntrinsicType::Float4 => {
                     assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
 
@@ -1598,675 +2027,502 @@ fn emit_expr_spv_ops(
 
                     Some((result_id, rt))
                 }
-                _ => unimplemented!("Composite construction for {it:?}"),
+                _ => unimplemented!("Composite construction for {ty:?}"),
             }
         }
-        SimplifiedExpression::LogAnd(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-            assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
-
-            Some(ctx.log_and(sv.vector_size(), l, r))
+        BlockInstruction::InstantiateIntrinsicTypeClass(_, _) => {
+            unreachable!("not instantiated intrinsic type?")
         }
-        SimplifiedExpression::LogOr(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-            assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
+        BlockInstruction::PromoteIntToNumber(_) => unreachable!("not processed promotion"),
+        BlockInstruction::ConstructStruct(_) => unimplemented!("ConstructStruct"),
+        BlockInstruction::ConstructTuple(_) => unimplemented!("ConstructTuple"),
+        BlockInstruction::BuiltinIORef(b) => {
+            let (id, ty) = shader_if.builtins[match b {
+                BuiltinInputOutput::VertexID => &spv::asm::Builtin::VertexIndex,
+                BuiltinInputOutput::InstanceID => &spv::asm::Builtin::InstanceIndex,
+                BuiltinInputOutput::Position => &spv::asm::Builtin::Position,
+                BuiltinInputOutput::LocalInvocationIndex => {
+                    &spv::asm::Builtin::LocalInvocationIndex
+                }
+                BuiltinInputOutput::GlobalInvocationID => &spv::asm::Builtin::GlobalInvocationId,
+            }]
+            .clone();
 
-            Some(ctx.log_or(sv.vector_size(), l, r))
+            Some((id, ty.into()))
         }
-        SimplifiedExpression::Eq(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
+        &BlockInstruction::DescriptorRef { set, binding } => {
+            let (id, ty) = shader_if.descriptors[&(set, binding)].clone();
+
+            Some((id, ty.into()))
+        }
+        &BlockInstruction::PushConstantRef(offset) => {
+            let (vid, vty) = shader_if.push_constant.clone().unwrap();
+            let mindex = shader_if.push_constant_offset_to_index[&offset];
+            let result_ty = match vty.base {
+                spv::Type::Struct { member_types, .. } => member_types[mindex as usize]
+                    .ty
+                    .clone()
+                    .of_pointer(vty.storage_class),
+                _ => unreachable!(),
             };
 
-            Some(ctx.equal(
-                EqCompareOperandClass::of(sv.scalar()),
-                sv.vector_size(),
-                l,
-                r,
+            let mindex_const = ctx.module_ctx.request_const_id(spv::Constant::from(mindex));
+            Some((
+                ctx.access_chain(result_ty.clone().into(), vid, vec![mindex_const]),
+                result_ty.into(),
             ))
         }
-        SimplifiedExpression::Ne(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-
-            Some(ctx.not_equal(
-                EqCompareOperandClass::of(sv.scalar()),
-                sv.vector_size(),
-                l,
-                r,
-            ))
+        BlockInstruction::ScopeLocalVarRef(_, _) => unimplemented!("ScopeLocalVarRef"),
+        BlockInstruction::FunctionInputVarRef(_, _) => unimplemented!("FunctionInputVarRef"),
+        BlockInstruction::UserDefinedFunctionRef(_, _) => unreachable!("not inlined function"),
+        BlockInstruction::IntrinsicFunctionRef(_) => {
+            unreachable!("unresolved intrinsic function ref")
         }
-        SimplifiedExpression::Lt(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-
-            Some(ctx.less_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+        BlockInstruction::IntrinsicTypeConstructorRef(_) => {
+            unreachable!("unresolved intrinsic type constructor ref")
         }
-        SimplifiedExpression::Le(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
+        BlockInstruction::TupleRef(_, _) => unimplemented!("TupleRef"),
+        BlockInstruction::MemberRef(_, _) => unreachable!("MemberRef"),
+        BlockInstruction::WorkgroupSharedMemoryRef(path) => {
+            let (vid, vty) = shader_if.workgroup_shared_memory[&path].clone();
 
-            Some(ctx.less_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+            Some((vid, vty.into()))
         }
-        SimplifiedExpression::Gt(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-
-            Some(ctx.greater_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
-        }
-        SimplifiedExpression::Ge(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-
-            Some(ctx.greater_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
-        }
-        SimplifiedExpression::BitAnd(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-            assert!(matches!(sv.scalar(), &spv::ScalarType::Int(_, _)));
-
-            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
-            ctx.ops.push(spv::Instruction::BitwiseAnd {
-                result_type,
-                result,
-                operand1: l,
-                operand2: r,
-            });
-            Some((result, lt))
-        }
-        SimplifiedExpression::BitOr(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-            assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
-
-            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
-            ctx.ops.push(spv::Instruction::BitwiseOr {
-                result_type,
-                result,
-                operand1: l,
-                operand2: r,
-            });
-            Some((result, lt))
-        }
-        SimplifiedExpression::BitXor(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
-            };
-            assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
-
-            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
-            ctx.ops.push(spv::Instruction::BitwiseXor {
-                result_type,
-                result,
-                operand1: l,
-                operand2: r,
-            });
-            Some((result, lt))
-        }
-        SimplifiedExpression::Add(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
-                unreachable!();
+        BlockInstruction::StaticPathRef(_) => unimplemented!("StaticPathRef"),
+        &BlockInstruction::ArrayRef { source, index } => {
+            let (source, source_ty) =
+                emit_block_instruction(shader_if, consts, insts, source, ctx).unwrap();
+            let (index, _index_ty) =
+                emit_block_instruction(shader_if, consts, insts, index, ctx).unwrap();
+            let element_ptr_ty = match source_ty {
+                spv::Type::Pointer(ptr) => match ptr.base {
+                    spv::Type::Array { element_type, .. } => {
+                        element_type.of_pointer(ptr.storage_class)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
             };
 
             Some((
-                match sv.scalar() {
-                    spv::ScalarType::Int(_, _) => ctx.iadd(lt.clone(), l, r),
-                    spv::ScalarType::Float(_) => ctx.fadd(lt.clone(), l, r),
-                    _ => unreachable!(),
-                },
-                lt,
+                ctx.access_chain(element_ptr_ty.clone().into(), source, vec![index]),
+                element_ptr_ty.into(),
             ))
         }
-        SimplifiedExpression::Sub(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-            let Some(sv) = lt.scalar_or_vector_view() else {
+        BlockInstruction::SwizzleRef(_, _) => {
+            unimplemented!("SwizzleRef")
+        }
+        &BlockInstruction::Swizzle(src, ref elements) => {
+            let (x, xt) = emit_block_instruction(shader_if, consts, insts, src, ctx).unwrap();
+            let spv::Type::Vector(component_type, _) = xt else {
                 unreachable!();
             };
 
-            Some((
-                match sv.scalar() {
-                    spv::ScalarType::Int(_, _) => ctx.isub(lt.clone(), l, r),
-                    spv::ScalarType::Float(_) => ctx.fsub(lt.clone(), l, r),
+            match &elements[..] {
+                &[a] => Some((
+                    ctx.composite_extract(component_type.clone(), x, vec![a as _]),
+                    component_type.into(),
+                )),
+                &[a, b] => {
+                    let rt = component_type.of_vector(spv::VectorSize::Two);
+                    Some((
+                        ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _]),
+                        rt.into(),
+                    ))
+                }
+                &[a, b, c] => {
+                    let rt = component_type.of_vector(spv::VectorSize::Three);
+                    Some((
+                        ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _]),
+                        rt.into(),
+                    ))
+                }
+                &[a, b, c, d] => {
+                    let rt = component_type.of_vector(spv::VectorSize::Four);
+                    Some((
+                        ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _, d as _]),
+                        rt.into(),
+                    ))
+                }
+                _ => unreachable!(),
+            }
+        }
+        &BlockInstruction::LoadRef(ptr) => {
+            let (ptr, ptr_ty) = emit_block_instruction(shader_if, consts, insts, ptr, ctx).unwrap();
+            let value_ty = ptr_ty.dereferenced().unwrap();
+
+            let result = ctx.load(value_ty.clone(), ptr);
+            Some((result, value_ty))
+        }
+        &BlockInstruction::IntrinsicBinaryOp(left, op, right) => {
+            let (l, lt) = emit_block_instruction(shader_if, consts, insts, left, ctx).unwrap();
+            let (r, rt) = emit_block_instruction(shader_if, consts, insts, right, ctx).unwrap();
+            assert_eq!(lt, rt);
+
+            match op {
+                IntrinsicBinaryOperation::Add => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some((
+                        match sv.scalar() {
+                            spv::ScalarType::Int(_, _) => ctx.iadd(lt.clone(), l, r),
+                            spv::ScalarType::Float(_) => ctx.fadd(lt.clone(), l, r),
+                            _ => unreachable!(),
+                        },
+                        lt,
+                    ))
+                }
+                IntrinsicBinaryOperation::Sub => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some((
+                        match sv.scalar() {
+                            spv::ScalarType::Int(_, _) => ctx.isub(lt.clone(), l, r),
+                            spv::ScalarType::Float(_) => ctx.fsub(lt.clone(), l, r),
+                            _ => unreachable!(),
+                        },
+                        lt,
+                    ))
+                }
+                IntrinsicBinaryOperation::Mul => match (lt, rt) {
+                    (
+                        spv::Type::Vector(spv::ScalarType::Float(w1), component_count),
+                        spv::Type::Scalar(spv::ScalarType::Float(w2)),
+                    ) if w1 == w2 => {
+                        let rt: spv::Type =
+                            spv::ScalarType::Float(w1).of_vector(component_count).into();
+                        Some((ctx.vector_times_scalar(rt.clone(), l, r), rt))
+                    }
+                    (
+                        spv::Type::Matrix(
+                            spv::VectorType(spv::ScalarType::Float(w1), row_count),
+                            column_count,
+                        ),
+                        spv::Type::Scalar(spv::ScalarType::Float(w2)),
+                    ) if w1 == w2 => {
+                        let rt: spv::Type = spv::ScalarType::Float(w1)
+                            .of_matrix(row_count, column_count as _)
+                            .into();
+                        Some((ctx.matrix_times_scalar(rt.clone(), l, r), rt))
+                    }
+                    (
+                        spv::Type::Matrix(
+                            spv::VectorType(spv::ScalarType::Float(w1), component_count),
+                            ccl,
+                        ),
+                        spv::Type::Vector(spv::ScalarType::Float(w2), ccr),
+                    ) if ccl.count() == ccr.count() && w1 == w2 => {
+                        let rt: spv::Type =
+                            spv::ScalarType::Float(w1).of_vector(component_count).into();
+                        Some((ctx.matrix_times_vector(rt.clone(), l, r), rt))
+                    }
+                    (
+                        spv::Type::Vector(spv::ScalarType::Float(w1), ccl),
+                        spv::Type::Matrix(
+                            spv::VectorType(spv::ScalarType::Float(w2), component_count),
+                            ccr,
+                        ),
+                    ) if ccl == component_count && w1 == w2 => {
+                        let rt: spv::Type = spv::ScalarType::Float(w2).of_vector(ccr.into()).into();
+                        Some((ctx.vector_times_matrix(rt.clone(), l, r), rt))
+                    }
+                    (
+                        spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w1), rl), cl),
+                        spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w2), rr), cr),
+                    ) if w1 == w2 && cl.count() == rr.count() => {
+                        let rt: spv::Type = spv::ScalarType::Float(w1).of_matrix(rl, cr).into();
+                        Some((ctx.matrix_times_matrix(rt.clone(), l, r), rt))
+                    }
+                    (a, b) if a == b => Some((
+                        match a {
+                            spv::Type::Scalar(spv::ScalarType::Int(_, _))
+                            | spv::Type::Vector(spv::ScalarType::Int(_, _), _) => {
+                                ctx.imul(a.clone(), l, r)
+                            }
+                            spv::Type::Scalar(spv::ScalarType::Float(_))
+                            | spv::Type::Vector(spv::ScalarType::Float(_), _) => {
+                                ctx.fmul(a.clone(), l, r)
+                            }
+                            _ => unreachable!(),
+                        },
+                        a,
+                    )),
                     _ => unreachable!(),
                 },
-                lt,
-            ))
-        }
-        SimplifiedExpression::Mul(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-
-            match (lt, rt) {
-                (
-                    spv::Type::Vector(spv::ScalarType::Float(w1), component_count),
-                    spv::Type::Scalar(spv::ScalarType::Float(w2)),
-                ) if w1 == w2 => {
-                    let rt: spv::Type =
-                        spv::ScalarType::Float(w1).of_vector(component_count).into();
-                    Some((ctx.vector_times_scalar(rt.clone(), l, r), rt))
-                }
-                (
-                    spv::Type::Matrix(
-                        spv::VectorType(spv::ScalarType::Float(w1), row_count),
-                        column_count,
-                    ),
-                    spv::Type::Scalar(spv::ScalarType::Float(w2)),
-                ) if w1 == w2 => {
-                    let rt: spv::Type = spv::ScalarType::Float(w1)
-                        .of_matrix(row_count, column_count as _)
-                        .into();
-                    Some((ctx.matrix_times_scalar(rt.clone(), l, r), rt))
-                }
-                (
-                    spv::Type::Matrix(
-                        spv::VectorType(spv::ScalarType::Float(w1), component_count),
-                        ccl,
-                    ),
-                    spv::Type::Vector(spv::ScalarType::Float(w2), ccr),
-                ) if ccl.count() == ccr.count() && w1 == w2 => {
-                    let rt: spv::Type =
-                        spv::ScalarType::Float(w1).of_vector(component_count).into();
-                    Some((ctx.matrix_times_vector(rt.clone(), l, r), rt))
-                }
-                (
-                    spv::Type::Vector(spv::ScalarType::Float(w1), ccl),
-                    spv::Type::Matrix(
-                        spv::VectorType(spv::ScalarType::Float(w2), component_count),
-                        ccr,
-                    ),
-                ) if ccl == component_count && w1 == w2 => {
-                    let rt: spv::Type = spv::ScalarType::Float(w2).of_vector(ccr.into()).into();
-                    Some((ctx.vector_times_matrix(rt.clone(), l, r), rt))
-                }
-                (
-                    spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w1), rl), cl),
-                    spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w2), rr), cr),
-                ) if w1 == w2 && cl.count() == rr.count() => {
-                    let rt: spv::Type = spv::ScalarType::Float(w1).of_matrix(rl, cr).into();
-                    Some((ctx.matrix_times_matrix(rt.clone(), l, r), rt))
-                }
-                (a, b) if a == b => Some((
-                    match a {
-                        spv::Type::Scalar(spv::ScalarType::Int(_, _))
-                        | spv::Type::Vector(spv::ScalarType::Int(_, _), _) => {
-                            ctx.imul(a.clone(), l, r)
+                IntrinsicBinaryOperation::Div => Some((
+                    match lt {
+                        spv::Type::Scalar(spv::ScalarType::Int(_, true))
+                        | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
+                            ctx.sdiv(lt.clone(), l, r)
+                        }
+                        spv::Type::Scalar(spv::ScalarType::Int(_, false))
+                        | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
+                            ctx.udiv(lt.clone(), l, r)
                         }
                         spv::Type::Scalar(spv::ScalarType::Float(_))
                         | spv::Type::Vector(spv::ScalarType::Float(_), _) => {
-                            ctx.fmul(a.clone(), l, r)
+                            ctx.fdiv(lt.clone(), l, r)
                         }
                         _ => unreachable!(),
                     },
-                    a,
+                    lt,
                 )),
-                _ => unreachable!(),
+                IntrinsicBinaryOperation::Rem => Some((
+                    match lt {
+                        spv::Type::Scalar(spv::ScalarType::Int(_, true))
+                        | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
+                            ctx.srem(lt.clone(), l, r)
+                        }
+                        spv::Type::Scalar(spv::ScalarType::Int(_, false))
+                        | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
+                            ctx.umod(lt.clone(), l, r)
+                        }
+                        spv::Type::Scalar(spv::ScalarType::Float(_))
+                        | spv::Type::Vector(spv::ScalarType::Float(_), _) => {
+                            ctx.frem(lt.clone(), l, r)
+                        }
+                        _ => unreachable!(),
+                    },
+                    lt,
+                )),
+                IntrinsicBinaryOperation::Pow => {
+                    let rt: spv::Type = match lt {
+                        spv::Type::Scalar(spv::ScalarType::Float(width)) => {
+                            spv::ScalarType::Float(width).into()
+                        }
+                        spv::Type::Vector(spv::ScalarType::Float(width), component_count) => {
+                            spv::ScalarType::Float(width)
+                                .of_vector(component_count)
+                                .into()
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let glsl_std_450_lib_set_id =
+                        ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
+                    let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+                    ctx.ops.push(spv::Instruction::ExtInst {
+                        result_type,
+                        result,
+                        set: glsl_std_450_lib_set_id,
+                        instruction: 26,
+                        operands: vec![l, r],
+                    });
+                    Some((result, rt))
+                }
+                IntrinsicBinaryOperation::BitAnd => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+                    assert!(matches!(sv.scalar(), &spv::ScalarType::Int(_, _)));
+
+                    let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                    ctx.ops.push(spv::Instruction::BitwiseAnd {
+                        result_type,
+                        result,
+                        operand1: l,
+                        operand2: r,
+                    });
+                    Some((result, lt))
+                }
+                IntrinsicBinaryOperation::BitOr => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+                    assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
+
+                    let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                    ctx.ops.push(spv::Instruction::BitwiseOr {
+                        result_type,
+                        result,
+                        operand1: l,
+                        operand2: r,
+                    });
+                    Some((result, lt))
+                }
+                IntrinsicBinaryOperation::BitXor => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+                    assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
+
+                    let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                    ctx.ops.push(spv::Instruction::BitwiseXor {
+                        result_type,
+                        result,
+                        operand1: l,
+                        operand2: r,
+                    });
+                    Some((result, lt))
+                }
+                IntrinsicBinaryOperation::LeftShift => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    match sv.scalar() {
+                        spv::ScalarType::Int(_, _) => {
+                            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                            ctx.ops.push(spv::Instruction::ShiftLeftLogical {
+                                result_type,
+                                result,
+                                base: l,
+                                shift: r,
+                            });
+                            Some((result, lt))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                IntrinsicBinaryOperation::RightShift => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    match sv.scalar() {
+                        spv::ScalarType::Int(_, true) => {
+                            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                            ctx.ops.push(spv::Instruction::ShiftRightArithmetic {
+                                result_type,
+                                result,
+                                base: l,
+                                shift: r,
+                            });
+                            Some((result, lt))
+                        }
+                        spv::ScalarType::Int(_, false) => {
+                            let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+                            ctx.ops.push(spv::Instruction::ShiftRightLogical {
+                                result_type,
+                                result,
+                                base: l,
+                                shift: r,
+                            });
+                            Some((result, lt))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                IntrinsicBinaryOperation::Eq => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.equal(
+                        EqCompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::Ne => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.not_equal(
+                        EqCompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::Lt => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.less_than(
+                        CompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::Le => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.less_than_eq(
+                        CompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::Gt => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.greater_than(
+                        CompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::Ge => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+
+                    Some(ctx.greater_than_eq(
+                        CompareOperandClass::of(sv.scalar()),
+                        sv.vector_size(),
+                        l,
+                        r,
+                    ))
+                }
+                IntrinsicBinaryOperation::LogAnd => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+                    assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
+
+                    Some(ctx.log_and(sv.vector_size(), l, r))
+                }
+                IntrinsicBinaryOperation::LogOr => {
+                    let Some(sv) = lt.scalar_or_vector_view() else {
+                        unreachable!();
+                    };
+                    assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
+
+                    Some(ctx.log_or(sv.vector_size(), l, r))
+                }
             }
         }
-        SimplifiedExpression::Div(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            Some((
-                match lt {
-                    spv::Type::Scalar(spv::ScalarType::Int(_, true))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
-                        ctx.sdiv(lt.clone(), l, r)
-                    }
-                    spv::Type::Scalar(spv::ScalarType::Int(_, false))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
-                        ctx.udiv(lt.clone(), l, r)
-                    }
-                    spv::Type::Scalar(spv::ScalarType::Float(_))
-                    | spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.fdiv(lt.clone(), l, r),
-                    _ => unreachable!(),
-                },
-                lt,
-            ))
-        }
-        SimplifiedExpression::Rem(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            Some((
-                match lt {
-                    spv::Type::Scalar(spv::ScalarType::Int(_, true))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
-                        ctx.srem(lt.clone(), l, r)
-                    }
-                    spv::Type::Scalar(spv::ScalarType::Int(_, false))
-                    | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
-                        ctx.umod(lt.clone(), l, r)
-                    }
-                    spv::Type::Scalar(spv::ScalarType::Float(_))
-                    | spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.frem(lt.clone(), l, r),
-                    _ => unreachable!(),
-                },
-                lt,
-            ))
-        }
-        SimplifiedExpression::Pow(l, r) => {
-            let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            assert_eq!(lt, rt);
-
-            let rt: spv::Type = match lt {
-                spv::Type::Scalar(spv::ScalarType::Float(width)) => {
-                    spv::ScalarType::Float(width).into()
-                }
-                spv::Type::Vector(spv::ScalarType::Float(width), component_count) => {
-                    spv::ScalarType::Float(width)
-                        .of_vector(component_count)
-                        .into()
-                }
-                _ => unreachable!(),
-            };
-
-            let glsl_std_450_lib_set_id =
-                ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
-            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
-            ctx.ops.push(spv::Instruction::ExtInst {
-                result_type,
-                result,
-                set: glsl_std_450_lib_set_id,
-                instruction: 26,
-                operands: vec![l, r],
-            });
-            Some((result, rt))
-        }
-        SimplifiedExpression::Neg(x) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+        &BlockInstruction::IntrinsicUnaryOp(src, op) => {
+            let (x, xt) = emit_block_instruction(shader_if, consts, insts, src, ctx).unwrap();
             let Some(xtsv) = xt.clone().scalar_or_vector() else {
                 unreachable!();
             };
 
-            Some((
-                match xtsv.scalar() {
-                    spv::ScalarType::Int(_, true) => ctx.snegate(xt.clone(), x),
-                    spv::ScalarType::Float(_) => ctx.fnegate(xt.clone(), x),
-                    _ => unreachable!(),
-                },
-                xt,
-            ))
-        }
-        SimplifiedExpression::Cast(x, t) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-
-            Some(match xt {
-                spv::Type::Scalar(spv::ScalarType::Int(32, true)) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
-                        ctx.convert_sint_to_float(None, x)
-                    }
-                    _ => unreachable!(),
-                },
-                spv::Type::Scalar(spv::ScalarType::Int(32, false)) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::Float) => {
-                        ctx.convert_uint_to_float(None, x)
-                    }
-                    _ => unreachable!(),
-                },
-                spv::Type::Scalar(spv::ScalarType::Float(32)) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::SInt) => {
-                        ctx.convert_float_to_sint(None, x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::UInt) => {
-                        ctx.convert_float_to_uint(None, x)
-                    }
-                    _ => unreachable!(),
-                },
-                spv::Type::Vector(spv::ScalarType::Int(32, true), c) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
-                        ctx.convert_sint_to_float(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::Float3)
-                        if c == spv::VectorSize::Three =>
-                    {
-                        ctx.convert_sint_to_float(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::Float4)
-                        if c == spv::VectorSize::Four =>
-                    {
-                        ctx.convert_sint_to_float(Some(c), x)
-                    }
-                    _ => unreachable!(),
-                },
-                spv::Type::Vector(spv::ScalarType::Int(32, false), c) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
-                        ctx.convert_uint_to_float(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::Float3)
-                        if c == spv::VectorSize::Three =>
-                    {
-                        ctx.convert_uint_to_float(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::Float4)
-                        if c == spv::VectorSize::Four =>
-                    {
-                        ctx.convert_uint_to_float(Some(c), x)
-                    }
-                    _ => unreachable!(),
-                },
-                spv::Type::Vector(spv::ScalarType::Float(32), c) => match t {
-                    ConcreteType::Intrinsic(IntrinsicType::SInt2) if c == spv::VectorSize::Two => {
-                        ctx.convert_float_to_sint(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::UInt2) if c == spv::VectorSize::Two => {
-                        ctx.convert_float_to_uint(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::SInt3)
-                        if c == spv::VectorSize::Three =>
-                    {
-                        ctx.convert_float_to_sint(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::UInt3)
-                        if c == spv::VectorSize::Three =>
-                    {
-                        ctx.convert_float_to_uint(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::SInt4) if c == spv::VectorSize::Four => {
-                        ctx.convert_float_to_sint(Some(c), x)
-                    }
-                    ConcreteType::Intrinsic(IntrinsicType::UInt4) if c == spv::VectorSize::Four => {
-                        ctx.convert_float_to_uint(Some(c), x)
-                    }
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            })
-        }
-        &SimplifiedExpression::Swizzle1(x, a) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-            let spv::Type::Vector(component_type, _) = xt else {
-                unreachable!();
-            };
-
-            Some((
-                ctx.composite_extract(component_type.clone(), x, vec![a as _]),
-                component_type.into(),
-            ))
-        }
-        &SimplifiedExpression::Swizzle2(x, a, b) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-            let spv::Type::Vector(component_type, _) = xt else {
-                unreachable!();
-            };
-
-            let rt = component_type.of_vector(spv::VectorSize::Two);
-            Some((
-                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _]),
-                rt.into(),
-            ))
-        }
-        &SimplifiedExpression::Swizzle3(x, a, b, c) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-            let spv::Type::Vector(component_type, _) = xt else {
-                unreachable!();
-            };
-
-            let rt = component_type.of_vector(spv::VectorSize::Three);
-            Some((
-                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _]),
-                rt.into(),
-            ))
-        }
-        &SimplifiedExpression::Swizzle4(x, a, b, c, d) => {
-            let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-            let spv::Type::Vector(component_type, _) = xt else {
-                unreachable!();
-            };
-
-            let rt = component_type.of_vector(spv::VectorSize::Four);
-            Some((
-                ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _, d as _]),
-                rt.into(),
-            ))
-        }
-        &SimplifiedExpression::VectorShuffle4(v1, v2, a, b, c, d) => {
-            let (v1, v1t) = emit_expr_spv_ops(body, v1.0, ctx).unwrap();
-            let (v2, _) = emit_expr_spv_ops(body, v2.0, ctx).unwrap();
-            let spv::Type::Vector(component_type, _) = v1t else {
-                unreachable!("v1t = {v1t:?}");
-            };
-
-            let rt = component_type.of_vector(spv::VectorSize::Four);
-            Some((
-                ctx.vector_shuffle(rt.clone(), v1, v2, vec![a as _, b as _, c as _, d as _]),
-                rt.into(),
-            ))
-        }
-        SimplifiedExpression::CanonicalPathRef(rp) => {
-            match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
-                Some(&GlobalAccessType::Direct(gv, ref vty, storage_class)) => {
-                    Some((gv, vty.clone().of_pointer(storage_class)))
-                }
-                Some(&GlobalAccessType::PushConstantStruct {
-                    struct_var,
-                    member_index,
-                    ref member_ty,
-                }) => {
-                    let member_ty = member_ty
-                        .clone()
-                        .of_pointer(spv::asm::StorageClass::PushConstant);
-
-                    let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
-                    Some((
-                        ctx.access_chain(member_ty.clone(), struct_var, vec![ac_index_id]),
-                        member_ty,
-                    ))
-                }
-                None => panic!("no corresponding canonical refpath found? {rp:?}"),
+            match op {
+                IntrinsicUnaryOperation::Neg => Some((
+                    match xtsv.scalar() {
+                        spv::ScalarType::Int(_, true) => ctx.snegate(xt.clone(), x),
+                        spv::ScalarType::Float(_) => ctx.fnegate(xt.clone(), x),
+                        _ => unreachable!(),
+                    },
+                    xt,
+                )),
+                IntrinsicUnaryOperation::BitNot => unimplemented!("Unary:BitNot"),
+                IntrinsicUnaryOperation::LogNot => unimplemented!("Unary:LogNot"),
             }
         }
-        SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
-            match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
-                Some(GlobalAccessType::Direct(gv, vty, _)) => {
-                    let (gv, vty) = (gv.clone(), vty.clone());
-
-                    Some((ctx.load(vty.clone(), gv), vty))
-                }
-                Some(&GlobalAccessType::PushConstantStruct {
-                    struct_var,
-                    member_index,
-                    ref member_ty,
-                }) => {
-                    let member_ty = member_ty.clone();
-
-                    let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
-                    Some((
-                        ctx.chained_load(
-                            member_ty.clone(),
-                            spv::asm::StorageClass::PushConstant,
-                            struct_var,
-                            vec![ac_index_id],
-                        ),
-                        member_ty,
-                    ))
-                }
-                // TODO: あとで再帰組む
-                None => match rp {
-                    RefPath::Member(root, index) => {
-                        Some(match ctx.entry_point_maps.refpath_to_global_var.get(root) {
-                            Some(GlobalAccessType::Direct(gv, vty, storage_class)) => {
-                                let (gv, vty) = (gv.clone(), vty.clone());
-                                let member_ty = match vty {
-                                    spv::Type::Struct { member_types, .. } => {
-                                        member_types[*index].ty.clone()
-                                    }
-                                    _ => unreachable!("cannot member ref"),
-                                };
-
-                                let ac_index_id =
-                                    ctx.module_ctx.request_const_id((*index as u32).into());
-                                (
-                                    ctx.chained_load(
-                                        member_ty.clone(),
-                                        *storage_class,
-                                        gv,
-                                        vec![ac_index_id],
-                                    ),
-                                    member_ty,
-                                )
-                            }
-                            Some(&GlobalAccessType::PushConstantStruct {
-                                struct_var,
-                                member_index,
-                                ref member_ty,
-                            }) => {
-                                let member_ty = member_ty.clone();
-                                let final_ty = match member_ty {
-                                    spv::Type::Struct { member_types, .. } => {
-                                        member_types[*index].ty.clone()
-                                    }
-                                    _ => unreachable!("cannot member ref"),
-                                };
-
-                                let ac_index_id =
-                                    ctx.module_ctx.request_const_id(member_index.into());
-                                let ac_index2_id =
-                                    ctx.module_ctx.request_const_id((*index as u32).into());
-                                (
-                                    ctx.chained_load(
-                                        final_ty.clone(),
-                                        spv::asm::StorageClass::PushConstant,
-                                        struct_var,
-                                        vec![ac_index_id, ac_index2_id],
-                                    ),
-                                    final_ty,
-                                )
-                            }
-                            None => panic!("no corresponding canonical refpath found? {rp:?}"),
-                        })
-                    }
-                    _ => panic!("no corresponding canonical refpath found? {rp:?}"),
-                },
-            }
-        }
-        SimplifiedExpression::ConstSInt(s, mods) => {
-            let mut x: i32 = match s
-                .0
-                .slice
-                .strip_prefix("0x")
-                .or_else(|| s.0.slice.strip_prefix("0X"))
-            {
-                Some(left) => i32::from_str_radix(left, 16).unwrap(),
-                None => s.0.slice.parse().unwrap(),
-            };
-            if mods.contains(ConstModifiers::NEGATE) {
-                x = -x;
-            }
-            if mods.contains(ConstModifiers::BIT_NOT) {
-                x = !x;
-            }
-            if mods.contains(ConstModifiers::LOGICAL_NOT) {
-                x = if x == 0 { 1 } else { 0 };
-            }
-
-            Some((
-                ctx.module_ctx.request_const_id(x.into()),
-                spv::Type::sint(32),
-            ))
-        }
-        SimplifiedExpression::ConstUInt(s, mods) => {
-            let mut x: u32 = match s
-                .0
-                .slice
-                .strip_prefix("0x")
-                .or_else(|| s.0.slice.strip_prefix("0X"))
-            {
-                Some(left) => u32::from_str_radix(left, 16).unwrap(),
-                None => s.0.slice.parse().unwrap(),
-            };
-            if mods.contains(ConstModifiers::NEGATE) {
-                panic!("applying negate to unsigned number?");
-            }
-            if mods.contains(ConstModifiers::BIT_NOT) {
-                x = !x;
-            }
-            if mods.contains(ConstModifiers::LOGICAL_NOT) {
-                x = if x == 0 { 1 } else { 0 };
-            }
-
-            Some((
-                ctx.module_ctx.request_const_id(x.into()),
-                spv::Type::uint(32),
-            ))
-        }
-        SimplifiedExpression::ConstFloat(s, mods) => {
-            let mut x: f32 =
-                s.0.slice
-                    .strip_suffix(['f', 'F'])
-                    .unwrap_or(s.0.slice)
-                    .parse()
-                    .unwrap();
-            if mods.contains(ConstModifiers::NEGATE) {
-                x = -x;
-            }
-            if mods.contains(ConstModifiers::BIT_NOT) {
-                x = unsafe { core::mem::transmute(!core::mem::transmute::<_, u32>(x)) };
-            }
-            if mods.contains(ConstModifiers::LOGICAL_NOT) {
-                x = if x != 0.0 { 0.0 } else { 1.0 };
-            }
-
-            Some((
-                ctx.module_ctx.request_const_id(x.into()),
-                spv::Type::float(32),
-            ))
-        }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SubpassLoad", _, args) => {
+        BlockInstruction::Phi(_) => unimplemented!("Phi"),
+        BlockInstruction::RegisterAlias(_) => unreachable!("unresolved register alias"),
+        BlockInstruction::PureFuncall(_, _) => unreachable!("all functions must be inlined"),
+        &BlockInstruction::PureIntrinsicCall("Cloth.Intrinsic.SubpassLoad", ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|x| emit_block_instruction(shader_if, consts, insts, *x, ctx).unwrap())
                 .unzip();
             assert!(arg_ty.len() == 1 && arg_ty[0] == spv::Type::SUBPASS_DATA_IMAGE_TYPE);
 
@@ -2284,10 +2540,10 @@ fn emit_expr_spv_ops(
             });
             Some((result_id, rt))
         }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Dot#Float3", _, args) => {
+        &BlockInstruction::PureIntrinsicCall("Cloth.Intrinsic.Dot#Float3", ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|x| emit_block_instruction(shader_if, consts, insts, *x, ctx).unwrap())
                 .unzip();
             assert!(
                 arg_ty.len() == 2
@@ -2306,10 +2562,10 @@ fn emit_expr_spv_ops(
             });
             Some((result, rt))
         }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Normalize#Float3", _, args) => {
+        &BlockInstruction::PureIntrinsicCall("Cloth.Intrinsic.Normalize#Float3", ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|x| emit_block_instruction(shader_if, consts, insts, *x, ctx).unwrap())
                 .unzip();
             assert_eq!(arg_ty.len(), 1);
             assert_eq!(arg_ty[0], spv::Type::float(32).of_vector(3));
@@ -2327,10 +2583,10 @@ fn emit_expr_spv_ops(
             });
             Some((result, rt))
         }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Transpose#Float4x4", _, args) => {
+        &BlockInstruction::PureIntrinsicCall("Cloth.Intrinsic.Transpose#Float4x4", ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|x| emit_block_instruction(shader_if, consts, insts, *x, ctx).unwrap())
                 .unzip();
             assert_eq!(arg_ty.len(), 1);
             assert_eq!(arg_ty[0], spv::Type::float(32).of_matrix(4, 4));
@@ -2344,10 +2600,10 @@ fn emit_expr_spv_ops(
             });
             Some((result, rt))
         }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SampleAt#Texture2D", _, args) => {
+        &BlockInstruction::PureIntrinsicCall("Cloth.Intrinsic.SampleAt#Texture2D", ref args) => {
             let (args, arg_ty): (Vec<_>, Vec<_>) = args
                 .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+                .map(|x| emit_block_instruction(shader_if, consts, insts, *x, ctx).unwrap())
                 .unzip();
             assert_eq!(arg_ty.len(), 2);
             assert!(matches!(arg_ty[0], spv::Type::SampledImage { .. }));
@@ -2363,98 +2619,1146 @@ fn emit_expr_spv_ops(
             });
             Some((result, rt))
         }
-        SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.ExecutionBarrier", _, args) => {
-            assert!(args.is_empty());
+        BlockInstruction::PureIntrinsicCall(id, ref args) => panic!(
+            "Error: unknown intrinsic call {id}({})",
+            args.iter()
+                .map(|r| format!("r{}", r.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
 
-            // とりあえずGLSLに倣って固定値で出してるけどこれでいいんだろうか
-            let execution_scope = ctx
-                .module_ctx
-                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
-            let memory_scope = ctx
-                .module_ctx
-                .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
-            let semantics = ctx.module_ctx.request_const_id(spv::Constant::from(
-                (spv::asm::MemorySemantics::ACQUIRE_RELEASE
-                    | spv::asm::MemorySemantics::WORKGROUP_MEMORY)
-                    .bits(),
-            ));
-            ctx.ops.push(spv::Instruction::ControlBarrier {
-                execution: execution_scope,
-                memory: memory_scope,
-                semantics,
-            });
-            None
-        }
-        SimplifiedExpression::ChainedRef(base, xs) => {
-            let (base, bty) = emit_expr_spv_ops(body, base.0, ctx).unwrap();
-            let xs = xs
-                .iter()
-                .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap().0)
-                .collect::<Vec<_>>();
-
-            let spv::Type::Pointer(storage_class, _) = bty else {
-                unreachable!()
-            };
-            let term_type = match body[expr_id].1 {
-                ConcreteType::Ref(ref inner) => &**inner,
-                ConcreteType::MutableRef(ref inner) => &**inner,
-                _ => unreachable!(),
-            };
-
-            // TODO: ここの型生成方法あとで考える
-            let rt = term_type
-                .clone()
-                .make_spv_type(&SymbolScope::new_intrinsics())
-                .of_pointer(storage_class);
-            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
-            ctx.ops.push(spv::Instruction::AccessChain {
-                base,
-                result_type,
-                result,
-                indexes: xs,
-            });
-            Some((result, rt))
-        }
-        SimplifiedExpression::LoadRef(r) => {
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-
-            let rt = rt.dereferenced().unwrap();
-            let (result_type, result) = ctx.issue_typed_ids(rt.clone());
-            ctx.ops.push(spv::Instruction::Load {
-                result_type,
-                result,
-                pointer: r,
-            });
-            Some((result, rt))
-        }
-        SimplifiedExpression::StoreRef(r, v) => {
-            let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
-            let (v, vt) = emit_expr_spv_ops(body, v.0, ctx).unwrap();
-            assert_eq!(rt.dereferenced(), Some(vt));
-            ctx.ops.push(spv::Instruction::Store {
-                pointer: r,
-                object: v,
-            });
-
-            None
-        }
-        SimplifiedExpression::StoreOutput(x, o) => {
-            let (x, _xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
-            ctx.ops.push(spv::Instruction::Store {
-                pointer: ctx.entry_point_maps.output_global_vars[*o],
-                object: x,
-            });
-
-            None
-        }
-        SimplifiedExpression::ScopedBlock {
-            expressions,
-            returning,
-            ..
-        } => emit_expr_spv_ops(expressions, returning.0, ctx),
-        x => unimplemented!("{x:?}"),
+pub struct ShaderEntryPointMaps {
+    refpath_to_global_var: HashMap<RefPath, GlobalAccessType>,
+    output_global_vars: Vec<SpvSectionLocalId>,
+    interface_global_vars: Vec<SpvSectionLocalId>,
+}
+impl ShaderEntryPointMaps {
+    pub fn iter_interface_global_vars<'s>(
+        &'s self,
+    ) -> impl Iterator<Item = &'s SpvSectionLocalId> + 's {
+        self.interface_global_vars.iter()
+    }
+}
+pub fn emit_entry_point_spv_ops<'s>(
+    ep: &ShaderEntryPointDescription<'s>,
+    ctx: &mut SpvModuleEmissionContext,
+) -> ShaderEntryPointMaps {
+    let mut entry_point_maps = ShaderEntryPointMaps {
+        refpath_to_global_var: HashMap::new(),
+        output_global_vars: Vec::new(),
+        interface_global_vars: Vec::new(),
     };
 
-    ctx.emitted_expression_id.insert(expr_id, result.clone());
-    result
+    for a in ep.global_variables.outputs.iter() {
+        let gvid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Output);
+        ctx.decorate(gvid, &a.decorations);
+
+        entry_point_maps.output_global_vars.push(gvid);
+        entry_point_maps.interface_global_vars.push(gvid);
+    }
+
+    for a in ep.global_variables.inputs.iter() {
+        let vid = ctx.declare_global_variable(a.ty.clone(), spv::asm::StorageClass::Input);
+        ctx.decorate(vid, &a.decorations);
+
+        entry_point_maps.refpath_to_global_var.insert(
+            a.original_refpath.clone(),
+            GlobalAccessType::Direct(vid, a.ty.clone(), spv::asm::StorageClass::Input),
+        );
+        entry_point_maps.interface_global_vars.push(vid);
+    }
+
+    for a in ep.global_variables.uniforms.iter() {
+        let storage_class = match a.ty {
+            spv::Type::Image { .. } | spv::Type::SampledImage { .. } => {
+                spv::asm::StorageClass::UniformConstant
+            }
+            _ => spv::asm::StorageClass::Uniform,
+        };
+        let vid = ctx.declare_global_variable(a.ty.clone(), storage_class);
+        ctx.decorate(vid, &a.decorations);
+
+        entry_point_maps.refpath_to_global_var.insert(
+            a.original_refpath.clone(),
+            GlobalAccessType::Direct(vid, a.ty.clone(), storage_class),
+        );
+        entry_point_maps.interface_global_vars.push(vid);
+    }
+
+    if !ep.global_variables.push_constants.is_empty() {
+        let block_ty = spv::Type::Struct {
+            decorations: vec![spv::Decorate::Block],
+            member_types: ep
+                .global_variables
+                .push_constants
+                .iter()
+                .map(|x| {
+                    let mut decorations = vec![spv::Decorate::Offset(x.offset)];
+                    if let spv::Type::Matrix(ref r, _) = x.ty {
+                        decorations.extend([
+                            spv::Decorate::ColMajor,
+                            spv::Decorate::MatrixStride(r.matrix_stride().unwrap()),
+                        ]);
+                    }
+
+                    spv::TypeStructMember {
+                        ty: x.ty.clone(),
+                        decorations,
+                    }
+                })
+                .collect(),
+        };
+        let block_var = ctx.declare_global_variable(block_ty, spv::asm::StorageClass::PushConstant);
+        for (n, a) in ep.global_variables.push_constants.iter().enumerate() {
+            entry_point_maps.refpath_to_global_var.insert(
+                a.original_refpath.clone(),
+                GlobalAccessType::PushConstantStruct {
+                    struct_var: block_var,
+                    member_index: n as _,
+                    member_ty: a.ty.clone(),
+                },
+            );
+        }
+        entry_point_maps.interface_global_vars.push(block_var);
+    }
+
+    for v in ep.global_variables.workgroup_shared_vars.iter() {
+        let storage_class = spv::asm::StorageClass::Workgroup;
+        let vid = ctx.declare_global_variable(v.ty.clone(), storage_class);
+
+        entry_point_maps.refpath_to_global_var.insert(
+            v.original_refpath.clone(),
+            GlobalAccessType::Direct(vid, v.ty.clone(), storage_class),
+        );
+    }
+
+    entry_point_maps
 }
+
+// pub fn emit_function_body_spv_ops(
+//     body: &[(SimplifiedExpression, ConcreteType)],
+//     ctx: &mut SpvFunctionBodyEmissionContext,
+// ) {
+//     for (n, (_, _)) in body.iter().enumerate() {
+//         if !ExprRef(n).is_pure(body) {
+//             emit_expr_spv_ops(body, n, ctx);
+//         }
+//     }
+// }
+
+// fn emit_expr_spv_ops(
+//     body: &[(SimplifiedExpression, ConcreteType)],
+//     expr_id: usize,
+//     ctx: &mut SpvFunctionBodyEmissionContext,
+// ) -> Option<(SpvSectionLocalId, spv::Type)> {
+//     if let Some(r) = ctx.emitted_expression_id.get(&expr_id) {
+//         return r.clone();
+//     }
+
+//     let result = match &body[expr_id].0 {
+//         SimplifiedExpression::Select(c, t, e) => {
+//             let (c, ct) = emit_expr_spv_ops(body, c.0, ctx).unwrap();
+
+//             let requires_control_flow_branching = ct != spv::Type::Scalar(spv::ScalarType::Bool)
+//                 || matches!(
+//                     (&body[t.0].0, &body[e.0].0),
+//                     (SimplifiedExpression::ScopedBlock { .. }, _)
+//                         | (_, SimplifiedExpression::ScopedBlock { .. })
+//                 );
+
+//             if requires_control_flow_branching {
+//                 // impure select
+//                 unimplemented!("Control Flow Branching strategy");
+//             } else {
+//                 let (t, tt) = emit_expr_spv_ops(body, t.0, ctx).unwrap();
+//                 let (e, et) = emit_expr_spv_ops(body, e.0, ctx).unwrap();
+//                 assert_eq!(tt, et);
+
+//                 Some(ctx.select(tt.clone(), c, t, e))
+//             }
+//         }
+//         SimplifiedExpression::ConstructIntrinsicComposite(it, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|&x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+
+//             match it {
+//                 IntrinsicType::Float4 => {
+//                     assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
+
+//                     let rt = spv::Type::float(32).of_vector(4);
+//                     let result_type = ctx.module_ctx.request_type_id(rt.clone());
+//                     let is_constant = args
+//                         .iter()
+//                         .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
+
+//                     let result_id;
+//                     if is_constant {
+//                         result_id = ctx.module_ctx.new_type_const_id();
+//                         ctx.module_ctx
+//                             .type_const_ops
+//                             .push(spv::Instruction::ConstantComposite {
+//                                 result_type,
+//                                 result: result_id,
+//                                 constituents: match args.len() {
+//                                     1 => args.repeat(4),
+//                                     2 => args.repeat(2),
+//                                     4 => args,
+//                                     _ => panic!("Error: component count mismatching"),
+//                                 },
+//                             });
+//                     } else {
+//                         result_id = ctx.new_id();
+//                         ctx.ops.push(spv::Instruction::CompositeConstruct {
+//                             result_type,
+//                             result: result_id,
+//                             constituents: match args.len() {
+//                                 1 => args.repeat(4),
+//                                 2 => args.repeat(2),
+//                                 4 => args,
+//                                 _ => panic!("Error: component count mismatching"),
+//                             },
+//                         });
+//                     };
+
+//                     Some((result_id, rt))
+//                 }
+//                 IntrinsicType::Float3 => {
+//                     assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
+
+//                     let rt = spv::Type::float(32).of_vector(3);
+//                     let result_type = ctx.module_ctx.request_type_id(rt.clone());
+//                     let is_constant = args
+//                         .iter()
+//                         .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
+
+//                     let result_id;
+//                     if is_constant {
+//                         result_id = ctx.module_ctx.new_type_const_id();
+//                         ctx.module_ctx
+//                             .type_const_ops
+//                             .push(spv::Instruction::ConstantComposite {
+//                                 result_type,
+//                                 result: result_id,
+//                                 constituents: match args.len() {
+//                                     1 => args.repeat(3),
+//                                     3 => args,
+//                                     _ => panic!("Error: component count mismatching"),
+//                                 },
+//                             });
+//                     } else {
+//                         result_id = ctx.new_id();
+//                         ctx.ops.push(spv::Instruction::CompositeConstruct {
+//                             result_type,
+//                             result: result_id,
+//                             constituents: match args.len() {
+//                                 1 => args.repeat(3),
+//                                 3 => args,
+//                                 _ => panic!("Error: component count mismatching"),
+//                             },
+//                         });
+//                     };
+
+//                     Some((result_id, rt))
+//                 }
+//                 IntrinsicType::Float2 => {
+//                     assert!(arg_ty.iter().all(|x| *x == spv::Type::float(32)));
+
+//                     let rt = spv::Type::float(32).of_vector(2);
+//                     let result_type = ctx.module_ctx.request_type_id(rt.clone());
+//                     let is_constant = args
+//                         .iter()
+//                         .all(|x| matches!(x, SpvSectionLocalId::TypeConst(_)));
+
+//                     let result_id;
+//                     if is_constant {
+//                         result_id = ctx.module_ctx.new_type_const_id();
+//                         ctx.module_ctx
+//                             .type_const_ops
+//                             .push(spv::Instruction::ConstantComposite {
+//                                 result_type,
+//                                 result: result_id,
+//                                 constituents: match args.len() {
+//                                     1 => args.repeat(2),
+//                                     2 => args,
+//                                     _ => panic!("Error: component count mismatching"),
+//                                 },
+//                             });
+//                     } else {
+//                         result_id = ctx.new_id();
+//                         ctx.ops.push(spv::Instruction::CompositeConstruct {
+//                             result_type,
+//                             result: result_id,
+//                             constituents: match args.len() {
+//                                 1 => args.repeat(2),
+//                                 2 => args,
+//                                 _ => panic!("Error: component count mismatching"),
+//                             },
+//                         });
+//                     };
+
+//                     Some((result_id, rt))
+//                 }
+//                 _ => unimplemented!("Composite construction for {it:?}"),
+//             }
+//         }
+//         SimplifiedExpression::LogAnd(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+//             assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
+
+//             Some(ctx.log_and(sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::LogOr(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+//             assert_eq!(sv.scalar(), &spv::ScalarType::Bool);
+
+//             Some(ctx.log_or(sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::Eq(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.equal(
+//                 EqCompareOperandClass::of(sv.scalar()),
+//                 sv.vector_size(),
+//                 l,
+//                 r,
+//             ))
+//         }
+//         SimplifiedExpression::Ne(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.not_equal(
+//                 EqCompareOperandClass::of(sv.scalar()),
+//                 sv.vector_size(),
+//                 l,
+//                 r,
+//             ))
+//         }
+//         SimplifiedExpression::Lt(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.less_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::Le(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.less_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::Gt(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.greater_than(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::Ge(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some(ctx.greater_than_eq(CompareOperandClass::of(sv.scalar()), sv.vector_size(), l, r))
+//         }
+//         SimplifiedExpression::BitAnd(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+//             assert!(matches!(sv.scalar(), &spv::ScalarType::Int(_, _)));
+
+//             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+//             ctx.ops.push(spv::Instruction::BitwiseAnd {
+//                 result_type,
+//                 result,
+//                 operand1: l,
+//                 operand2: r,
+//             });
+//             Some((result, lt))
+//         }
+//         SimplifiedExpression::BitOr(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+//             assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
+
+//             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+//             ctx.ops.push(spv::Instruction::BitwiseOr {
+//                 result_type,
+//                 result,
+//                 operand1: l,
+//                 operand2: r,
+//             });
+//             Some((result, lt))
+//         }
+//         SimplifiedExpression::BitXor(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+//             assert!(matches!(sv.scalar(), spv::ScalarType::Int(_, _)));
+
+//             let (result_type, result) = ctx.issue_typed_ids(lt.clone());
+//             ctx.ops.push(spv::Instruction::BitwiseXor {
+//                 result_type,
+//                 result,
+//                 operand1: l,
+//                 operand2: r,
+//             });
+//             Some((result, lt))
+//         }
+//         SimplifiedExpression::Add(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some((
+//                 match sv.scalar() {
+//                     spv::ScalarType::Int(_, _) => ctx.iadd(lt.clone(), l, r),
+//                     spv::ScalarType::Float(_) => ctx.fadd(lt.clone(), l, r),
+//                     _ => unreachable!(),
+//                 },
+//                 lt,
+//             ))
+//         }
+//         SimplifiedExpression::Sub(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+//             let Some(sv) = lt.scalar_or_vector_view() else {
+//                 unreachable!();
+//             };
+
+//             Some((
+//                 match sv.scalar() {
+//                     spv::ScalarType::Int(_, _) => ctx.isub(lt.clone(), l, r),
+//                     spv::ScalarType::Float(_) => ctx.fsub(lt.clone(), l, r),
+//                     _ => unreachable!(),
+//                 },
+//                 lt,
+//             ))
+//         }
+//         SimplifiedExpression::Mul(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+
+//             match (lt, rt) {
+//                 (
+//                     spv::Type::Vector(spv::ScalarType::Float(w1), component_count),
+//                     spv::Type::Scalar(spv::ScalarType::Float(w2)),
+//                 ) if w1 == w2 => {
+//                     let rt: spv::Type =
+//                         spv::ScalarType::Float(w1).of_vector(component_count).into();
+//                     Some((ctx.vector_times_scalar(rt.clone(), l, r), rt))
+//                 }
+//                 (
+//                     spv::Type::Matrix(
+//                         spv::VectorType(spv::ScalarType::Float(w1), row_count),
+//                         column_count,
+//                     ),
+//                     spv::Type::Scalar(spv::ScalarType::Float(w2)),
+//                 ) if w1 == w2 => {
+//                     let rt: spv::Type = spv::ScalarType::Float(w1)
+//                         .of_matrix(row_count, column_count as _)
+//                         .into();
+//                     Some((ctx.matrix_times_scalar(rt.clone(), l, r), rt))
+//                 }
+//                 (
+//                     spv::Type::Matrix(
+//                         spv::VectorType(spv::ScalarType::Float(w1), component_count),
+//                         ccl,
+//                     ),
+//                     spv::Type::Vector(spv::ScalarType::Float(w2), ccr),
+//                 ) if ccl.count() == ccr.count() && w1 == w2 => {
+//                     let rt: spv::Type =
+//                         spv::ScalarType::Float(w1).of_vector(component_count).into();
+//                     Some((ctx.matrix_times_vector(rt.clone(), l, r), rt))
+//                 }
+//                 (
+//                     spv::Type::Vector(spv::ScalarType::Float(w1), ccl),
+//                     spv::Type::Matrix(
+//                         spv::VectorType(spv::ScalarType::Float(w2), component_count),
+//                         ccr,
+//                     ),
+//                 ) if ccl == component_count && w1 == w2 => {
+//                     let rt: spv::Type = spv::ScalarType::Float(w2).of_vector(ccr.into()).into();
+//                     Some((ctx.vector_times_matrix(rt.clone(), l, r), rt))
+//                 }
+//                 (
+//                     spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w1), rl), cl),
+//                     spv::Type::Matrix(spv::VectorType(spv::ScalarType::Float(w2), rr), cr),
+//                 ) if w1 == w2 && cl.count() == rr.count() => {
+//                     let rt: spv::Type = spv::ScalarType::Float(w1).of_matrix(rl, cr).into();
+//                     Some((ctx.matrix_times_matrix(rt.clone(), l, r), rt))
+//                 }
+//                 (a, b) if a == b => Some((
+//                     match a {
+//                         spv::Type::Scalar(spv::ScalarType::Int(_, _))
+//                         | spv::Type::Vector(spv::ScalarType::Int(_, _), _) => {
+//                             ctx.imul(a.clone(), l, r)
+//                         }
+//                         spv::Type::Scalar(spv::ScalarType::Float(_))
+//                         | spv::Type::Vector(spv::ScalarType::Float(_), _) => {
+//                             ctx.fmul(a.clone(), l, r)
+//                         }
+//                         _ => unreachable!(),
+//                     },
+//                     a,
+//                 )),
+//                 _ => unreachable!(),
+//             }
+//         }
+//         SimplifiedExpression::Div(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+
+//             Some((
+//                 match lt {
+//                     spv::Type::Scalar(spv::ScalarType::Int(_, true))
+//                     | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
+//                         ctx.sdiv(lt.clone(), l, r)
+//                     }
+//                     spv::Type::Scalar(spv::ScalarType::Int(_, false))
+//                     | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
+//                         ctx.udiv(lt.clone(), l, r)
+//                     }
+//                     spv::Type::Scalar(spv::ScalarType::Float(_))
+//                     | spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.fdiv(lt.clone(), l, r),
+//                     _ => unreachable!(),
+//                 },
+//                 lt,
+//             ))
+//         }
+//         SimplifiedExpression::Rem(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+
+//             Some((
+//                 match lt {
+//                     spv::Type::Scalar(spv::ScalarType::Int(_, true))
+//                     | spv::Type::Vector(spv::ScalarType::Int(_, true), _) => {
+//                         ctx.srem(lt.clone(), l, r)
+//                     }
+//                     spv::Type::Scalar(spv::ScalarType::Int(_, false))
+//                     | spv::Type::Vector(spv::ScalarType::Int(_, false), _) => {
+//                         ctx.umod(lt.clone(), l, r)
+//                     }
+//                     spv::Type::Scalar(spv::ScalarType::Float(_))
+//                     | spv::Type::Vector(spv::ScalarType::Float(_), _) => ctx.frem(lt.clone(), l, r),
+//                     _ => unreachable!(),
+//                 },
+//                 lt,
+//             ))
+//         }
+//         SimplifiedExpression::Pow(l, r) => {
+//             let (l, lt) = emit_expr_spv_ops(body, l.0, ctx).unwrap();
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             assert_eq!(lt, rt);
+
+//             let rt: spv::Type = match lt {
+//                 spv::Type::Scalar(spv::ScalarType::Float(width)) => {
+//                     spv::ScalarType::Float(width).into()
+//                 }
+//                 spv::Type::Vector(spv::ScalarType::Float(width), component_count) => {
+//                     spv::ScalarType::Float(width)
+//                         .of_vector(component_count)
+//                         .into()
+//                 }
+//                 _ => unreachable!(),
+//             };
+
+//             let glsl_std_450_lib_set_id =
+//                 ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::ExtInst {
+//                 result_type,
+//                 result,
+//                 set: glsl_std_450_lib_set_id,
+//                 instruction: 26,
+//                 operands: vec![l, r],
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::Neg(x) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             let Some(xtsv) = xt.clone().scalar_or_vector() else {
+//                 unreachable!();
+//             };
+
+//             Some((
+//                 match xtsv.scalar() {
+//                     spv::ScalarType::Int(_, true) => ctx.snegate(xt.clone(), x),
+//                     spv::ScalarType::Float(_) => ctx.fnegate(xt.clone(), x),
+//                     _ => unreachable!(),
+//                 },
+//                 xt,
+//             ))
+//         }
+//         SimplifiedExpression::Cast(x, t) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+
+//             Some(match xt {
+//                 spv::Type::Scalar(spv::ScalarType::Int(32, true)) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::Float) => {
+//                         ctx.convert_sint_to_float(None, x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 spv::Type::Scalar(spv::ScalarType::Int(32, false)) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::Float) => {
+//                         ctx.convert_uint_to_float(None, x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 spv::Type::Scalar(spv::ScalarType::Float(32)) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::SInt) => {
+//                         ctx.convert_float_to_sint(None, x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::UInt) => {
+//                         ctx.convert_float_to_uint(None, x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 spv::Type::Vector(spv::ScalarType::Int(32, true), c) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
+//                         ctx.convert_sint_to_float(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::Float3)
+//                         if c == spv::VectorSize::Three =>
+//                     {
+//                         ctx.convert_sint_to_float(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::Float4)
+//                         if c == spv::VectorSize::Four =>
+//                     {
+//                         ctx.convert_sint_to_float(Some(c), x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 spv::Type::Vector(spv::ScalarType::Int(32, false), c) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::Float2) if c == spv::VectorSize::Two => {
+//                         ctx.convert_uint_to_float(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::Float3)
+//                         if c == spv::VectorSize::Three =>
+//                     {
+//                         ctx.convert_uint_to_float(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::Float4)
+//                         if c == spv::VectorSize::Four =>
+//                     {
+//                         ctx.convert_uint_to_float(Some(c), x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 spv::Type::Vector(spv::ScalarType::Float(32), c) => match t {
+//                     ConcreteType::Intrinsic(IntrinsicType::SInt2) if c == spv::VectorSize::Two => {
+//                         ctx.convert_float_to_sint(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::UInt2) if c == spv::VectorSize::Two => {
+//                         ctx.convert_float_to_uint(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::SInt3)
+//                         if c == spv::VectorSize::Three =>
+//                     {
+//                         ctx.convert_float_to_sint(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::UInt3)
+//                         if c == spv::VectorSize::Three =>
+//                     {
+//                         ctx.convert_float_to_uint(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::SInt4) if c == spv::VectorSize::Four => {
+//                         ctx.convert_float_to_sint(Some(c), x)
+//                     }
+//                     ConcreteType::Intrinsic(IntrinsicType::UInt4) if c == spv::VectorSize::Four => {
+//                         ctx.convert_float_to_uint(Some(c), x)
+//                     }
+//                     _ => unreachable!(),
+//                 },
+//                 _ => unreachable!(),
+//             })
+//         }
+//         &SimplifiedExpression::Swizzle1(x, a) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             let spv::Type::Vector(component_type, _) = xt else {
+//                 unreachable!();
+//             };
+
+//             Some((
+//                 ctx.composite_extract(component_type.clone(), x, vec![a as _]),
+//                 component_type.into(),
+//             ))
+//         }
+//         &SimplifiedExpression::Swizzle2(x, a, b) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             let spv::Type::Vector(component_type, _) = xt else {
+//                 unreachable!();
+//             };
+
+//             let rt = component_type.of_vector(spv::VectorSize::Two);
+//             Some((
+//                 ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _]),
+//                 rt.into(),
+//             ))
+//         }
+//         &SimplifiedExpression::Swizzle3(x, a, b, c) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             let spv::Type::Vector(component_type, _) = xt else {
+//                 unreachable!();
+//             };
+
+//             let rt = component_type.of_vector(spv::VectorSize::Three);
+//             Some((
+//                 ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _]),
+//                 rt.into(),
+//             ))
+//         }
+//         &SimplifiedExpression::Swizzle4(x, a, b, c, d) => {
+//             let (x, xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             let spv::Type::Vector(component_type, _) = xt else {
+//                 unreachable!();
+//             };
+
+//             let rt = component_type.of_vector(spv::VectorSize::Four);
+//             Some((
+//                 ctx.vector_shuffle_1(rt.clone(), x, vec![a as _, b as _, c as _, d as _]),
+//                 rt.into(),
+//             ))
+//         }
+//         &SimplifiedExpression::VectorShuffle4(v1, v2, a, b, c, d) => {
+//             let (v1, v1t) = emit_expr_spv_ops(body, v1.0, ctx).unwrap();
+//             let (v2, _) = emit_expr_spv_ops(body, v2.0, ctx).unwrap();
+//             let spv::Type::Vector(component_type, _) = v1t else {
+//                 unreachable!("v1t = {v1t:?}");
+//             };
+
+//             let rt = component_type.of_vector(spv::VectorSize::Four);
+//             Some((
+//                 ctx.vector_shuffle(rt.clone(), v1, v2, vec![a as _, b as _, c as _, d as _]),
+//                 rt.into(),
+//             ))
+//         }
+//         SimplifiedExpression::CanonicalPathRef(rp) => {
+//             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
+//                 Some(&GlobalAccessType::Direct(gv, ref vty, storage_class)) => {
+//                     Some((gv, vty.clone().of_pointer(storage_class)))
+//                 }
+//                 Some(&GlobalAccessType::PushConstantStruct {
+//                     struct_var,
+//                     member_index,
+//                     ref member_ty,
+//                 }) => {
+//                     let member_ty = member_ty
+//                         .clone()
+//                         .of_pointer(spv::asm::StorageClass::PushConstant);
+
+//                     let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
+//                     Some((
+//                         ctx.access_chain(member_ty.clone(), struct_var, vec![ac_index_id]),
+//                         member_ty,
+//                     ))
+//                 }
+//                 None => panic!("no corresponding canonical refpath found? {rp:?}"),
+//             }
+//         }
+//         SimplifiedExpression::LoadByCanonicalRefPath(rp) => {
+//             match ctx.entry_point_maps.refpath_to_global_var.get(rp) {
+//                 Some(GlobalAccessType::Direct(gv, vty, _)) => {
+//                     let (gv, vty) = (gv.clone(), vty.clone());
+
+//                     Some((ctx.load(vty.clone(), gv), vty))
+//                 }
+//                 Some(&GlobalAccessType::PushConstantStruct {
+//                     struct_var,
+//                     member_index,
+//                     ref member_ty,
+//                 }) => {
+//                     let member_ty = member_ty.clone();
+
+//                     let ac_index_id = ctx.module_ctx.request_const_id(member_index.into());
+//                     Some((
+//                         ctx.chained_load(
+//                             member_ty.clone(),
+//                             spv::asm::StorageClass::PushConstant,
+//                             struct_var,
+//                             vec![ac_index_id],
+//                         ),
+//                         member_ty,
+//                     ))
+//                 }
+//                 // TODO: あとで再帰組む
+//                 None => match rp {
+//                     RefPath::Member(root, index) => {
+//                         Some(match ctx.entry_point_maps.refpath_to_global_var.get(root) {
+//                             Some(GlobalAccessType::Direct(gv, vty, storage_class)) => {
+//                                 let (gv, vty) = (gv.clone(), vty.clone());
+//                                 let member_ty = match vty {
+//                                     spv::Type::Struct { member_types, .. } => {
+//                                         member_types[*index].ty.clone()
+//                                     }
+//                                     _ => unreachable!("cannot member ref"),
+//                                 };
+
+//                                 let ac_index_id =
+//                                     ctx.module_ctx.request_const_id((*index as u32).into());
+//                                 (
+//                                     ctx.chained_load(
+//                                         member_ty.clone(),
+//                                         *storage_class,
+//                                         gv,
+//                                         vec![ac_index_id],
+//                                     ),
+//                                     member_ty,
+//                                 )
+//                             }
+//                             Some(&GlobalAccessType::PushConstantStruct {
+//                                 struct_var,
+//                                 member_index,
+//                                 ref member_ty,
+//                             }) => {
+//                                 let member_ty = member_ty.clone();
+//                                 let final_ty = match member_ty {
+//                                     spv::Type::Struct { member_types, .. } => {
+//                                         member_types[*index].ty.clone()
+//                                     }
+//                                     _ => unreachable!("cannot member ref"),
+//                                 };
+
+//                                 let ac_index_id =
+//                                     ctx.module_ctx.request_const_id(member_index.into());
+//                                 let ac_index2_id =
+//                                     ctx.module_ctx.request_const_id((*index as u32).into());
+//                                 (
+//                                     ctx.chained_load(
+//                                         final_ty.clone(),
+//                                         spv::asm::StorageClass::PushConstant,
+//                                         struct_var,
+//                                         vec![ac_index_id, ac_index2_id],
+//                                     ),
+//                                     final_ty,
+//                                 )
+//                             }
+//                             None => panic!("no corresponding canonical refpath found? {rp:?}"),
+//                         })
+//                     }
+//                     _ => panic!("no corresponding canonical refpath found? {rp:?}"),
+//                 },
+//             }
+//         }
+//         SimplifiedExpression::ConstSInt(s, mods) => {
+//             let mut x: i32 = match s
+//                 .0
+//                 .slice
+//                 .strip_prefix("0x")
+//                 .or_else(|| s.0.slice.strip_prefix("0X"))
+//             {
+//                 Some(left) => i32::from_str_radix(left, 16).unwrap(),
+//                 None => s.0.slice.parse().unwrap(),
+//             };
+//             if mods.contains(ConstModifiers::NEGATE) {
+//                 x = -x;
+//             }
+//             if mods.contains(ConstModifiers::BIT_NOT) {
+//                 x = !x;
+//             }
+//             if mods.contains(ConstModifiers::LOGICAL_NOT) {
+//                 x = if x == 0 { 1 } else { 0 };
+//             }
+
+//             Some((
+//                 ctx.module_ctx.request_const_id(x.into()),
+//                 spv::Type::sint(32),
+//             ))
+//         }
+//         SimplifiedExpression::ConstUInt(s, mods) => {
+//             let mut x: u32 = match s
+//                 .0
+//                 .slice
+//                 .strip_prefix("0x")
+//                 .or_else(|| s.0.slice.strip_prefix("0X"))
+//             {
+//                 Some(left) => u32::from_str_radix(left, 16).unwrap(),
+//                 None => s.0.slice.parse().unwrap(),
+//             };
+//             if mods.contains(ConstModifiers::NEGATE) {
+//                 panic!("applying negate to unsigned number?");
+//             }
+//             if mods.contains(ConstModifiers::BIT_NOT) {
+//                 x = !x;
+//             }
+//             if mods.contains(ConstModifiers::LOGICAL_NOT) {
+//                 x = if x == 0 { 1 } else { 0 };
+//             }
+
+//             Some((
+//                 ctx.module_ctx.request_const_id(x.into()),
+//                 spv::Type::uint(32),
+//             ))
+//         }
+//         SimplifiedExpression::ConstFloat(s, mods) => {
+//             let mut x: f32 =
+//                 s.0.slice
+//                     .strip_suffix(['f', 'F'])
+//                     .unwrap_or(s.0.slice)
+//                     .parse()
+//                     .unwrap();
+//             if mods.contains(ConstModifiers::NEGATE) {
+//                 x = -x;
+//             }
+//             if mods.contains(ConstModifiers::BIT_NOT) {
+//                 x = unsafe { core::mem::transmute(!core::mem::transmute::<_, u32>(x)) };
+//             }
+//             if mods.contains(ConstModifiers::LOGICAL_NOT) {
+//                 x = if x != 0.0 { 0.0 } else { 1.0 };
+//             }
+
+//             Some((
+//                 ctx.module_ctx.request_const_id(x.into()),
+//                 spv::Type::float(32),
+//             ))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SubpassLoad", _, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+//             assert!(arg_ty.len() == 1 && arg_ty[0] == spv::Type::SUBPASS_DATA_IMAGE_TYPE);
+
+//             let rt = spv::Type::float(32).of_vector(4);
+//             let result_type = ctx.module_ctx.request_type_id(rt.clone());
+//             let result_id = ctx.new_id();
+//             let coordinate_const = ctx
+//                 .module_ctx
+//                 .request_const_id(spv::Constant::i32vec2(0, 0));
+//             ctx.ops.push(spv::Instruction::ImageRead {
+//                 result_type,
+//                 result: result_id,
+//                 image: args[0],
+//                 coordinate: coordinate_const,
+//             });
+//             Some((result_id, rt))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Dot#Float3", _, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+//             assert!(
+//                 arg_ty.len() == 2
+//                     && arg_ty
+//                         .iter()
+//                         .all(|t| *t == spv::Type::float(32).of_vector(3))
+//             );
+
+//             let rt = spv::Type::float(32);
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::Dot {
+//                 result_type,
+//                 result,
+//                 vector1: args[0],
+//                 vector2: args[1],
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Normalize#Float3", _, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+//             assert_eq!(arg_ty.len(), 1);
+//             assert_eq!(arg_ty[0], spv::Type::float(32).of_vector(3));
+
+//             let glsl_std_450_ext_set = ctx.module_ctx.request_ext_inst_set("GLSL.std.450".into());
+
+//             let rt = spv::Type::float(32).of_vector(3);
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::ExtInst {
+//                 result_type,
+//                 result,
+//                 set: glsl_std_450_ext_set,
+//                 instruction: 69,
+//                 operands: args,
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.Transpose#Float4x4", _, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+//             assert_eq!(arg_ty.len(), 1);
+//             assert_eq!(arg_ty[0], spv::Type::float(32).of_matrix(4, 4));
+
+//             let rt = spv::Type::float(32).of_matrix(4, 4);
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::Transpose {
+//                 result_type,
+//                 result,
+//                 matrix: args[0],
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.SampleAt#Texture2D", _, args) => {
+//             let (args, arg_ty): (Vec<_>, Vec<_>) = args
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap())
+//                 .unzip();
+//             assert_eq!(arg_ty.len(), 2);
+//             assert!(matches!(arg_ty[0], spv::Type::SampledImage { .. }));
+//             assert_eq!(arg_ty[1], spv::Type::float(32).of_vector(2));
+
+//             let rt = spv::Type::float(32).of_vector(4);
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::ImageSampleImplicitLod {
+//                 result_type,
+//                 result,
+//                 sampled_image: args[0],
+//                 coordinate: args[1],
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::IntrinsicFuncall("Cloth.Intrinsic.ExecutionBarrier", _, args) => {
+//             assert!(args.is_empty());
+
+//             // とりあえずGLSLに倣って固定値で出してるけどこれでいいんだろうか
+//             let execution_scope = ctx
+//                 .module_ctx
+//                 .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+//             let memory_scope = ctx
+//                 .module_ctx
+//                 .request_const_id(spv::Constant::from(spv::asm::Scope::Workgroup as u32));
+//             let semantics = ctx.module_ctx.request_const_id(spv::Constant::from(
+//                 (spv::asm::MemorySemantics::ACQUIRE_RELEASE
+//                     | spv::asm::MemorySemantics::WORKGROUP_MEMORY)
+//                     .bits(),
+//             ));
+//             ctx.ops.push(spv::Instruction::ControlBarrier {
+//                 execution: execution_scope,
+//                 memory: memory_scope,
+//                 semantics,
+//             });
+//             None
+//         }
+//         SimplifiedExpression::ChainedRef(base, xs) => {
+//             let (base, bty) = emit_expr_spv_ops(body, base.0, ctx).unwrap();
+//             let xs = xs
+//                 .iter()
+//                 .map(|x| emit_expr_spv_ops(body, x.0, ctx).unwrap().0)
+//                 .collect::<Vec<_>>();
+
+//             let spv::Type::Pointer(p) = bty else {
+//                 unreachable!()
+//             };
+//             let term_type = match body[expr_id].1 {
+//                 ConcreteType::Ref(ref inner) => &**inner,
+//                 ConcreteType::MutableRef(ref inner) => &**inner,
+//                 _ => unreachable!(),
+//             };
+
+//             // TODO: ここの型生成方法あとで考える
+//             let rt = term_type
+//                 .clone()
+//                 .make_spv_type(&SymbolScope::new_intrinsics())
+//                 .of_pointer(p.storage_class);
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::AccessChain {
+//                 base,
+//                 result_type,
+//                 result,
+//                 indexes: xs,
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::LoadRef(r) => {
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+
+//             let rt = rt.dereferenced().unwrap();
+//             let (result_type, result) = ctx.issue_typed_ids(rt.clone());
+//             ctx.ops.push(spv::Instruction::Load {
+//                 result_type,
+//                 result,
+//                 pointer: r,
+//             });
+//             Some((result, rt))
+//         }
+//         SimplifiedExpression::StoreRef(r, v) => {
+//             let (r, rt) = emit_expr_spv_ops(body, r.0, ctx).unwrap();
+//             let (v, vt) = emit_expr_spv_ops(body, v.0, ctx).unwrap();
+//             assert_eq!(rt.dereferenced(), Some(vt));
+//             ctx.ops.push(spv::Instruction::Store {
+//                 pointer: r,
+//                 object: v,
+//             });
+
+//             None
+//         }
+//         SimplifiedExpression::StoreOutput(x, o) => {
+//             let (x, _xt) = emit_expr_spv_ops(body, x.0, ctx).unwrap();
+//             ctx.ops.push(spv::Instruction::Store {
+//                 pointer: ctx.entry_point_maps.output_global_vars[*o],
+//                 object: x,
+//             });
+
+//             None
+//         }
+//         SimplifiedExpression::ScopedBlock {
+//             expressions,
+//             returning,
+//             ..
+//         } => emit_expr_spv_ops(expressions, returning.0, ctx),
+//         x => unimplemented!("{x:?}"),
+//     };
+
+//     ctx.emitted_expression_id.insert(expr_id, result.clone());
+//     result
+// }

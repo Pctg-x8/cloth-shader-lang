@@ -564,6 +564,24 @@ pub enum Instruction<IdType = Id> {
         vector1: IdType,
         vector2: IdType,
     },
+    ShiftRightLogical {
+        result_type: IdType,
+        result: IdType,
+        base: IdType,
+        shift: IdType,
+    },
+    ShiftRightArithmetic {
+        result_type: IdType,
+        result: IdType,
+        base: IdType,
+        shift: IdType,
+    },
+    ShiftLeftLogical {
+        result_type: IdType,
+        result: IdType,
+        base: IdType,
+        shift: IdType,
+    },
     BitwiseOr {
         result_type: IdType,
         result: IdType,
@@ -1362,6 +1380,39 @@ impl<IdType> Instruction<IdType> {
                 result: relocator(result),
                 vector1: relocator(vector1),
                 vector2: relocator(vector2),
+            },
+            Self::ShiftRightLogical {
+                result_type,
+                result,
+                base,
+                shift,
+            } => Instruction::ShiftRightLogical {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                base: relocator(base),
+                shift: relocator(shift),
+            },
+            Self::ShiftRightArithmetic {
+                result_type,
+                result,
+                base,
+                shift,
+            } => Instruction::ShiftRightArithmetic {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                base: relocator(base),
+                shift: relocator(shift),
+            },
+            Self::ShiftLeftLogical {
+                result_type,
+                result,
+                base,
+                shift,
+            } => Instruction::ShiftLeftLogical {
+                result_type: relocator(result_type),
+                result: relocator(result),
+                base: relocator(base),
+                shift: relocator(shift),
             },
             Self::BitwiseOr {
                 result_type,
@@ -2303,6 +2354,24 @@ impl Instruction<Id> {
                 vector1,
                 vector2,
             } => w.push_array([Self::opcode(5, 148), result_type, result, vector1, vector2]),
+            &Self::ShiftRightLogical {
+                result_type,
+                result,
+                base,
+                shift,
+            } => w.push_array([Self::opcode(5, 194), result_type, result, base, shift]),
+            &Self::ShiftRightArithmetic {
+                result_type,
+                result,
+                base,
+                shift,
+            } => w.push_array([Self::opcode(5, 195), result_type, result, base, shift]),
+            &Self::ShiftLeftLogical {
+                result_type,
+                result,
+                base,
+                shift,
+            } => w.push_array([Self::opcode(5, 196), result_type, result, base, shift]),
             &Self::BitwiseOr {
                 result_type,
                 result,

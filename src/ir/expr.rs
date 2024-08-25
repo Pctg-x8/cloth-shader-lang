@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use typed_arena::Arena;
 
@@ -18,7 +18,8 @@ use crate::{
 use super::{
     block::{
         transform_statement, Block, BlockFlowInstruction, BlockGenerationContext, BlockInstruction,
-        BlockInstructionEmitter, IntrinsicBinaryOperation, IntrinsicUnaryOperation, RegisterRef,
+        BlockInstructionEmitter, BlockRef, IntrinsicBinaryOperation, IntrinsicUnaryOperation,
+        RegisterRef,
     },
     ExprRef,
 };
@@ -527,8 +528,8 @@ impl ExprRef {
 
 pub struct SimplifyResult {
     pub result: RegisterRef,
-    pub start_block: usize,
-    pub end_block: usize,
+    pub start_block: BlockRef,
+    pub end_block: BlockRef,
 }
 
 pub struct SimplificationContext<'a, 's> {
@@ -614,6 +615,12 @@ pub fn simplify_expression<'a, 's>(
             let mut inst = BlockInstructionEmitter::new(block_ctx);
             let left_value = inst.loaded(left.result);
             let right_value = inst.loaded(right.result);
+            println!(
+                "binop {:?} {} {:?}",
+                left_value.ty(inst.generation_context),
+                op.slice,
+                right_value.ty(inst.generation_context)
+            );
             let result = binary_op(left_value, SourceRef::from(&op), right_value, &mut inst);
             let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
             assert!(
@@ -809,7 +816,9 @@ pub fn simplify_expression<'a, 's>(
                     // return unit
                     let result = block_ctx.alloc_register(IntrinsicType::Unit.into());
                     let block = block_ctx.add(Block {
-                        instructions: vec![BlockInstruction::ConstUnit(result)],
+                        instructions: [(result, BlockInstruction::ConstUnit)]
+                            .into_iter()
+                            .collect(),
                         flow: BlockFlowInstruction::Undetermined,
                     });
                     if let Some(b) = last_block {
@@ -1244,7 +1253,9 @@ pub fn simplify_expression<'a, 's>(
                 None => {
                     let result_register = block_ctx.alloc_register(IntrinsicType::Unit.into());
                     let perform_block = block_ctx.add(Block {
-                        instructions: vec![BlockInstruction::ConstUnit(result_register)],
+                        instructions: [(result_register, BlockInstruction::ConstUnit)]
+                            .into_iter()
+                            .collect(),
                         flow: BlockFlowInstruction::Undetermined,
                     });
 
@@ -1475,7 +1486,8 @@ pub fn simplify_expression<'a, 's>(
                 block_ctx.block_mut(condition.end_block).try_set_branch(
                     condition.result,
                     then.start_block,
-                    r#else.start_block
+                    r#else.start_block,
+                    merge_block
                 ),
                 "already chained?"
             );
@@ -1567,7 +1579,7 @@ pub fn binary_op<'a, 's>(
             Some(x) => x,
             None => {
                 eprintln!(
-                    "Error: cannot apply binary op {} between terms ({:?} and {:?})",
+                    "Error: cannot apply binary op {}({op:?}) between terms ({:?} and {:?})",
                     op.slice,
                     left.ty(inst.generation_context),
                     right.ty(inst.generation_context)
@@ -1767,7 +1779,7 @@ fn funcall<'a, 's>(
     callee: RegisterRef,
     mut args: Vec<RegisterRef>,
     block_ctx: &mut BlockGenerationContext<'a, 's>,
-) -> (RegisterRef, usize) {
+) -> (RegisterRef, BlockRef) {
     match block_ctx.register_type(callee) {
         &ConcreteType::IntrinsicTypeConstructor(t) => {
             let element_ty = t.scalar_type().unwrap();
@@ -1931,7 +1943,7 @@ fn funcall<'a, 's>(
                 &[n] => {
                     let result_register = block_ctx.alloc_register(*xs[n].1.clone());
                     let eval_block = block_ctx.add(Block {
-                        instructions: vec![],
+                        instructions: HashMap::new(),
                         flow: BlockFlowInstruction::Funcall {
                             callee, args, result: result_register, after_return: None
                         }

@@ -304,20 +304,8 @@ impl<'a, 's> SymbolScope<'a, 's> {
     }
 
     #[inline]
-    pub fn init_expr_id(&self, xid: usize) -> Option<ExprRef> {
-        self.local_vars.borrow().get(xid).map(|x| x.init_expr_id)
-    }
-
-    #[inline]
     pub fn all_local_var_ids(&self) -> impl Iterator<Item = usize> {
         0..self.local_vars.borrow().len()
-    }
-
-    #[inline]
-    pub fn relocate_local_var_init_expr(&self, mut relocator: impl FnMut(ExprRef) -> ExprRef) {
-        for l in self.local_vars.borrow_mut().iter_mut() {
-            l.init_expr_id = relocator(l.init_expr_id);
-        }
     }
 
     pub fn remove_local_var_by_id(&self, id: usize) {
@@ -435,17 +423,29 @@ impl<'a, 's> SymbolScope<'a, 's> {
         &self,
         name: SourceRef<'s>,
         ty: ConcreteType<'s>,
-        init_expr: ExprRef,
         mutable: bool,
     ) -> VarId {
         self.local_vars.borrow_mut().push(LocalVariable {
             occurence: name.clone(),
             ty,
-            init_expr_id: init_expr,
             mutable,
         });
         let vid = VarId::ScopeLocal(self.local_vars.borrow().len() - 1);
         self.var_id_by_name.borrow_mut().insert(name.slice, vid);
+        vid
+    }
+
+    pub fn declare_anon_local_var(&self, ty: ConcreteType<'s>, mutable: bool) -> VarId {
+        self.local_vars.borrow_mut().push(LocalVariable {
+            occurence: SourceRef {
+                slice: "",
+                line: 0,
+                col: 0,
+            },
+            ty,
+            mutable,
+        });
+        let vid = VarId::ScopeLocal(self.local_vars.borrow().len() - 1);
         vid
     }
 

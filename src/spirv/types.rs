@@ -242,8 +242,15 @@ impl<'s> ScalarOrVectorTypeView<'s> {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct PointerType {
+    pub storage_class: super::asm::StorageClass,
+    pub base: Type,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Type {
     Void,
+    Bool,
     Scalar(ScalarType),
     Vector(ScalarType, VectorSize),
     Matrix(VectorType, MatrixColumnCount),
@@ -275,7 +282,7 @@ pub enum Type {
     Opaque {
         name: String,
     },
-    Pointer(super::asm::StorageClass, Box<Type>),
+    Pointer(Box<PointerType>),
     Function {
         return_type: Box<Type>,
         parameter_types: Vec<Type>,
@@ -385,14 +392,17 @@ impl Type {
     }
 
     #[inline(always)]
-    pub fn of_pointer(self, storage: super::asm::StorageClass) -> Self {
-        Self::Pointer(storage, Box::new(self))
+    pub fn of_pointer(self, storage: super::asm::StorageClass) -> PointerType {
+        PointerType {
+            storage_class: storage,
+            base: self,
+        }
     }
 
     #[inline(always)]
     pub fn dereferenced(self) -> Option<Self> {
         match self {
-            Self::Pointer(_, t) => Some(*t),
+            Self::Pointer(p) => Some(p.base),
             _ => None,
         }
     }
@@ -413,5 +423,11 @@ impl Type {
             Self::Vector(x, c) => Some(ScalarOrVectorTypeView::Vector(x, *c)),
             _ => None,
         }
+    }
+}
+impl From<PointerType> for Type {
+    #[inline(always)]
+    fn from(value: PointerType) -> Self {
+        Self::Pointer(Box::new(value))
     }
 }

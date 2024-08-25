@@ -28,7 +28,6 @@ pub struct FunctionInputVariable<'s> {
 pub struct LocalVariable<'s> {
     pub occurence: SourceRef<'s>,
     pub ty: ConcreteType<'s>,
-    pub init_expr_id: ExprRef,
     pub mutable: bool,
 }
 
