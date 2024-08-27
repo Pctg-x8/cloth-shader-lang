@@ -13,7 +13,7 @@ use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
-        BlockGenerationContext, BlockRef,
+        BlockGenerationContext, BlockRef, RegisterRef,
     },
     expr::simplify_expression,
     opt::{
@@ -22,7 +22,8 @@ use ir::{
         deconstruct_effectless_phi, extract_constants, fold_const_ops, inline_function2,
         merge_constants, merge_simple_goto_blocks, optimize_pure_expr, promote_instantiate_const,
         resolve_intrinsic_funcalls, resolve_register_aliases, resolve_shader_io_ref_binds,
-        strip_unreachable_blocks, strip_write_only_local_memory, track_scope_local_var_aliases,
+        strip_unreachable_blocks, strip_unreferenced_registers, strip_write_only_local_memory,
+        track_scope_local_var_aliases,
     },
     FunctionBody,
 };
@@ -302,14 +303,6 @@ fn main() {
                         println!("    {id} at {scope:?} = {r:?}");
                     }
                 }
-                println!("Constants:");
-                for (k, v) in const_instructions.iter() {
-                    println!("  r{}: {v:?}", k.0);
-                }
-                let mut o = std::io::stdout().lock();
-                block_generation_context.dump_blocks(&mut o).unwrap();
-                o.flush().unwrap();
-                drop(o);
 
                 loop {
                     let modified = apply_local_var_states(
@@ -317,15 +310,17 @@ fn main() {
                         &const_instructions,
                         &scope_local_var_states,
                     );
-                    println!("ApplyLocalVarStates:");
-                    println!("Constants:");
-                    for (k, v) in const_instructions.iter() {
-                        println!("  r{}: {v:?}", k.0);
+                    println!("ApplyLocalVarStates(modified={modified}):");
+                    if modified {
+                        println!("Constants:");
+                        for (k, v) in const_instructions.iter() {
+                            println!("  r{}: {v:?}", k.0);
+                        }
+                        let mut o = std::io::stdout().lock();
+                        block_generation_context.dump_blocks(&mut o).unwrap();
+                        o.flush().unwrap();
+                        drop(o);
                     }
-                    let mut o = std::io::stdout().lock();
-                    block_generation_context.dump_blocks(&mut o).unwrap();
-                    o.flush().unwrap();
-                    drop(o);
 
                     if !modified {
                         break;
@@ -341,22 +336,17 @@ fn main() {
                             merge_simple_goto_blocks(&mut block_generation_context.blocks);
                         needs_reopt |= modified;
                         println!("Merged(perform={modified}):");
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
+                        if modified {
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
+                        }
 
                         if !modified {
                             break;
                         }
                     }
-
-                    needs_reopt |= strip_unreachable_blocks(&mut block_generation_context.blocks);
-                    println!("Stripped:");
-                    let mut o = std::io::stdout().lock();
-                    block_generation_context.dump_blocks(&mut o).unwrap();
-                    o.flush().unwrap();
-                    drop(o);
 
                     loop {
                         let mut modified = false;
@@ -369,10 +359,16 @@ fn main() {
                         needs_reopt |= modified;
 
                         println!("ConstPromotion(perform={modified}):");
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
+                        }
 
                         if !modified {
                             break;
@@ -388,14 +384,16 @@ fn main() {
                         needs_reopt |= modified;
 
                         println!("FoldConst(perform={modified}):");
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
                         }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
 
                         if !modified {
                             break;
@@ -407,14 +405,16 @@ fn main() {
                         needs_reopt |= modified;
 
                         println!("BlockAliasing(perform={modified}):");
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
                         }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
 
                         if !modified {
                             break;
@@ -429,14 +429,16 @@ fn main() {
                         needs_reopt |= modified;
 
                         println!("ResolveIntrinsicFuncalls(perform={modified}):");
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
                         }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
 
                         if !modified {
                             break;
@@ -451,14 +453,16 @@ fn main() {
                         needs_reopt |= modified;
 
                         println!("MergeDupConst(perform={modified}):");
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
                         }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
 
                         if !modified {
                             break;
@@ -473,6 +477,48 @@ fn main() {
                         }
                         needs_reopt = needs_reopt || modified;
                         println!("DeconstructUselessPhi(modified={modified}):");
+                        if modified {
+                            println!("Constants:");
+                            for (k, v) in const_instructions.iter() {
+                                println!("  r{}: {v:?}", k.0);
+                            }
+                            let mut o = std::io::stdout().lock();
+                            block_generation_context.dump_blocks(&mut o).unwrap();
+                            o.flush().unwrap();
+                            drop(o);
+                        }
+
+                        if !modified {
+                            break;
+                        }
+                    }
+                }
+
+                loop {
+                    let modified = strip_unreachable_blocks(&mut block_generation_context.blocks);
+
+                    println!("Stripped(modified={modified}):");
+                    if modified {
+                        let mut o = std::io::stdout().lock();
+                        block_generation_context.dump_blocks(&mut o).unwrap();
+                        o.flush().unwrap();
+                        drop(o);
+                    }
+
+                    if !modified {
+                        break;
+                    }
+                }
+
+                loop {
+                    let modified = strip_unreferenced_registers(
+                        &mut block_generation_context.blocks,
+                        &mut block_generation_context.registers,
+                        &mut const_instructions,
+                    );
+
+                    println!("StripUnreferencedRegisters(modified={modified}):");
+                    if modified {
                         println!("Constants:");
                         for (k, v) in const_instructions.iter() {
                             println!("  r{}: {v:?}", k.0);
@@ -481,20 +527,23 @@ fn main() {
                         block_generation_context.dump_blocks(&mut o).unwrap();
                         o.flush().unwrap();
                         drop(o);
+                    }
 
-                        if !modified {
-                            break;
-                        }
+                    if !modified {
+                        break;
                     }
                 }
 
                 println!("Optimized:");
-                println!("Constants:");
-                for (k, v) in const_instructions.iter() {
-                    println!("  r{}: {v:?}", k.0);
-                }
+                println!("Registers:");
                 let mut o = std::io::stdout().lock();
-                block_generation_context.dump_blocks(&mut o).unwrap();
+                for (n, r) in block_generation_context.registers.iter().enumerate() {
+                    match const_instructions.get(&RegisterRef(n)) {
+                        Some(c) => writeln!(o, "  r{n}: {r:?} = {c:?}").unwrap(),
+                        None => writeln!(o, "  r{n}: {r:?}").unwrap(),
+                    }
+                }
+                dump_blocks(&mut o, &block_generation_context.blocks).unwrap();
                 o.flush().unwrap();
                 drop(o);
 
@@ -641,7 +690,10 @@ fn main() {
             &body.borrow().constants,
         );
         println!("IR2:");
-        println!("{:#?}", ir2.instructions);
+        let mut o = std::io::stdout().lock();
+        crate::ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
+        o.flush().unwrap();
+        drop(o);
 
         unimplemented!("codegen");
 
@@ -1064,29 +1116,27 @@ fn optimize<'a, 's>(
         }
     }
 
-    // while inline_function1(&mut body.expressions, scope_arena) {}
+    loop {
+        let modified = strip_unreferenced_registers(
+            &mut body.blocks,
+            &mut body.registers,
+            &mut body.constants,
+        );
 
-    // let mut stdout = std::io::stdout().lock();
-    // writeln!(stdout, "inline function1:").unwrap();
-    // for (n, (x, t)) in body.expressions.iter().enumerate() {
-    //     ir::expr::print_simp_expr(&mut stdout, x, t, n, 0);
-    // }
-    // stdout.flush().unwrap();
-    // drop(stdout);
+        println!("StripUnreferencedRegisters(perform={modified}):");
+        let mut o = std::io::stdout().lock();
+        writeln!(o, "Constants:").unwrap();
+        for (k, v) in body.constants.iter() {
+            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
+        }
+        writeln!(o, "Registers:").unwrap();
+        dump_registers(&mut o, &body.registers).unwrap();
+        dump_blocks(&mut o, &body.blocks).unwrap();
+        o.flush().unwrap();
+        drop(o);
 
-    // optimize_pure_expr(
-    //     &mut body.expressions,
-    //     body.symbol_scope,
-    //     scope_arena,
-    //     Some(&mut body.returning.id),
-    //     refpaths,
-    // );
-
-    // let mut stdout = std::io::stdout().lock();
-    // writeln!(stdout, "optimized:").unwrap();
-    // for (n, (x, t)) in body.expressions.iter().enumerate() {
-    //     ir::expr::print_simp_expr(&mut stdout, x, t, n, 0);
-    // }
-    // writeln!(stdout, "returning {:?}", body.returning).unwrap();
-    // stdout.flush().unwrap();
+        if !modified {
+            break;
+        }
+    }
 }

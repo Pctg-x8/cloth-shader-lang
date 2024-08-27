@@ -124,7 +124,7 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
 
     for n in 0..blocks.len() {
         if let BlockFlowInstruction::Goto(next) = blocks[n].flow {
-            println!("[MergeSimpleGoto] n={n} next={}", next.0);
+            println!("[MergeSimpleGoto] b{n}->b{next}", next = next.0);
             let (current, merged) = unsafe {
                 (
                     &mut *blocks.as_mut_ptr().add(n),
@@ -132,14 +132,10 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                 )
             };
 
-            if merged
-                .instructions
-                .values()
-                .all(|x| !x.is_block_dependent())
-            {
+            if !merged.has_block_dependent_instructions() {
                 current
                     .instructions
-                    .extend(merged.instructions.iter().map(|(k, v)| (*k, v.clone())));
+                    .extend(merged.instructions.iter().map(|(&r, x)| (r, x.clone())));
                 current.flow = merged.flow.clone();
 
                 match merged.flow {
@@ -157,18 +153,9 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                         ..
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_after.0);
                         for x in blocks[new_after.0].instructions.values_mut() {
-                            match x {
-                                BlockInstruction::Phi(ref mut incoming_selectors) => {
-                                    eprintln!(
-                                        "*dbg* n={n} next={} new_after={}",
-                                        next.0, new_after.0
-                                    );
-                                    let cloned_register = incoming_selectors[&next];
-                                    incoming_selectors.insert(BlockRef(n), cloned_register);
-                                }
-                                _ => (),
-                            }
+                            x.dup_phi_incoming(next, BlockRef(n));
                         }
                     }
                     BlockFlowInstruction::Conditional {
@@ -177,31 +164,13 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                         ..
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_true_after.0);
                         for x in blocks[new_true_after.0].instructions.values_mut() {
-                            match x {
-                                BlockInstruction::Phi(ref mut incoming_selectors) => {
-                                    eprintln!(
-                                        "*dbg* n={n} next={} new_true_after={}",
-                                        next.0, new_true_after.0
-                                    );
-                                    let cloned_register = incoming_selectors[&next];
-                                    incoming_selectors.insert(BlockRef(n), cloned_register);
-                                }
-                                _ => (),
-                            }
+                            x.dup_phi_incoming(next, BlockRef(n));
                         }
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_false_after.0);
                         for x in blocks[new_false_after.0].instructions.values_mut() {
-                            match x {
-                                BlockInstruction::Phi(ref mut incoming_selectors) => {
-                                    eprintln!(
-                                        "*dbg* n={n} next={} new_false_after={}",
-                                        next.0, new_false_after.0
-                                    );
-                                    let cloned_register = incoming_selectors[&next];
-                                    incoming_selectors.insert(BlockRef(n), cloned_register);
-                                }
-                                _ => (),
-                            }
+                            x.dup_phi_incoming(next, BlockRef(n));
                         }
                     }
                     BlockFlowInstruction::ConditionalLoop {
@@ -210,31 +179,13 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                         ..
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_break_after.0);
                         for x in blocks[new_break_after.0].instructions.values_mut() {
-                            match x {
-                                BlockInstruction::Phi(ref mut incoming_selectors) => {
-                                    eprintln!(
-                                        "*dbg* n={n} next={} new_break_after={}",
-                                        next.0, new_break_after.0
-                                    );
-                                    let cloned_register = incoming_selectors[&next];
-                                    incoming_selectors.insert(BlockRef(n), cloned_register);
-                                }
-                                _ => (),
-                            }
+                            x.dup_phi_incoming(next, BlockRef(n));
                         }
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_body_after.0);
                         for x in blocks[new_body_after.0].instructions.values_mut() {
-                            match x {
-                                BlockInstruction::Phi(ref mut incoming_selectors) => {
-                                    eprintln!(
-                                        "*dbg* n={n} next={} new_body_after={}",
-                                        next.0, new_body_after.0
-                                    );
-                                    let cloned_register = incoming_selectors[&next];
-                                    incoming_selectors.insert(BlockRef(n), cloned_register);
-                                }
-                                _ => (),
-                            }
+                            x.dup_phi_incoming(next, BlockRef(n));
                         }
                     }
                     BlockFlowInstruction::Return(_)
@@ -813,17 +764,12 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
     let block_aliases_to = blocks
         .iter()
         .enumerate()
-        .filter_map(|(n, b)| {
-            // extract goto only block
-            if !b.instructions.is_empty() {
-                return None;
-            }
-
-            if let BlockFlowInstruction::Goto(to) = b.flow {
-                Some((BlockRef(n), to))
-            } else {
-                None
-            }
+        .filter_map(|(n, b)| match b {
+            &Block {
+                ref instructions,
+                flow: BlockFlowInstruction::Goto(to),
+            } if instructions.is_empty() => Some((BlockRef(n), to)),
+            _ => None,
         })
         .collect::<HashMap<_, _>>();
 
@@ -834,11 +780,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(next) {
                     // skip先のphiにnextからのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(&next) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*next, BlockRef(n));
                     }
 
                     *next = skip;
@@ -852,11 +794,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(next) {
                     // skip先のphiにnextからのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(&next) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*next, BlockRef(n));
                     }
 
                     *next = skip;
@@ -870,11 +808,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(next) {
                     // skip先のphiにnextからのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(&next) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*next, BlockRef(n));
                     }
 
                     *next = skip;
@@ -888,11 +822,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(next) {
                     // skip先のphiにnextからのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(&next) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*next, BlockRef(n));
                     }
 
                     *next = skip;
@@ -907,11 +837,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(r#true) {
                     // skip先のphiに分岐先からのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(r#true) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*r#true, BlockRef(n));
                     }
 
                     *r#true = skip;
@@ -921,14 +847,35 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 if let Some(&skip) = block_aliases_to.get(r#false) {
                     // skip先のphiに分岐先からのものがあったらコピー
                     for x in blocks[skip.0].instructions.values_mut() {
-                        if let BlockInstruction::Phi(ref mut incoming_selectors) = x {
-                            if let Some(r) = incoming_selectors.get(r#false) {
-                                incoming_selectors.insert(BlockRef(n), *r);
-                            }
-                        }
+                        x.dup_phi_incoming(*r#false, BlockRef(n));
                     }
 
                     *r#false = skip;
+                    modified = true;
+                }
+            }
+            BlockFlowInstruction::ConditionalLoop {
+                ref mut r#break,
+                ref mut body,
+                ..
+            } => {
+                if let Some(&skip) = block_aliases_to.get(r#break) {
+                    // skip先のphiに分岐先からのものがあったらコピー
+                    for x in blocks[skip.0].instructions.values_mut() {
+                        x.dup_phi_incoming(*r#break, BlockRef(n));
+                    }
+
+                    *r#break = skip;
+                    modified = true;
+                }
+
+                if let Some(&skip) = block_aliases_to.get(body) {
+                    // skip先のphiに分岐先からのものがあったらコピー
+                    for x in blocks[skip.0].instructions.values_mut() {
+                        x.dup_phi_incoming(*body, BlockRef(n));
+                    }
+
+                    *body = skip;
                     modified = true;
                 }
             }
@@ -1022,99 +969,30 @@ pub fn merge_constants<'a, 's>(
         }
     }
 
-    println!("merge const:");
-    for (x, r) in const_to_register_map.iter() {
-        println!("  r{} = {x:?}", r.0);
-    }
-    println!("register rewrite map:");
-    for (from, to) in register_rewrite_map.iter() {
-        println!("  r{} -> r{}", from.0, to.0);
-    }
-
-    let mut modified = false;
-    for b in blocks.iter_mut() {
-        for n in b.instructions.values_mut() {
-            let m1 = n.relocate_register(|r| {
-                while let Some(&&nr) = register_rewrite_map.get(r) {
-                    *r = nr;
-                }
-            });
-
-            modified = modified || m1;
-        }
-
-        match b.flow {
-            BlockFlowInstruction::StoreRef {
-                ref mut ptr,
-                ref mut value,
-                ..
-            } => {
-                while let Some(&&nr) = register_rewrite_map.get(ptr) {
-                    *ptr = nr;
-                    modified = true;
-                }
-                while let Some(&&nr) = register_rewrite_map.get(value) {
-                    *value = nr;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::Funcall {
-                ref mut callee,
-                ref mut args,
-                ..
-            } => {
-                while let Some(&&nr) = register_rewrite_map.get(callee) {
-                    *callee = nr;
-                    modified = true;
-                }
-
-                for a in args.iter_mut() {
-                    while let Some(&&nr) = register_rewrite_map.get(a) {
-                        *a = nr;
-                        modified = true;
-                    }
-                }
-            }
-            BlockFlowInstruction::IntrinsicImpureFuncall { ref mut args, .. } => {
-                for a in args.iter_mut() {
-                    while let Some(&&nr) = register_rewrite_map.get(a) {
-                        *a = nr;
-                        modified = true;
-                    }
-                }
-            }
-            BlockFlowInstruction::Conditional { ref mut source, .. } => {
-                while let Some(&&nr) = register_rewrite_map.get(source) {
-                    *source = nr;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::ConditionalLoop {
-                ref mut condition, ..
-            } => {
-                while let Some(&&nr) = register_rewrite_map.get(condition) {
-                    *condition = nr;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::Return(ref mut r) => {
-                while let Some(&&nr) = register_rewrite_map.get(r) {
-                    *r = nr;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::Break
-            | BlockFlowInstruction::Continue
-            | BlockFlowInstruction::Undetermined
-            | BlockFlowInstruction::Goto(_) => (),
+    if !register_rewrite_map.is_empty() {
+        println!("register rewrite map:");
+        for (from, to) in register_rewrite_map.iter() {
+            println!("  r{} -> r{}", from.0, to.0);
         }
     }
+
+    let mut modified = blocks.iter_mut().fold(false, |m, b| {
+        let m1 = b.relocate_register(|r| {
+            while let Some(&&nr) = register_rewrite_map.get(r) {
+                *r = nr;
+            }
+        });
+
+        m || m1
+    });
 
     let alive_const_registers = const_to_register_map
         .into_values()
         .copied()
         .collect::<HashSet<_>>();
+    let old_const_map_len = const_map.len();
     const_map.retain(|k, _| alive_const_registers.contains(k));
+    modified = modified || const_map.len() != old_const_map_len;
 
     modified
 }
@@ -1907,6 +1785,143 @@ pub fn resolve_register_aliases<'a, 's>(
             }
         });
         modified = modified || m;
+    }
+
+    modified
+}
+
+pub fn strip_unreferenced_registers(
+    blocks: &mut [Block],
+    registers: &mut Vec<ConcreteType>,
+    const_map: &mut HashMap<RegisterRef, BlockInstruction>,
+) -> bool {
+    let mut referenced_registers = HashSet::new();
+    for b in blocks.iter() {
+        for x in b.instructions.values() {
+            match x {
+                BlockInstruction::ConstUnit
+                | BlockInstruction::ConstInt(_)
+                | BlockInstruction::ConstNumber(_)
+                | BlockInstruction::ConstSInt(_)
+                | BlockInstruction::ConstUInt(_)
+                | BlockInstruction::ConstFloat(_)
+                | BlockInstruction::ImmBool(_)
+                | BlockInstruction::ImmSInt(_)
+                | BlockInstruction::ImmUInt(_)
+                | BlockInstruction::ImmInt(_)
+                | BlockInstruction::ScopeLocalVarRef(_, _)
+                | BlockInstruction::FunctionInputVarRef(_, _)
+                | BlockInstruction::IntrinsicTypeConstructorRef(_)
+                | BlockInstruction::IntrinsicFunctionRef(_)
+                | BlockInstruction::UserDefinedFunctionRef(_, _)
+                | BlockInstruction::BuiltinIORef(_)
+                | BlockInstruction::DescriptorRef { .. }
+                | BlockInstruction::PushConstantRef(_)
+                | BlockInstruction::WorkgroupSharedMemoryRef(_)
+                | BlockInstruction::StaticPathRef(_) => (),
+                &BlockInstruction::MemberRef(x, _)
+                | &BlockInstruction::TupleRef(x, _)
+                | &BlockInstruction::IntrinsicUnaryOp(x, _)
+                | &BlockInstruction::Cast(x, _)
+                | &BlockInstruction::PromoteIntToNumber(x)
+                | &BlockInstruction::InstantiateIntrinsicTypeClass(x, _)
+                | &BlockInstruction::LoadRef(x)
+                | &BlockInstruction::Swizzle(x, _)
+                | &BlockInstruction::SwizzleRef(x, _)
+                | &BlockInstruction::RegisterAlias(x) => {
+                    referenced_registers.insert(x);
+                }
+                &BlockInstruction::IntrinsicBinaryOp(x, _, y)
+                | &BlockInstruction::ArrayRef {
+                    source: x,
+                    index: y,
+                } => {
+                    referenced_registers.extend([x, y]);
+                }
+                &BlockInstruction::ConstructTuple(ref xs)
+                | &BlockInstruction::ConstructStruct(ref xs)
+                | &BlockInstruction::ConstructIntrinsicComposite(_, ref xs)
+                | &BlockInstruction::PureIntrinsicCall(_, ref xs) => {
+                    referenced_registers.extend(xs.iter().copied());
+                }
+                &BlockInstruction::Phi(ref xs) => {
+                    referenced_registers.extend(xs.values().copied());
+                }
+                &BlockInstruction::PureFuncall(callee, ref xs) => {
+                    referenced_registers.insert(callee);
+                    referenced_registers.extend(xs.iter().copied());
+                }
+            }
+        }
+
+        match b.flow {
+            BlockFlowInstruction::StoreRef { ptr, value, .. } => {
+                referenced_registers.extend([ptr, value]);
+            }
+            BlockFlowInstruction::Funcall {
+                callee, ref args, ..
+            } => {
+                referenced_registers.insert(callee);
+                referenced_registers.extend(args.iter().copied());
+            }
+            BlockFlowInstruction::IntrinsicImpureFuncall { ref args, .. } => {
+                referenced_registers.extend(args.iter().copied());
+            }
+            BlockFlowInstruction::Conditional { source, .. } => {
+                referenced_registers.insert(source);
+            }
+            BlockFlowInstruction::ConditionalLoop { condition, .. } => {
+                referenced_registers.insert(condition);
+            }
+            BlockFlowInstruction::Return(r) => {
+                referenced_registers.insert(r);
+            }
+            BlockFlowInstruction::Break
+            | BlockFlowInstruction::Continue
+            | BlockFlowInstruction::Undetermined
+            | BlockFlowInstruction::Goto(_) => (),
+        }
+    }
+
+    let mut stripped_registers = (0..registers.len())
+        .map(RegisterRef)
+        .filter(|x| !referenced_registers.contains(x))
+        .collect::<Vec<_>>();
+    let mut modified = false;
+    while let Some(stripped) = stripped_registers.pop() {
+        let swapped_register = RegisterRef(registers.len() - 1);
+        registers.swap_remove(stripped.0);
+        modified = true;
+
+        const_map.remove(&stripped);
+        if swapped_register != stripped {
+            if let Some(s) = const_map.remove(&swapped_register) {
+                const_map.insert(stripped, s);
+            }
+        }
+        for b in blocks.iter_mut() {
+            b.instructions.remove(&stripped);
+
+            if swapped_register != stripped {
+                if let Some(s) = b.instructions.remove(&swapped_register) {
+                    b.instructions.insert(stripped, s);
+                }
+
+                for x in b.instructions.values_mut() {
+                    x.relocate_register(|r| {
+                        if r == &swapped_register {
+                            *r = stripped;
+                        }
+                    });
+                }
+
+                b.flow.relocate_register(|r| {
+                    if r == &swapped_register {
+                        *r = stripped;
+                    }
+                });
+            }
+        }
     }
 
     modified

@@ -269,6 +269,15 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
+    pub fn dup_phi_incoming(&mut self, old: BlockRef, new: BlockRef) {
+        if let Self::Phi(ref mut incomings) = self {
+            if let Some(&r) = incomings.get(&old) {
+                incomings.insert(new, r);
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn try_instantiate_const(&self) -> Option<InstantiatedConst> {
         match self {
             Self::ConstInt(v) => Some(InstantiatedConst::Int(v.instantiate())),
@@ -507,6 +516,22 @@ pub struct Block<'a, 's> {
     pub flow: BlockFlowInstruction,
 }
 impl<'a, 's> Block<'a, 's> {
+    #[inline(always)]
+    pub fn has_block_dependent_instructions(&self) -> bool {
+        self.instructions.values().any(|x| x.is_block_dependent())
+    }
+
+    #[inline(always)]
+    pub fn relocate_register(&mut self, relocator: impl FnMut(&mut RegisterRef) + Copy) -> bool {
+        let mod_insts = self
+            .instructions
+            .values_mut()
+            .fold(false, |m, x| x.relocate_register(relocator) || m);
+        let mod_flow = self.flow.relocate_register(relocator);
+
+        mod_insts || mod_flow
+    }
+
     pub fn try_set_next(&mut self, next: BlockRef) -> bool {
         match self.flow {
             BlockFlowInstruction::Undetermined => {
