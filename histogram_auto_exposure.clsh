@@ -74,7 +74,7 @@ aggregate env: HistogramAggregateEnv does
 
     barrier()
     cutoff >>= 1
-  
+
   if env.localIndex == 0 then
     # final computation is only in single thread
 
@@ -95,7 +95,8 @@ aggregate env: HistogramAggregateEnv does
       percentileFilterRange.y -= lumPixels
 
       accumulator += Float2(lumPixels * env `computeEv100FromBinIndex` (i - 1), lumPixels)
-    
+      i += 1
+
     let weightedAvgEv100 = clamp(accumulator.x / accumulator.y, env.exposureMinEv, env.exposureMaxEv)
     let newExposure = 1.0 / (exp2 weightedAvgEv100 * 1.2f)
 

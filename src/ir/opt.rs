@@ -7,7 +7,7 @@ use typed_arena::Arena;
 
 use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
-    ir::{block::RegisterRef, expr::print_simp_expr},
+    ir::block::RegisterRef,
     parser::FunctionDeclarationInputArguments,
     ref_path::RefPath,
     scope::{self, SymbolScope, VarId},
@@ -132,7 +132,7 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                 )
             };
 
-            if !merged.has_block_dependent_instructions() {
+            if !merged.has_block_dependent_instructions() && !merged.is_loop_term_block() {
                 current
                     .instructions
                     .extend(merged.instructions.iter().map(|(&r, x)| (r, x.clone())));
@@ -188,9 +188,10 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                             x.dup_phi_incoming(next, BlockRef(n));
                         }
                     }
+                    BlockFlowInstruction::Break | BlockFlowInstruction::Continue => {
+                        unreachable!("break/continue cannot determine new_after")
+                    }
                     BlockFlowInstruction::Return(_)
-                    | BlockFlowInstruction::Break
-                    | BlockFlowInstruction::Continue
                     | BlockFlowInstruction::Undetermined
                     | BlockFlowInstruction::StoreRef { after: None, .. }
                     | BlockFlowInstruction::Funcall {
@@ -772,6 +773,10 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
             _ => None,
         })
         .collect::<HashMap<_, _>>();
+
+    for (from, to) in block_aliases_to.iter() {
+        println!("[block alias] b{} = b{}", from.0, to.0);
+    }
 
     let mut modified = false;
     for n in 0..blocks.len() {
@@ -1920,6 +1925,11 @@ pub fn strip_unreferenced_registers(
                         *r = stripped;
                     }
                 });
+                b.flow.relocate_result_register(|r| {
+                    if r == &swapped_register {
+                        *r = stripped;
+                    }
+                });
             }
         }
     }
@@ -2373,7 +2383,7 @@ pub fn deconstruct_effectless_phi(
     instructions: &mut HashMap<RegisterRef, BlockInstruction>,
 ) -> bool {
     let mut modified = false;
-    for x in instructions.values_mut() {
+    for (r, x) in instructions.iter_mut() {
         match x {
             BlockInstruction::Phi(xs) => {
                 let unique_registers = xs
@@ -2388,6 +2398,15 @@ pub fn deconstruct_effectless_phi(
                     &[r] => {
                         *x = BlockInstruction::RegisterAlias(r);
                         modified = true;
+                    }
+                    &[r1, r2] => {
+                        if r1 == *r && r2 != *r {
+                            *x = BlockInstruction::RegisterAlias(r2);
+                            modified = true;
+                        } else if r1 != *r && r2 == *r {
+                            *x = BlockInstruction::RegisterAlias(r1);
+                            modified = true;
+                        }
                     }
                     _ => (),
                 }
@@ -2705,125 +2724,6 @@ fn promote_single_scope<'a, 's>(
     }
 }
 
-fn unfold_pure_computation_scopes<'a, 's>(
-    expressions: &mut Vec<(SimplifiedExpression<'a, 's>, ConcreteType<'s>)>,
-    scope: &'a SymbolScope<'a, 's>,
-    block_returning_ref: &mut Option<&mut ExprRef>,
-) -> bool {
-    let mut tree_modified = false;
-
-    println!("[unlift input]");
-    let mut so = std::io::stdout().lock();
-    for (n, (x, xt)) in expressions.iter().enumerate() {
-        print_simp_expr(&mut so, x, xt, n, 0);
-    }
-    so.flush().unwrap();
-    drop(so);
-
-    let mut n = 0;
-    while n < expressions.len() {
-        match &mut expressions[n] {
-            (
-                SimplifiedExpression::ScopedBlock {
-                    expressions: scope_expr,
-                    symbol_scope,
-                    returning,
-                    capturing,
-                },
-                _,
-            ) if !symbol_scope.0.has_local_vars()
-                && scope_expr
-                    .iter()
-                    .enumerate()
-                    .all(|(n, _)| ExprRef(n).is_pure(&scope_expr)) =>
-            {
-                assert_eq!(returning.0, scope_expr.len() - 1);
-
-                // relocate scope local ids and unlift scope capture refs
-                for x in scope_expr.iter_mut() {
-                    println!("[unlift reloc] {x:?}");
-
-                    x.0.relocate_ref(|x| x + n);
-                    match &mut x.0 {
-                        &mut SimplifiedExpression::AliasScopeCapture(n) => {
-                            x.0 = match capturing[n] {
-                                ScopeCaptureSource::Expr(x) => SimplifiedExpression::Alias(x),
-                                ScopeCaptureSource::Capture(x) => {
-                                    SimplifiedExpression::AliasScopeCapture(x)
-                                }
-                            };
-                        }
-                        &mut SimplifiedExpression::ScopedBlock {
-                            capturing: ref mut inner_capturing,
-                            ..
-                        } => {
-                            println!("inner scope captures: {inner_capturing:?}");
-
-                            for c in inner_capturing.iter_mut() {
-                                match c {
-                                    &mut ScopeCaptureSource::Capture(n) => {
-                                        println!(
-                                            "promotecapture: Capture({n}) -> {:?}",
-                                            capturing[n]
-                                        );
-
-                                        *c = capturing[n];
-                                    }
-                                    _ => (),
-                                }
-                            }
-                        }
-                        _ => (),
-                    }
-                }
-
-                let first_expr = scope_expr.pop().unwrap();
-                let (
-                    SimplifiedExpression::ScopedBlock {
-                        expressions: mut scope_expr,
-                        ..
-                    },
-                    _,
-                ) = core::mem::replace(&mut expressions[n], first_expr)
-                else {
-                    unreachable!();
-                };
-                let nth_shifts = scope_expr.len();
-                while let Some(x) = scope_expr.pop() {
-                    expressions.insert(n, x);
-                }
-
-                // rewrite shifted reference
-                for m in n + nth_shifts + 1..expressions.len() {
-                    expressions[m]
-                        .0
-                        .relocate_ref(|x| if x >= n { x + nth_shifts } else { x });
-                }
-
-                if let Some(ref mut ret) = block_returning_ref {
-                    ret.0 += if ret.0 >= n { nth_shifts } else { 0 };
-                }
-
-                println!("[unlift scope]");
-                let mut so = std::io::stdout().lock();
-                for (n, (x, xt)) in expressions.iter().enumerate() {
-                    print_simp_expr(&mut so, x, xt, n, 0);
-                }
-                so.flush().unwrap();
-                drop(so);
-
-                n += nth_shifts + 1;
-                tree_modified = true;
-            }
-            _ => {
-                n += 1;
-            }
-        }
-    }
-
-    tree_modified
-}
-
 fn construct_refpath<'a, 's>(
     body: &[(SimplifiedExpression<'a, 's>, ConcreteType<'s>)],
     expr_id: ExprRef,
@@ -2880,8 +2780,6 @@ pub fn optimize_pure_expr<'a, 's>(
         tree_modified = false;
 
         tree_modified |= promote_single_scope(expressions, &mut block_returning_ref);
-        tree_modified |=
-            unfold_pure_computation_scopes(expressions, scope, &mut block_returning_ref);
         tree_modified |= flatten_composite_outputs(expressions, scope, scope_arena);
 
         // reference canonicalize

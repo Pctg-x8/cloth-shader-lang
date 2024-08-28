@@ -73,13 +73,41 @@ pub enum BlockFlowInstruction {
     Undetermined,
 }
 impl BlockFlowInstruction {
+    pub fn relocate_result_register(
+        &mut self,
+        mut relocator: impl FnMut(&mut RegisterRef),
+    ) -> bool {
+        match self {
+            Self::Funcall { ref mut result, .. }
+            | Self::IntrinsicImpureFuncall { ref mut result, .. } => {
+                let x0 = result.0;
+                relocator(result);
+                result.0 != x0
+            }
+            Self::Goto(_)
+            | Self::StoreRef { .. }
+            | Self::Conditional { .. }
+            | Self::ConditionalLoop { .. }
+            | Self::Break
+            | Self::Continue
+            | Self::Return(_)
+            | Self::Undetermined => false,
+        }
+    }
+
     pub fn relocate_register(&mut self, mut relocator: impl FnMut(&mut RegisterRef)) -> bool {
         match self {
             Self::Goto(_) => false,
-            Self::StoreRef { ref mut value, .. } => {
+            Self::StoreRef {
+                ref mut ptr,
+                ref mut value,
+                ..
+            } => {
                 let x0 = value.0;
                 relocator(value);
-                value.0 != x0
+                let p0 = ptr.0;
+                relocator(ptr);
+                value.0 != x0 || ptr.0 != p0
             }
             Self::Funcall {
                 ref mut callee,
@@ -519,6 +547,14 @@ impl<'a, 's> Block<'a, 's> {
     #[inline(always)]
     pub fn has_block_dependent_instructions(&self) -> bool {
         self.instructions.values().any(|x| x.is_block_dependent())
+    }
+
+    #[inline(always)]
+    pub fn is_loop_term_block(&self) -> bool {
+        matches!(
+            self.flow,
+            BlockFlowInstruction::Break | BlockFlowInstruction::Continue
+        )
     }
 
     #[inline(always)]
@@ -1172,7 +1208,9 @@ pub fn dump_blocks(
         writeln!(writer, "b{n}: {{")?;
 
         if !b.instructions.is_empty() {
-            for (RegisterRef(r), i) in b.instructions.iter() {
+            let mut sorted = b.instructions.iter().collect::<Vec<_>>();
+            sorted.sort_by_key(|&(&RegisterRef(r), _)| r);
+            for (RegisterRef(r), i) in sorted {
                 write!(writer, "  r{r} = ")?;
                 i.dump(writer)?;
                 writer.write(b"\n")?;

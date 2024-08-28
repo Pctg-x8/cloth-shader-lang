@@ -13,7 +13,7 @@ use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
-        BlockGenerationContext, BlockRef, RegisterRef,
+        BlockGenerationContext, BlockInstruction, BlockRef, RegisterRef,
     },
     expr::simplify_expression,
     opt::{
@@ -304,28 +304,88 @@ fn main() {
                     }
                 }
 
+                let mut last_ir_document = build_ir_document(
+                    &block_generation_context.registers,
+                    &const_instructions,
+                    &block_generation_context.blocks,
+                );
+                fn perform_log(
+                    fname: &parser::Token,
+                    step_name: &str,
+                    modified: bool,
+                    last_irdoc: &mut String,
+                    blocks: &[Block],
+                    registers: &[ConcreteType],
+                    const_map: &HashMap<RegisterRef, BlockInstruction>,
+                ) {
+                    print_step_header(fname.slice, step_name, modified);
+
+                    if modified {
+                        let next_irdoc = build_ir_document(registers, const_map, blocks);
+
+                        let diff = similar::TextDiff::from_lines(last_irdoc, &next_irdoc);
+                        let mut o = std::io::stdout().lock();
+                        for c in diff.iter_all_changes() {
+                            let sign = match c.tag() {
+                                similar::ChangeTag::Equal => " ",
+                                similar::ChangeTag::Insert => "+",
+                                similar::ChangeTag::Delete => "-",
+                            };
+
+                            write!(o, "{sign}{c}").unwrap();
+                        }
+                        o.flush().unwrap();
+                        drop(o);
+
+                        *last_irdoc = next_irdoc;
+                    }
+                }
+
                 loop {
                     let modified = apply_local_var_states(
                         &mut block_generation_context.blocks,
                         &const_instructions,
                         &scope_local_var_states,
                     );
-                    println!("ApplyLocalVarStates(modified={modified}):");
-                    if modified {
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
-                        }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
-                    }
+
+                    perform_log(
+                        &f.fname_token,
+                        "ApplyLocalVarStates",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_generation_context.registers,
+                        &const_instructions,
+                    );
 
                     if !modified {
                         break;
                     }
                 }
+
+                let local_memory_usages = collect_scope_local_memory_usages(
+                    &block_generation_context.blocks,
+                    &const_instructions,
+                );
+                println!("LocalMemoryUsages:");
+                for ((scope, id), usage) in local_memory_usages.iter() {
+                    println!("  {id} @ {scope:?}: {usage:?}");
+                }
+
+                let modified = strip_write_only_local_memory(
+                    &mut block_generation_context.blocks,
+                    &const_instructions,
+                    &local_memory_usages,
+                );
+                perform_log(
+                    &f.fname_token,
+                    "StripWriteOnlyLocalMemory",
+                    modified,
+                    &mut last_ir_document,
+                    &block_generation_context.blocks,
+                    &block_generation_context.registers,
+                    &const_instructions,
+                );
 
                 let mut needs_reopt = true;
                 while needs_reopt {
@@ -333,67 +393,112 @@ fn main() {
 
                     loop {
                         let modified =
+                            block_generation_context
+                                .blocks
+                                .iter_mut()
+                                .fold(false, |m, b| {
+                                    let m1 = promote_instantiate_const(
+                                        &mut b.instructions,
+                                        &mut const_instructions,
+                                    );
+                                    m || m1
+                                });
+                        needs_reopt |= modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "PromoteInstantiateConst",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+
+                    loop {
+                        let modified =
+                            block_generation_context
+                                .blocks
+                                .iter_mut()
+                                .fold(false, |m, b| {
+                                    let m1 = fold_const_ops(
+                                        &mut b.instructions,
+                                        &mut const_instructions,
+                                    );
+                                    m || m1
+                                });
+                        needs_reopt |= modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "FoldConst",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+
+                    {
+                        let modified = merge_constants(
+                            &mut block_generation_context.blocks,
+                            &mut const_instructions,
+                        );
+                        needs_reopt |= modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "UnifyConstants",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
+                    }
+
+                    {
+                        let modified = resolve_intrinsic_funcalls(
+                            &mut block_generation_context,
+                            &const_instructions,
+                        );
+                        needs_reopt |= modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "ResolveIntrinsicFuncalls",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
+                    }
+
+                    loop {
+                        let modified =
                             merge_simple_goto_blocks(&mut block_generation_context.blocks);
                         needs_reopt |= modified;
-                        println!("Merged(perform={modified}):");
-                        if modified {
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
 
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let mut modified = false;
-                        for b in block_generation_context.blocks.iter_mut() {
-                            modified |= promote_instantiate_const(
-                                &mut b.instructions,
-                                &mut const_instructions,
-                            );
-                        }
-                        needs_reopt |= modified;
-
-                        println!("ConstPromotion(perform={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let mut modified = false;
-                        for b in block_generation_context.blocks.iter_mut() {
-                            modified |=
-                                fold_const_ops(&mut b.instructions, &mut const_instructions);
-                        }
-                        needs_reopt |= modified;
-
-                        println!("FoldConst(perform={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
+                        perform_log(
+                            &f.fname_token,
+                            "MergeSimpleGotoBlocks",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
 
                         if !modified {
                             break;
@@ -404,89 +509,61 @@ fn main() {
                         let modified = block_aliasing(&mut block_generation_context.blocks);
                         needs_reopt |= modified;
 
-                        println!("BlockAliasing(perform={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let modified = resolve_intrinsic_funcalls(
-                            &mut block_generation_context,
+                        perform_log(
+                            &f.fname_token,
+                            "BlockAliasing",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
                             &const_instructions,
                         );
-                        needs_reopt |= modified;
-
-                        println!("ResolveIntrinsicFuncalls(perform={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
 
                         if !modified {
                             break;
                         }
                     }
 
-                    loop {
-                        let modified = merge_constants(
-                            &mut block_generation_context.blocks,
-                            &mut const_instructions,
-                        );
-                        needs_reopt |= modified;
-
-                        println!("MergeDupConst(perform={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let mut modified = false;
-                        for b in block_generation_context.blocks.iter_mut() {
-                            let m1 = deconstruct_effectless_phi(&mut b.instructions);
-                            modified = modified || m1;
-                        }
+                    {
+                        let modified =
+                            block_generation_context
+                                .blocks
+                                .iter_mut()
+                                .fold(false, |m, b| {
+                                    let m1 = deconstruct_effectless_phi(&mut b.instructions);
+                                    m || m1
+                                });
                         needs_reopt = needs_reopt || modified;
-                        println!("DeconstructUselessPhi(modified={modified}):");
-                        if modified {
-                            println!("Constants:");
-                            for (k, v) in const_instructions.iter() {
-                                println!("  r{}: {v:?}", k.0);
-                            }
-                            let mut o = std::io::stdout().lock();
-                            block_generation_context.dump_blocks(&mut o).unwrap();
-                            o.flush().unwrap();
-                            drop(o);
-                        }
+
+                        perform_log(
+                            &f.fname_token,
+                            "DeconstructEffectlessPhi",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
+                    }
+
+                    loop {
+                        let register_state_map =
+                            build_register_state_map(&block_generation_context.blocks);
+                        let modified = resolve_register_aliases(
+                            &mut block_generation_context.blocks,
+                            &register_state_map,
+                        );
+                        needs_reopt = needs_reopt || modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "ResolveRegisterAliases",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_generation_context.registers,
+                            &const_instructions,
+                        );
 
                         if !modified {
                             break;
@@ -497,13 +574,15 @@ fn main() {
                 loop {
                     let modified = strip_unreachable_blocks(&mut block_generation_context.blocks);
 
-                    println!("Stripped(modified={modified}):");
-                    if modified {
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
-                    }
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreachableBlocks",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_generation_context.registers,
+                        &const_instructions,
+                    );
 
                     if !modified {
                         break;
@@ -517,24 +596,22 @@ fn main() {
                         &mut const_instructions,
                     );
 
-                    println!("StripUnreferencedRegisters(modified={modified}):");
-                    if modified {
-                        println!("Constants:");
-                        for (k, v) in const_instructions.iter() {
-                            println!("  r{}: {v:?}", k.0);
-                        }
-                        let mut o = std::io::stdout().lock();
-                        block_generation_context.dump_blocks(&mut o).unwrap();
-                        o.flush().unwrap();
-                        drop(o);
-                    }
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedRegisters",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_generation_context.registers,
+                        &const_instructions,
+                    );
 
                     if !modified {
                         break;
                     }
                 }
 
-                println!("Optimized:");
+                println!("Optimized({:?}):", f.fname_token);
                 println!("Registers:");
                 let mut o = std::io::stdout().lock();
                 for (n, r) in block_generation_context.registers.iter().enumerate() {
@@ -547,17 +624,19 @@ fn main() {
                 o.flush().unwrap();
                 drop(o);
 
-                let incoming_flows = parse_incoming_flows(&block_generation_context.blocks);
-                println!("Incoming Flows:");
-                for (src, dst) in incoming_flows.iter() {
-                    println!(
-                        "  b{} <- {}",
-                        src.0,
-                        dst.iter()
-                            .map(|b| format!("b{}", b.0))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                if false {
+                    let incoming_flows = parse_incoming_flows(&block_generation_context.blocks);
+                    println!("Incoming Flows:");
+                    for (src, dst) in incoming_flows.iter() {
+                        println!(
+                            "  b{} <- {}",
+                            src.0,
+                            dst.iter()
+                                .map(|b| format!("b{}", b.0))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
                 }
 
                 if fn_symbol.attribute.module_entry_point {
@@ -670,6 +749,35 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
+    struct OptimizedShaderEntryPoint<'s> {
+        pub info: ShaderEntryPointDescription<'s>,
+        pub ir2: ir2::Function<'s>,
+    }
+
+    let optimized_entry_points = entry_points
+        .into_iter()
+        .map(|ep| {
+            let sym = top_scope.user_defined_function_symbol(ep.name).unwrap();
+            let body = top_scope
+                .user_defined_function_body(ep.name)
+                .expect("cannot emit entry point without body");
+            optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
+            let ir2 = ir2::reconstruct(
+                &body.borrow().blocks,
+                &body.borrow().registers,
+                &body.borrow().constants,
+            );
+
+            println!("IR2({}):", ep.name);
+            let mut o = std::io::stdout().lock();
+            ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
+            o.flush().unwrap();
+            drop(o);
+
+            OptimizedShaderEntryPoint { info: ep, ir2 }
+        })
+        .collect::<Vec<_>>();
+
     let mut spv_context = SpvModuleEmissionContext::new();
     spv_context
         .capabilities
@@ -677,88 +785,71 @@ fn main() {
     spv_context
         .capabilities
         .insert(spv::asm::Capability::InputAttachment);
-    for e in entry_points {
-        let sym = top_scope.user_defined_function_symbol(e.name).unwrap();
-        let body = top_scope
-            .user_defined_function_body(e.name)
-            .expect("cannot emit entry point without body");
-        optimize(&e, sym, &mut body.borrow_mut(), &symbol_scope_arena);
-
-        let ir2 = ir2::reconstruct(
-            &body.borrow().blocks,
-            &body.borrow().registers,
-            &body.borrow().constants,
-        );
-        println!("IR2:");
-        let mut o = std::io::stdout().lock();
-        crate::ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
-        o.flush().unwrap();
-        drop(o);
-
+    for e in optimized_entry_points {
         unimplemented!("codegen");
 
-        let shader_if = emit_shader_interface_vars(sym, &body.borrow(), &mut spv_context);
-        let mut body_context = SpvFunctionBodyEmissionContext::new(&mut spv_context);
-        let main_label_id = body_context.new_id();
-        body_context.ops.push(spv::Instruction::Label {
-            result: main_label_id,
-        });
-        emit_block(
-            &shader_if,
-            &body.borrow().constants,
-            &body.borrow().blocks,
-            BlockRef(0),
-            &mut body_context,
-        );
-        // body_context.ops.push(spv::Instruction::Return);
-        let SpvFunctionBodyEmissionContext {
-            latest_id: body_latest_id,
-            ops: body_ops,
-            ..
-        } = body_context;
+        // let shader_if = emit_shader_interface_vars(sym, &body.borrow(), &mut spv_context);
+        // let mut body_context = SpvFunctionBodyEmissionContext::new(&mut spv_context);
+        // let main_label_id = body_context.new_id();
+        // body_context.ops.push(spv::Instruction::Label {
+        //     result: main_label_id,
+        // });
+        // emit_block(
+        //     &shader_if,
+        //     &body.borrow().constants,
+        //     &body.borrow().blocks,
+        //     BlockRef(0),
+        //     &mut body_context,
+        // );
+        // // body_context.ops.push(spv::Instruction::Return);
+        // let SpvFunctionBodyEmissionContext {
+        //     latest_id: body_latest_id,
+        //     ops: body_ops,
+        //     ..
+        // } = body_context;
 
-        let fn_result_ty = spv_context.request_type_id(spv::Type::Void);
-        let fnty = spv_context.request_type_id(spv::Type::Function {
-            return_type: Box::new(spv::Type::Void),
-            parameter_types: Vec::new(),
-        });
-        let fnid = spv_context.new_function_id();
-        spv_context.function_ops.push(spv::Instruction::Function {
-            result_type: fn_result_ty,
-            result: fnid,
-            function_control: spv::asm::FunctionControl::empty(),
-            function_type: fnty,
-        });
-        let fnid_offset = spv_context.latest_function_id;
-        spv_context.latest_function_id += body_latest_id;
-        spv_context
-            .function_ops
-            .extend(body_ops.into_iter().map(|x| {
-                x.relocate(|id| match id {
-                    SpvSectionLocalId::CurrentFunction(x) => {
-                        SpvSectionLocalId::Function(x + fnid_offset)
-                    }
-                    x => x,
-                })
-            }));
-        spv_context.function_ops.push(spv::Instruction::FunctionEnd);
-        spv_context
-            .entry_point_ops
-            .push(spv::Instruction::EntryPoint {
-                execution_model: e.execution_model,
-                entry_point: fnid,
-                name: e.name.into(),
-                interface: shader_if.iter_interface_global_vars().copied().collect(),
-            });
-        spv_context
-            .execution_mode_ops
-            .extend(e.execution_mode_modifiers.iter().map(|m| match m {
-                spv::ExecutionModeModifier::OriginUpperLeft => spv::Instruction::ExecutionMode {
-                    entry_point: fnid,
-                    mode: spv::asm::ExecutionMode::OriginUpperLeft,
-                    args: Vec::new(),
-                },
-            }));
+        // let fn_result_ty = spv_context.request_type_id(spv::Type::Void);
+        // let fnty = spv_context.request_type_id(spv::Type::Function {
+        //     return_type: Box::new(spv::Type::Void),
+        //     parameter_types: Vec::new(),
+        // });
+        // let fnid = spv_context.new_function_id();
+        // spv_context.function_ops.push(spv::Instruction::Function {
+        //     result_type: fn_result_ty,
+        //     result: fnid,
+        //     function_control: spv::asm::FunctionControl::empty(),
+        //     function_type: fnty,
+        // });
+        // let fnid_offset = spv_context.latest_function_id;
+        // spv_context.latest_function_id += body_latest_id;
+        // spv_context
+        //     .function_ops
+        //     .extend(body_ops.into_iter().map(|x| {
+        //         x.relocate(|id| match id {
+        //             SpvSectionLocalId::CurrentFunction(x) => {
+        //                 SpvSectionLocalId::Function(x + fnid_offset)
+        //             }
+        //             x => x,
+        //         })
+        //     }));
+        // spv_context.function_ops.push(spv::Instruction::FunctionEnd);
+        // spv_context
+        //     .entry_point_ops
+        //     .push(spv::Instruction::EntryPoint {
+        //         execution_model: e.execution_model,
+        //         entry_point: fnid,
+        //         name: e.name.into(),
+        //         interface: shader_if.iter_interface_global_vars().copied().collect(),
+        //     });
+        // spv_context
+        //     .execution_mode_ops
+        //     .extend(e.execution_mode_modifiers.iter().map(|m| match m {
+        //         spv::ExecutionModeModifier::OriginUpperLeft => spv::Instruction::ExecutionMode {
+        //             entry_point: fnid,
+        //             mode: spv::asm::ExecutionMode::OriginUpperLeft,
+        //             args: Vec::new(),
+        //         },
+        //     }));
     }
 
     let (module_ops, max_id) = spv_context.serialize_ops();
@@ -791,6 +882,33 @@ const fn module_header(bound: spv::Id) -> spv::BinaryModuleHeader {
     }
 }
 
+#[inline(always)]
+fn print_step_header(fname: &str, step_name: &str, modified: bool) {
+    println!(
+        "{step_name}({fname}, {}):",
+        if modified { "performed" } else { "skip" }
+    );
+}
+fn build_ir_document(
+    registers: &[ConcreteType],
+    const_map: &HashMap<RegisterRef, BlockInstruction>,
+    blocks: &[Block],
+) -> String {
+    use std::io::Write;
+
+    let mut sink = Vec::new();
+    for (rn, rt) in registers.iter().enumerate() {
+        match const_map.get(&RegisterRef(rn)) {
+            Some(c) => writeln!(sink, "  r{rn}: {rt:?} = {c:?}").unwrap(),
+            None => writeln!(sink, "  r{rn}: {rt:?}").unwrap(),
+        }
+    }
+
+    dump_blocks(&mut sink, blocks).unwrap();
+
+    unsafe { String::from_utf8_unchecked(sink) }
+}
+
 fn optimize<'a, 's>(
     ep: &ShaderEntryPointDescription,
     f: &UserDefinedFunctionSymbol<'s>,
@@ -810,6 +928,37 @@ fn optimize<'a, 's>(
         )
         .collect::<HashMap<_, _>>();
 
+    let mut last_ir_document = build_ir_document(&body.registers, &body.constants, &body.blocks);
+    fn perform_log(
+        f: &UserDefinedFunctionSymbol,
+        step_name: &str,
+        modified: bool,
+        last_irdoc: &mut String,
+        body: &FunctionBody,
+    ) {
+        print_step_header(&f.name(), step_name, modified);
+
+        if modified {
+            let new_irdoc = build_ir_document(&body.registers, &body.constants, &body.blocks);
+
+            let mut o = std::io::stdout().lock();
+            let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
+            for c in diff.iter_all_changes() {
+                let sign = match c.tag() {
+                    similar::ChangeTag::Equal => " ",
+                    similar::ChangeTag::Insert => "+",
+                    similar::ChangeTag::Delete => "-",
+                };
+
+                write!(o, "{sign} {c}").unwrap();
+            }
+            o.flush().unwrap();
+            drop(o);
+
+            *last_irdoc = new_irdoc;
+        }
+    }
+
     loop {
         let modified = inline_function2(
             &mut body.blocks,
@@ -819,17 +968,7 @@ fn optimize<'a, 's>(
             &mut body.registers,
         );
 
-        println!("InlineFunction(perform={modified}):");
-        let mut o = std::io::stdout().lock();
-        writeln!(o, "Constants:").unwrap();
-        for (k, v) in body.constants.iter() {
-            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-        }
-        writeln!(o, "Registers:").unwrap();
-        dump_registers(&mut o, &body.registers).unwrap();
-        dump_blocks(&mut o, &body.blocks).unwrap();
-        o.flush().unwrap();
-        drop(o);
+        perform_log(f, "InlineFunction", modified, &mut last_ir_document, body);
 
         if !modified {
             break;
@@ -863,31 +1002,18 @@ fn optimize<'a, 's>(
             println!("    {id} at {scope:?} = {r:?}");
         }
     }
-    let mut o = std::io::stdout().lock();
-    writeln!(o, "Constants:").unwrap();
-    for (k, v) in body.constants.iter() {
-        writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-    }
-    writeln!(o, "Registers:").unwrap();
-    dump_registers(&mut o, &body.registers).unwrap();
-    dump_blocks(&mut o, &body.blocks).unwrap();
-    o.flush().unwrap();
-    drop(o);
 
     loop {
         let modified =
             apply_local_var_states(&mut body.blocks, &body.constants, &scope_local_var_states);
-        println!("ApplyLocalVarStates:");
-        let mut o = std::io::stdout().lock();
-        writeln!(o, "Constants:").unwrap();
-        for (k, v) in body.constants.iter() {
-            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-        }
-        writeln!(o, "Registers:").unwrap();
-        dump_registers(&mut o, &body.registers).unwrap();
-        dump_blocks(&mut o, &body.blocks).unwrap();
-        o.flush().unwrap();
-        drop(o);
+
+        perform_log(
+            f,
+            "ApplyLocalVarStates",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
 
         if !modified {
             break;
@@ -903,17 +1029,13 @@ fn optimize<'a, 's>(
     let modified =
         strip_write_only_local_memory(&mut body.blocks, &body.constants, &local_memory_usages);
 
-    println!("StripWriteOnlyLocalMemory(perform={modified}):");
-    let mut o = std::io::stdout().lock();
-    writeln!(o, "Constants:").unwrap();
-    for (k, v) in body.constants.iter() {
-        writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-    }
-    writeln!(o, "Registers:").unwrap();
-    dump_registers(&mut o, &body.registers).unwrap();
-    dump_blocks(&mut o, &body.blocks).unwrap();
-    o.flush().unwrap();
-    drop(o);
+    perform_log(
+        f,
+        "StripWriteOnlyLocalMemory",
+        modified,
+        &mut last_ir_document,
+        body,
+    );
 
     loop {
         let modified = resolve_shader_io_ref_binds(
@@ -925,17 +1047,13 @@ fn optimize<'a, 's>(
             &body.registers,
         );
 
-        println!("ResolveShaderIORefBinds(perform={modified}):");
-        let mut o = std::io::stdout().lock();
-        writeln!(o, "Constants:").unwrap();
-        for (k, v) in body.constants.iter() {
-            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-        }
-        writeln!(o, "Registers:").unwrap();
-        dump_registers(&mut o, &body.registers).unwrap();
-        dump_blocks(&mut o, &body.blocks).unwrap();
-        o.flush().unwrap();
-        drop(o);
+        perform_log(
+            f,
+            "ResolveShaderIORefBinds",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
 
         if !modified {
             break;
@@ -947,56 +1065,19 @@ fn optimize<'a, 's>(
         needs_reopt = false;
 
         loop {
-            let modified = merge_simple_goto_blocks(&mut body.blocks);
-            needs_reopt |= modified;
-            println!("Merged(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+            let modified = body.blocks.iter_mut().fold(false, |m, b| {
+                let m1 = promote_instantiate_const(&mut b.instructions, &mut body.constants);
+                m || m1
+            });
+            needs_reopt = needs_reopt || modified;
 
-            if !modified {
-                break;
-            }
-        }
-
-        needs_reopt |= strip_unreachable_blocks(&mut body.blocks);
-        println!("Stripped:");
-        let mut o = std::io::stdout().lock();
-        writeln!(o, "Constants:").unwrap();
-        for (k, v) in body.constants.iter() {
-            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-        }
-        writeln!(o, "Registers:").unwrap();
-        dump_registers(&mut o, &body.registers).unwrap();
-        dump_blocks(&mut o, &body.blocks).unwrap();
-        o.flush().unwrap();
-        drop(o);
-
-        loop {
-            let mut modified = false;
-            for b in body.blocks.iter_mut() {
-                modified |= promote_instantiate_const(&mut b.instructions, &mut body.constants);
-            }
-            needs_reopt |= modified;
-
-            println!("ConstPromotion(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+            perform_log(
+                f,
+                "PromoteInstantiateConst",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
 
             if !modified {
                 break;
@@ -1004,44 +1085,13 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let mut modified = false;
-            for b in body.blocks.iter_mut() {
-                modified |= fold_const_ops(&mut b.instructions, &mut body.constants);
-            }
-            needs_reopt |= modified;
+            let modified = body.blocks.iter_mut().fold(false, |m, b| {
+                let m1 = fold_const_ops(&mut b.instructions, &mut body.constants);
+                m || m1
+            });
+            needs_reopt = needs_reopt || modified;
 
-            println!("FoldConst(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
-
-            if !modified {
-                break;
-            }
-        }
-
-        loop {
-            let modified = block_aliasing(&mut body.blocks);
-            needs_reopt |= modified;
-
-            println!("BlockAliasing(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+            perform_log(f, "FoldConstants", modified, &mut last_ir_document, body);
 
             if !modified {
                 break;
@@ -1050,19 +1100,9 @@ fn optimize<'a, 's>(
 
         loop {
             let modified = merge_constants(&mut body.blocks, &mut body.constants);
-            needs_reopt |= modified;
+            needs_reopt = needs_reopt || modified;
 
-            println!("MergeDupConst(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+            perform_log(f, "UnifyConstants", modified, &mut last_ir_document, body);
 
             if !modified {
                 break;
@@ -1070,23 +1110,47 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let mut modified = false;
-            for b in body.blocks.iter_mut() {
-                let m1 = deconstruct_effectless_phi(&mut b.instructions);
-                modified = modified || m1;
+            let modified = merge_simple_goto_blocks(&mut body.blocks);
+            needs_reopt |= modified;
+
+            perform_log(
+                f,
+                "MergeSimpleGotoBlocks",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
             }
+        }
+
+        loop {
+            let modified = block_aliasing(&mut body.blocks);
             needs_reopt = needs_reopt || modified;
-            println!("DeconstructUselessPhi(modified={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
+
+            perform_log(f, "BlockAliasing", modified, &mut last_ir_document, body);
+
+            if !modified {
+                break;
             }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+        }
+
+        loop {
+            let modified = body.blocks.iter_mut().fold(false, |m, b| {
+                let m1 = deconstruct_effectless_phi(&mut b.instructions);
+                m || m1
+            });
+            needs_reopt = needs_reopt || modified;
+
+            perform_log(
+                f,
+                "DeconstructEffectlessPhi",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
 
             if !modified {
                 break;
@@ -1098,21 +1162,34 @@ fn optimize<'a, 's>(
             let modified = resolve_register_aliases(&mut body.blocks, &register_state_map);
             needs_reopt = needs_reopt || modified;
 
-            println!("ResolveRegisterAliases(perform={modified}):");
-            let mut o = std::io::stdout().lock();
-            writeln!(o, "Constants:").unwrap();
-            for (k, v) in body.constants.iter() {
-                writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-            }
-            writeln!(o, "Registers:").unwrap();
-            dump_registers(&mut o, &body.registers).unwrap();
-            dump_blocks(&mut o, &body.blocks).unwrap();
-            o.flush().unwrap();
-            drop(o);
+            perform_log(
+                f,
+                "ResolveRegisterAliases",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
 
             if !modified {
                 break;
             }
+        }
+    }
+
+    loop {
+        let modified = strip_unreachable_blocks(&mut body.blocks);
+        needs_reopt = needs_reopt || modified;
+
+        perform_log(
+            f,
+            "StripUnreachableBlocks",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
         }
     }
 
@@ -1123,17 +1200,13 @@ fn optimize<'a, 's>(
             &mut body.constants,
         );
 
-        println!("StripUnreferencedRegisters(perform={modified}):");
-        let mut o = std::io::stdout().lock();
-        writeln!(o, "Constants:").unwrap();
-        for (k, v) in body.constants.iter() {
-            writeln!(o, "  r{}: {v:?}", k.0).unwrap();
-        }
-        writeln!(o, "Registers:").unwrap();
-        dump_registers(&mut o, &body.registers).unwrap();
-        dump_blocks(&mut o, &body.blocks).unwrap();
-        o.flush().unwrap();
-        drop(o);
+        perform_log(
+            f,
+            "StripUnreferencedRegisters",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
 
         if !modified {
             break;

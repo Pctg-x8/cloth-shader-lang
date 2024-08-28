@@ -1,5 +1,6 @@
 use crate::concrete_type::IntrinsicType;
 use crate::ir::block::BlockFlowInstruction;
+use crate::ir::{ConstIntLiteral, ConstNumberLiteral};
 use crate::spirv as spv;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -124,6 +125,7 @@ pub enum Inst<'s> {
         condition: ConstOrInst<'s>,
         body: Vec<Inst<'s>>,
     },
+    BlockValue(ConstOrInst<'s>),
     ContinueLoop,
     BreakLoop,
     Return(ConstOrInst<'s>),
@@ -200,6 +202,7 @@ impl<'s> Inst<'s> {
                 Inst::ContinueLoop => writeln!(sink, "{indent}continue"),
                 Inst::BreakLoop => writeln!(sink, "{indent}break"),
                 Inst::Return(v) => writeln!(sink, "{indent}return {v:?}"),
+                Inst::BlockValue(v) => writeln!(sink, "{indent}block value = {v:?}"),
             }
         }
 
@@ -230,8 +233,18 @@ pub fn reconstruct<'a, 's>(
             BlockInstruction::ConstUnit => {
                 register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::Unit));
             }
-            BlockInstruction::ConstInt(_) => unreachable!("uninstantiated const int"),
-            BlockInstruction::ConstNumber(_) => unreachable!("uninstantiated const number"),
+            &BlockInstruction::ConstInt(ConstIntLiteral(ref s, m)) => {
+                register_to_inst_const_map.insert(
+                    r,
+                    ConstOrInst::Const(ConstValue::SIntLit(ConstSIntLiteral(s.clone(), m))),
+                );
+            }
+            &BlockInstruction::ConstNumber(ConstNumberLiteral(ref s, m)) => {
+                register_to_inst_const_map.insert(
+                    r,
+                    ConstOrInst::Const(ConstValue::FloatLit(ConstFloatLiteral(s.clone(), m))),
+                );
+            }
             BlockInstruction::ConstSInt(l) => {
                 register_to_inst_const_map
                     .insert(r, ConstOrInst::Const(ConstValue::SIntLit(l.clone())));
@@ -250,7 +263,12 @@ pub fn reconstruct<'a, 's>(
             BlockInstruction::ImmBool(false) => {
                 register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::False));
             }
-            BlockInstruction::ImmInt(_) => unreachable!("uninstantiated imm int"),
+            &BlockInstruction::ImmInt(v) => {
+                register_to_inst_const_map.insert(
+                    r,
+                    ConstOrInst::Const(ConstValue::SInt(v.try_into().unwrap())),
+                );
+            }
             &BlockInstruction::ImmSInt(v) => {
                 register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::SInt(v)));
             }
@@ -337,6 +355,7 @@ pub fn reconstruct<'a, 's>(
         >,
         n: crate::ir::block::BlockRef,
         until: Option<crate::ir::block::BlockRef>,
+        last_block: &mut crate::ir::block::BlockRef,
         register_to_inst_const_map: &mut HashMap<RegisterRef, ConstOrInst<'s>>,
         instructions: &mut Vec<Inst<'s>>,
     ) {
@@ -601,6 +620,8 @@ pub fn reconstruct<'a, 's>(
             }
         }
 
+        *last_block = n;
+
         match blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => {
                 process(
@@ -609,6 +630,7 @@ pub fn reconstruct<'a, 's>(
                     const_map,
                     next,
                     until,
+                    last_block,
                     register_to_inst_const_map,
                     instructions,
                 );
@@ -629,6 +651,7 @@ pub fn reconstruct<'a, 's>(
                     const_map,
                     after.unwrap(),
                     until,
+                    last_block,
                     register_to_inst_const_map,
                     instructions,
                 );
@@ -672,6 +695,7 @@ pub fn reconstruct<'a, 's>(
                     const_map,
                     after_return.unwrap(),
                     until,
+                    last_block,
                     register_to_inst_const_map,
                     instructions,
                 );
@@ -687,37 +711,91 @@ pub fn reconstruct<'a, 's>(
                     unreachable!("b{} r{} {:?}", n.0, source.0, blocks[n.0].flow);
                 };
                 let mut true_instructions = Vec::new();
+                let mut true_last_block = n;
                 process(
                     blocks,
                     registers,
                     const_map,
                     r#true,
                     Some(merge),
+                    &mut true_last_block,
                     register_to_inst_const_map,
                     &mut true_instructions,
                 );
                 let mut false_instructions = Vec::new();
+                let mut false_last_block = n;
                 process(
                     blocks,
                     registers,
                     const_map,
                     r#false,
                     Some(merge),
+                    &mut false_last_block,
                     register_to_inst_const_map,
                     &mut false_instructions,
                 );
 
-                instructions.push(Inst::Branch {
-                    source,
-                    true_instructions,
-                    false_instructions,
-                });
+                if let Some((merge_phi_register, merge_phi_incomings)) = blocks[merge.0]
+                    .instructions
+                    .iter()
+                    .find_map(|(r, x)| match x {
+                        BlockInstruction::Phi(incomings) => Some((*r, incomings)),
+                        _ => None,
+                    })
+                {
+                    let Some(true_phi_incoming_register) =
+                        merge_phi_incomings.get(&true_last_block)
+                    else {
+                        unreachable!(
+                            "no true phi incoming register true_last_blk=b{}",
+                            true_last_block.0
+                        );
+                    };
+                    let Some(false_phi_incoming_register) =
+                        merge_phi_incomings.get(&false_last_block)
+                    else {
+                        unreachable!(
+                            "no false phi incoming register false_last_blk=b{}",
+                            false_last_block.0
+                        );
+                    };
+                    let Some(true_phi_value) =
+                        register_to_inst_const_map.get(true_phi_incoming_register)
+                    else {
+                        unreachable!("no value for true phi");
+                    };
+                    let Some(false_phi_value) =
+                        register_to_inst_const_map.get(false_phi_incoming_register)
+                    else {
+                        unreachable!("no value for false phi");
+                    };
+
+                    true_instructions.push(Inst::BlockValue(true_phi_value.clone()));
+                    false_instructions.push(Inst::BlockValue(false_phi_value.clone()));
+                    instructions.push(Inst::Branch {
+                        source,
+                        true_instructions,
+                        false_instructions,
+                    });
+                    register_to_inst_const_map.insert(
+                        merge_phi_register,
+                        ConstOrInst::Inst(InstRef(instructions.len() - 1)),
+                    );
+                } else {
+                    instructions.push(Inst::Branch {
+                        source,
+                        true_instructions,
+                        false_instructions,
+                    });
+                }
+
                 process(
                     blocks,
                     registers,
                     const_map,
                     merge,
                     until,
+                    last_block,
                     register_to_inst_const_map,
                     instructions,
                 );
@@ -733,12 +811,14 @@ pub fn reconstruct<'a, 's>(
                 };
 
                 let mut body_instructions = Vec::new();
+                let mut body_last_block = body;
                 process(
                     blocks,
                     registers,
                     const_map,
                     body,
                     Some(r#break),
+                    &mut body_last_block,
                     register_to_inst_const_map,
                     &mut body_instructions,
                 );
@@ -753,6 +833,7 @@ pub fn reconstruct<'a, 's>(
                     const_map,
                     r#break,
                     until,
+                    last_block,
                     register_to_inst_const_map,
                     instructions,
                 );
@@ -780,6 +861,7 @@ pub fn reconstruct<'a, 's>(
         const_map,
         crate::ir::block::BlockRef(0),
         None,
+        &mut crate::ir::block::BlockRef(0),
         &mut register_to_inst_const_map,
         &mut function.instructions,
     );
