@@ -160,5 +160,6 @@ pub struct FunctionBody<'a, 's> {
     pub symbol_scope: &'a SymbolScope<'a, 's>,
     pub registers: Vec<ConcreteType<'s>>,
     pub constants: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    pub blocks: Vec<Block<'a, 's>>,
+    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    pub blocks: Vec<Block>,
 }

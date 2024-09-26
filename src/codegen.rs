@@ -1654,6 +1654,7 @@ pub fn emit_entry_point_spv_ops2<'s>(
         shaderif_variable_maps,
         &f.constants,
         &f.blocks,
+        &f.instructions,
         BlockRef(0),
         &mut SpvFunctionBodyEmissionContext::new(ctx),
     );
@@ -1662,29 +1663,28 @@ pub fn emit_entry_point_spv_ops2<'s>(
 pub fn emit_block<'a, 's>(
     shader_if: &ShaderInterfaceVariableMaps,
     consts: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    blocks: &[Block<'a, 's>],
+    blocks: &[Block],
+    instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     n: BlockRef,
     ctx: &mut SpvFunctionBodyEmissionContext,
 ) {
     match blocks[n.0].flow {
         BlockFlowInstruction::Goto(next) => {
             eprintln!("Warn: goto block has no effect");
-            emit_block(shader_if, consts, blocks, next, ctx);
+            emit_block(shader_if, consts, blocks, instructions, next, ctx);
         }
         BlockFlowInstruction::StoreRef { ptr, value, after } => {
             let (ptr, ptr_ty) =
-                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, ptr, ctx)
-                    .unwrap();
+                emit_block_instruction(shader_if, consts, instructions, ptr, ctx).unwrap();
             let (value, value_ty) =
-                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, value, ctx)
-                    .unwrap();
+                emit_block_instruction(shader_if, consts, instructions, value, ctx).unwrap();
             assert_eq!(ptr_ty.clone().dereferenced().unwrap(), value_ty);
             ctx.ops.push(spv::Instruction::Store {
                 pointer: ptr,
                 object: value,
             });
 
-            emit_block(shader_if, consts, blocks, after.unwrap(), ctx);
+            emit_block(shader_if, consts, blocks, instructions, after.unwrap(), ctx);
         }
         BlockFlowInstruction::IntrinsicImpureFuncall {
             identifier: "Cloth.Intrinsic.ExecutionBarrier",
@@ -1712,7 +1712,14 @@ pub fn emit_block<'a, 's>(
                 semantics,
             });
 
-            emit_block(shader_if, consts, blocks, after_return.unwrap(), ctx);
+            emit_block(
+                shader_if,
+                consts,
+                blocks,
+                instructions,
+                after_return.unwrap(),
+                ctx,
+            );
         }
         BlockFlowInstruction::IntrinsicImpureFuncall { identifier, .. } => {
             unimplemented!("Unknown intrinsic: {identifier}")
@@ -1740,8 +1747,7 @@ pub fn emit_block<'a, 's>(
             merge,
         } => {
             let (source, source_ty) =
-                emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, source, ctx)
-                    .unwrap();
+                emit_block_instruction(shader_if, consts, instructions, source, ctx).unwrap();
             assert_eq!(source_ty, spv::Type::Bool);
             // 抜け先を作るのにマージブロックが必要だが、true/falseブロックが具体的にいくつインストラクション数あるかがわからない......
             // IRをもう一個作ってブロックを崩していったほうがよさそう
@@ -1750,13 +1756,13 @@ pub fn emit_block<'a, 's>(
             ctx.ops.push(spv::Instruction::Label {
                 result: merge_label,
             });
-            emit_block(shader_if, consts, blocks, merge, ctx);
+            emit_block(shader_if, consts, blocks, instructions, merge, ctx);
         }
         BlockFlowInstruction::ConditionalLoop { .. } => unimplemented!("conditional loop"),
         BlockFlowInstruction::Break => unimplemented!("break"),
         BlockFlowInstruction::Continue => unimplemented!("continue"),
         BlockFlowInstruction::Return(r) => {
-            match emit_block_instruction(shader_if, consts, &blocks[n.0].instructions, r, ctx) {
+            match emit_block_instruction(shader_if, consts, instructions, r, ctx) {
                 None => ctx.ops.push(spv::Instruction::Return),
                 Some((_, spv::Type::Void)) => ctx.ops.push(spv::Instruction::Return),
                 Some(_) => unimplemented!("Return with Value"),
@@ -2626,6 +2632,7 @@ pub fn emit_block_instruction<'a, 's>(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        BlockInstruction::CompositeInsert { .. } => unimplemented!("CompositeInsert"),
     }
 }
 

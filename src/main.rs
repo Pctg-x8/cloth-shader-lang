@@ -13,7 +13,8 @@ use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
-        BlockGenerationContext, BlockInstruction, BlockRef, RegisterRef,
+        BlockGenerationContext, BlockInstruction, BlockInstructionEmissionContext, BlockRef,
+        RegisterRef,
     },
     expr::simplify_expression,
     opt::{
@@ -23,7 +24,7 @@ use ir::{
         merge_constants, merge_simple_goto_blocks, optimize_pure_expr, promote_instantiate_const,
         resolve_intrinsic_funcalls, resolve_register_aliases, resolve_shader_io_ref_binds,
         strip_unreachable_blocks, strip_unreferenced_registers, strip_write_only_local_memory,
-        track_scope_local_var_aliases,
+        track_scope_local_var_aliases, transform_swizzle_component_store,
     },
     FunctionBody,
 };
@@ -234,15 +235,15 @@ fn main() {
                     }
                 }
                 let mut block_generation_context = BlockGenerationContext::new(&symbol_scope_arena);
+                let mut block_instruction_emission_context = BlockInstructionEmissionContext::new();
                 let last = simplify_expression(
                     f.body,
                     &mut block_generation_context,
+                    &mut block_instruction_emission_context,
                     function_symbol_scope,
                 );
-                let final_return_block = block_generation_context.add(Block {
-                    instructions: HashMap::new(),
-                    flow: BlockFlowInstruction::Return(last.result),
-                });
+                let final_return_block = block_generation_context
+                    .add(Block::flow_only(BlockFlowInstruction::Return(last.result)));
                 assert!(
                     block_generation_context.try_chain(last.end_block, final_return_block),
                     "function body multiple out"
@@ -252,18 +253,18 @@ fn main() {
                     f.fname_token.slice, last.start_block.0, final_return_block.0
                 );
                 let mut o = std::io::stdout().lock();
-                block_generation_context.dump_blocks(&mut o).unwrap();
+                block_generation_context
+                    .dump_blocks(
+                        &mut o,
+                        &block_instruction_emission_context.registers,
+                        &block_instruction_emission_context.instructions,
+                    )
+                    .unwrap();
                 o.flush().unwrap();
                 drop(o);
 
                 let mut const_instructions =
-                    block_generation_context
-                        .blocks
-                        .iter_mut()
-                        .fold(HashMap::new(), |mut v, b| {
-                            v.extend(extract_constants(&mut b.instructions));
-                            v
-                        });
+                    extract_constants(&mut block_instruction_emission_context.instructions);
 
                 println!("ConstInstPromotion:");
                 println!("Constants:");
@@ -271,12 +272,19 @@ fn main() {
                     println!("  r{}: {v:?}", k.0);
                 }
                 let mut o = std::io::stdout().lock();
-                block_generation_context.dump_blocks(&mut o).unwrap();
+                block_generation_context
+                    .dump_blocks(
+                        &mut o,
+                        &block_instruction_emission_context.registers,
+                        &block_instruction_emission_context.instructions,
+                    )
+                    .unwrap();
                 o.flush().unwrap();
                 drop(o);
 
                 let local_scope_var_aliases = track_scope_local_var_aliases(
                     &block_generation_context.blocks,
+                    &block_instruction_emission_context.instructions,
                     &const_instructions,
                 );
                 println!("Scope Var Aliases:");
@@ -291,8 +299,9 @@ fn main() {
 
                 let scope_local_var_states = build_scope_local_var_state(
                     &mut block_generation_context.blocks,
+                    &mut block_instruction_emission_context.instructions,
                     &local_scope_var_aliases,
-                    &mut block_generation_context.registers,
+                    &mut block_instruction_emission_context.registers,
                 );
                 println!("Scope Local Var States:");
                 let mut sorted = scope_local_var_states.iter().collect::<Vec<_>>();
@@ -305,9 +314,10 @@ fn main() {
                 }
 
                 let mut last_ir_document = build_ir_document(
-                    &block_generation_context.registers,
+                    &block_instruction_emission_context.registers,
                     &const_instructions,
                     &block_generation_context.blocks,
+                    &block_instruction_emission_context.instructions,
                 );
                 fn perform_log(
                     fname: &parser::Token,
@@ -315,13 +325,15 @@ fn main() {
                     modified: bool,
                     last_irdoc: &mut String,
                     blocks: &[Block],
+                    instructions: &HashMap<RegisterRef, BlockInstruction>,
                     registers: &[ConcreteType],
                     const_map: &HashMap<RegisterRef, BlockInstruction>,
                 ) {
                     print_step_header(fname.slice, step_name, modified);
 
                     if modified {
-                        let next_irdoc = build_ir_document(registers, const_map, blocks);
+                        let next_irdoc =
+                            build_ir_document(registers, const_map, blocks, instructions);
 
                         let diff = similar::TextDiff::from_lines(last_irdoc, &next_irdoc);
                         let mut o = std::io::stdout().lock();
@@ -344,6 +356,7 @@ fn main() {
                 loop {
                     let modified = apply_local_var_states(
                         &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.instructions,
                         &const_instructions,
                         &scope_local_var_states,
                     );
@@ -354,7 +367,8 @@ fn main() {
                         modified,
                         &mut last_ir_document,
                         &block_generation_context.blocks,
-                        &block_generation_context.registers,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
                         &const_instructions,
                     );
 
@@ -365,6 +379,7 @@ fn main() {
 
                 let local_memory_usages = collect_scope_local_memory_usages(
                     &block_generation_context.blocks,
+                    &block_instruction_emission_context.instructions,
                     &const_instructions,
                 );
                 println!("LocalMemoryUsages:");
@@ -383,7 +398,8 @@ fn main() {
                     modified,
                     &mut last_ir_document,
                     &block_generation_context.blocks,
-                    &block_generation_context.registers,
+                    &block_instruction_emission_context.instructions,
+                    &block_instruction_emission_context.registers,
                     &const_instructions,
                 );
 
@@ -392,17 +408,10 @@ fn main() {
                     needs_reopt = false;
 
                     loop {
-                        let modified =
-                            block_generation_context
-                                .blocks
-                                .iter_mut()
-                                .fold(false, |m, b| {
-                                    let m1 = promote_instantiate_const(
-                                        &mut b.instructions,
-                                        &mut const_instructions,
-                                    );
-                                    m || m1
-                                });
+                        let modified = promote_instantiate_const(
+                            &mut block_instruction_emission_context.instructions,
+                            &mut const_instructions,
+                        );
                         needs_reopt |= modified;
 
                         perform_log(
@@ -411,7 +420,8 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
 
@@ -421,17 +431,10 @@ fn main() {
                     }
 
                     loop {
-                        let modified =
-                            block_generation_context
-                                .blocks
-                                .iter_mut()
-                                .fold(false, |m, b| {
-                                    let m1 = fold_const_ops(
-                                        &mut b.instructions,
-                                        &mut const_instructions,
-                                    );
-                                    m || m1
-                                });
+                        let modified = fold_const_ops(
+                            &mut block_instruction_emission_context.instructions,
+                            &mut const_instructions,
+                        );
                         needs_reopt |= modified;
 
                         perform_log(
@@ -440,7 +443,8 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
 
@@ -452,6 +456,7 @@ fn main() {
                     {
                         let modified = merge_constants(
                             &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
                             &mut const_instructions,
                         );
                         needs_reopt |= modified;
@@ -462,7 +467,8 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
                     }
@@ -470,6 +476,7 @@ fn main() {
                     {
                         let modified = resolve_intrinsic_funcalls(
                             &mut block_generation_context,
+                            &mut block_instruction_emission_context,
                             &const_instructions,
                         );
                         needs_reopt |= modified;
@@ -480,14 +487,17 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
                     }
 
                     loop {
-                        let modified =
-                            merge_simple_goto_blocks(&mut block_generation_context.blocks);
+                        let modified = merge_simple_goto_blocks(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
+                        );
                         needs_reopt |= modified;
 
                         perform_log(
@@ -496,7 +506,8 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
 
@@ -506,7 +517,10 @@ fn main() {
                     }
 
                     loop {
-                        let modified = block_aliasing(&mut block_generation_context.blocks);
+                        let modified = block_aliasing(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
+                        );
                         needs_reopt |= modified;
 
                         perform_log(
@@ -515,7 +529,8 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
 
@@ -525,14 +540,9 @@ fn main() {
                     }
 
                     {
-                        let modified =
-                            block_generation_context
-                                .blocks
-                                .iter_mut()
-                                .fold(false, |m, b| {
-                                    let m1 = deconstruct_effectless_phi(&mut b.instructions);
-                                    m || m1
-                                });
+                        let modified = deconstruct_effectless_phi(
+                            &mut block_instruction_emission_context.instructions,
+                        );
                         needs_reopt = needs_reopt || modified;
 
                         perform_log(
@@ -541,16 +551,20 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
                     }
 
                     loop {
-                        let register_state_map =
-                            build_register_state_map(&block_generation_context.blocks);
+                        let register_state_map = build_register_state_map(
+                            &block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
+                        );
                         let modified = resolve_register_aliases(
                             &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
                             &register_state_map,
                         );
                         needs_reopt = needs_reopt || modified;
@@ -561,7 +575,32 @@ fn main() {
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
-                            &block_generation_context.registers,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
+                            &const_instructions,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+
+                    loop {
+                        let modified = transform_swizzle_component_store(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.instructions,
+                            &mut block_instruction_emission_context.registers,
+                        );
+                        needs_reopt = needs_reopt || modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "TransformSwizzleComponentStore",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
                             &const_instructions,
                         );
 
@@ -572,7 +611,10 @@ fn main() {
                 }
 
                 loop {
-                    let modified = strip_unreachable_blocks(&mut block_generation_context.blocks);
+                    let modified = strip_unreachable_blocks(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.instructions,
+                    );
 
                     perform_log(
                         &f.fname_token,
@@ -580,7 +622,8 @@ fn main() {
                         modified,
                         &mut last_ir_document,
                         &block_generation_context.blocks,
-                        &block_generation_context.registers,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
                         &const_instructions,
                     );
 
@@ -592,7 +635,8 @@ fn main() {
                 loop {
                     let modified = strip_unreferenced_registers(
                         &mut block_generation_context.blocks,
-                        &mut block_generation_context.registers,
+                        &mut block_instruction_emission_context.instructions,
+                        &mut block_instruction_emission_context.registers,
                         &mut const_instructions,
                     );
 
@@ -602,7 +646,8 @@ fn main() {
                         modified,
                         &mut last_ir_document,
                         &block_generation_context.blocks,
-                        &block_generation_context.registers,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
                         &const_instructions,
                     );
 
@@ -614,13 +659,22 @@ fn main() {
                 println!("Optimized({:?}):", f.fname_token);
                 println!("Registers:");
                 let mut o = std::io::stdout().lock();
-                for (n, r) in block_generation_context.registers.iter().enumerate() {
+                for (n, r) in block_instruction_emission_context
+                    .registers
+                    .iter()
+                    .enumerate()
+                {
                     match const_instructions.get(&RegisterRef(n)) {
                         Some(c) => writeln!(o, "  r{n}: {r:?} = {c:?}").unwrap(),
                         None => writeln!(o, "  r{n}: {r:?}").unwrap(),
                     }
                 }
-                dump_blocks(&mut o, &block_generation_context.blocks).unwrap();
+                dump_blocks(
+                    &mut o,
+                    &block_generation_context.blocks,
+                    &block_instruction_emission_context.instructions,
+                )
+                .unwrap();
                 o.flush().unwrap();
                 drop(o);
 
@@ -728,8 +782,9 @@ fn main() {
                     f.fname_token.slice,
                     FunctionBody {
                         symbol_scope: function_symbol_scope,
-                        registers: block_generation_context.registers,
+                        registers: block_instruction_emission_context.registers,
                         constants: const_instructions,
+                        instructions: block_instruction_emission_context.instructions,
                         blocks: block_generation_context.blocks,
                     },
                 );
@@ -764,6 +819,7 @@ fn main() {
             optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
             let ir2 = ir2::reconstruct(
                 &body.borrow().blocks,
+                &body.borrow().instructions,
                 &body.borrow().registers,
                 &body.borrow().constants,
             );
@@ -893,6 +949,7 @@ fn build_ir_document(
     registers: &[ConcreteType],
     const_map: &HashMap<RegisterRef, BlockInstruction>,
     blocks: &[Block],
+    instructions: &HashMap<RegisterRef, BlockInstruction>,
 ) -> String {
     use std::io::Write;
 
@@ -904,7 +961,7 @@ fn build_ir_document(
         }
     }
 
-    dump_blocks(&mut sink, blocks).unwrap();
+    dump_blocks(&mut sink, blocks, instructions).unwrap();
 
     unsafe { String::from_utf8_unchecked(sink) }
 }
@@ -928,7 +985,12 @@ fn optimize<'a, 's>(
         )
         .collect::<HashMap<_, _>>();
 
-    let mut last_ir_document = build_ir_document(&body.registers, &body.constants, &body.blocks);
+    let mut last_ir_document = build_ir_document(
+        &body.registers,
+        &body.constants,
+        &body.blocks,
+        &body.instructions,
+    );
     fn perform_log(
         f: &UserDefinedFunctionSymbol,
         step_name: &str,
@@ -939,7 +1001,12 @@ fn optimize<'a, 's>(
         print_step_header(&f.name(), step_name, modified);
 
         if modified {
-            let new_irdoc = build_ir_document(&body.registers, &body.constants, &body.blocks);
+            let new_irdoc = build_ir_document(
+                &body.registers,
+                &body.constants,
+                &body.blocks,
+                &body.instructions,
+            );
 
             let mut o = std::io::stdout().lock();
             let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
@@ -962,6 +1029,7 @@ fn optimize<'a, 's>(
     loop {
         let modified = inline_function2(
             &mut body.blocks,
+            &mut body.instructions,
             &mut body.constants,
             scope_arena,
             body.symbol_scope,
@@ -977,7 +1045,8 @@ fn optimize<'a, 's>(
 
     println!("refpath binds: {refpath_binds:#?}");
 
-    let local_scope_var_aliases = track_scope_local_var_aliases(&body.blocks, &body.constants);
+    let local_scope_var_aliases =
+        track_scope_local_var_aliases(&body.blocks, &body.instructions, &body.constants);
     println!("Scope Var Aliases:");
     let mut sorted = local_scope_var_aliases.iter().collect::<Vec<_>>();
     sorted.sort_by_key(|p| p.0 .0);
@@ -990,6 +1059,7 @@ fn optimize<'a, 's>(
 
     let scope_local_var_states = build_scope_local_var_state(
         &mut body.blocks,
+        &mut body.instructions,
         &local_scope_var_aliases,
         &mut body.registers,
     );
@@ -1004,8 +1074,12 @@ fn optimize<'a, 's>(
     }
 
     loop {
-        let modified =
-            apply_local_var_states(&mut body.blocks, &body.constants, &scope_local_var_states);
+        let modified = apply_local_var_states(
+            &mut body.blocks,
+            &mut body.instructions,
+            &body.constants,
+            &scope_local_var_states,
+        );
 
         perform_log(
             f,
@@ -1020,7 +1094,8 @@ fn optimize<'a, 's>(
         }
     }
 
-    let local_memory_usages = collect_scope_local_memory_usages(&body.blocks, &body.constants);
+    let local_memory_usages =
+        collect_scope_local_memory_usages(&body.blocks, &body.instructions, &body.constants);
     println!("LocalMemoryUsages:");
     for ((scope, id), usage) in local_memory_usages.iter() {
         println!("  {id} @ {scope:?}: {usage:?}");
@@ -1043,6 +1118,7 @@ fn optimize<'a, 's>(
             body.symbol_scope,
             &refpath_binds,
             &mut body.blocks,
+            &mut body.instructions,
             &mut body.constants,
             &body.registers,
         );
@@ -1065,10 +1141,7 @@ fn optimize<'a, 's>(
         needs_reopt = false;
 
         loop {
-            let modified = body.blocks.iter_mut().fold(false, |m, b| {
-                let m1 = promote_instantiate_const(&mut b.instructions, &mut body.constants);
-                m || m1
-            });
+            let modified = promote_instantiate_const(&mut body.instructions, &mut body.constants);
             needs_reopt = needs_reopt || modified;
 
             perform_log(
@@ -1085,10 +1158,7 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = body.blocks.iter_mut().fold(false, |m, b| {
-                let m1 = fold_const_ops(&mut b.instructions, &mut body.constants);
-                m || m1
-            });
+            let modified = fold_const_ops(&mut body.instructions, &mut body.constants);
             needs_reopt = needs_reopt || modified;
 
             perform_log(f, "FoldConstants", modified, &mut last_ir_document, body);
@@ -1099,7 +1169,11 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = merge_constants(&mut body.blocks, &mut body.constants);
+            let modified = merge_constants(
+                &mut body.blocks,
+                &mut body.instructions,
+                &mut body.constants,
+            );
             needs_reopt = needs_reopt || modified;
 
             perform_log(f, "UnifyConstants", modified, &mut last_ir_document, body);
@@ -1110,7 +1184,7 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = merge_simple_goto_blocks(&mut body.blocks);
+            let modified = merge_simple_goto_blocks(&mut body.blocks, &mut body.instructions);
             needs_reopt |= modified;
 
             perform_log(
@@ -1127,7 +1201,7 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = block_aliasing(&mut body.blocks);
+            let modified = block_aliasing(&mut body.blocks, &mut body.instructions);
             needs_reopt = needs_reopt || modified;
 
             perform_log(f, "BlockAliasing", modified, &mut last_ir_document, body);
@@ -1138,10 +1212,7 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = body.blocks.iter_mut().fold(false, |m, b| {
-                let m1 = deconstruct_effectless_phi(&mut b.instructions);
-                m || m1
-            });
+            let modified = deconstruct_effectless_phi(&mut body.instructions);
             needs_reopt = needs_reopt || modified;
 
             perform_log(
@@ -1158,8 +1229,12 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let register_state_map = build_register_state_map(&body.blocks);
-            let modified = resolve_register_aliases(&mut body.blocks, &register_state_map);
+            let register_state_map = build_register_state_map(&body.blocks, &mut body.instructions);
+            let modified = resolve_register_aliases(
+                &mut body.blocks,
+                &mut body.instructions,
+                &register_state_map,
+            );
             needs_reopt = needs_reopt || modified;
 
             perform_log(
@@ -1174,10 +1249,31 @@ fn optimize<'a, 's>(
                 break;
             }
         }
+
+        loop {
+            let modified = transform_swizzle_component_store(
+                &mut body.blocks,
+                &mut body.instructions,
+                &mut body.registers,
+            );
+            needs_reopt = needs_reopt || modified;
+
+            perform_log(
+                f,
+                "TransformSwizzleComponentStore",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
+            }
+        }
     }
 
     loop {
-        let modified = strip_unreachable_blocks(&mut body.blocks);
+        let modified = strip_unreachable_blocks(&mut body.blocks, &mut body.instructions);
         needs_reopt = needs_reopt || modified;
 
         perform_log(
@@ -1196,6 +1292,7 @@ fn optimize<'a, 's>(
     loop {
         let modified = strip_unreferenced_registers(
             &mut body.blocks,
+            &mut body.instructions,
             &mut body.registers,
             &mut body.constants,
         );

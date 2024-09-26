@@ -219,7 +219,8 @@ pub struct Function<'s> {
 }
 
 pub fn reconstruct<'a, 's>(
-    blocks: &[crate::ir::block::Block<'a, 's>],
+    blocks: &[crate::ir::block::Block],
+    mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     registers: &[ConcreteType<'s>],
     const_map: &HashMap<crate::ir::block::RegisterRef, crate::ir::block::BlockInstruction<'a, 's>>,
 ) -> Function<'s> {
@@ -340,14 +341,16 @@ pub fn reconstruct<'a, 's>(
             | BlockInstruction::Phi(_)
             | BlockInstruction::RegisterAlias(_)
             | BlockInstruction::PureIntrinsicCall(_, _)
-            | BlockInstruction::PureFuncall(_, _) => {
+            | BlockInstruction::PureFuncall(_, _)
+            | BlockInstruction::CompositeInsert { .. } => {
                 unreachable!("Not a const instruction {x:?}")
             }
         }
     }
 
     fn process<'a, 's>(
-        blocks: &[crate::ir::block::Block<'a, 's>],
+        blocks: &[crate::ir::block::Block],
+        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
         registers: &[ConcreteType<'s>],
         const_map: &HashMap<
             crate::ir::block::RegisterRef,
@@ -368,13 +371,13 @@ pub fn reconstruct<'a, 's>(
         while generated {
             generated = false;
 
-            for (&r, x) in blocks[n.0].instructions.iter() {
-                if register_to_inst_const_map.contains_key(&r) {
+            for r in blocks[n.0].eval_registers.iter() {
+                if register_to_inst_const_map.contains_key(r) {
                     // 生成済み
                     continue;
                 }
 
-                match x {
+                match mod_instructions[r] {
                     BlockInstruction::ConstUnit => {
                         unreachable!("ConstUnit cannot be appeared in block")
                     }
@@ -390,10 +393,10 @@ pub fn reconstruct<'a, 's>(
                     BlockInstruction::ImmBool(_) => {
                         unreachable!("ImmBool cannot be appeared in block")
                     }
-                    &BlockInstruction::ImmSInt(_) => {
+                    BlockInstruction::ImmSInt(_) => {
                         unreachable!("ImmSInt cannot be appeared in block")
                     }
-                    &BlockInstruction::ImmUInt(_) => {
+                    BlockInstruction::ImmUInt(_) => {
                         unreachable!("ImmUInt cannot be appeared in block")
                     }
                     BlockInstruction::ImmInt(_) => unreachable!("non instantiated imm int"),
@@ -415,16 +418,18 @@ pub fn reconstruct<'a, 's>(
                         unreachable!("WorkgroupSharedMemoryRef cannot be appeared in block")
                     }
                     BlockInstruction::StaticPathRef(_) => unreachable!("deprecated"),
-                    BlockInstruction::Cast(src, ty) => match register_to_inst_const_map.get(&src) {
-                        Some(&ConstOrInst::Inst(i)) => {
-                            instructions.push(Inst::Cast(i, ty.clone()));
-                            register_to_inst_const_map
-                                .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                            generated = true;
+                    BlockInstruction::Cast(src, ref ty) => {
+                        match register_to_inst_const_map.get(&src) {
+                            Some(&ConstOrInst::Inst(i)) => {
+                                instructions.push(Inst::Cast(i, ty.clone()));
+                                register_to_inst_const_map
+                                    .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                                generated = true;
+                            }
+                            Some(ConstOrInst::Const(_)) => unimplemented!("reduce const cast"),
+                            _ => (),
                         }
-                        Some(ConstOrInst::Const(_)) => unimplemented!("reduce const cast"),
-                        _ => (),
-                    },
+                    }
                     BlockInstruction::InstantiateIntrinsicTypeClass(_, _) => {
                         unreachable!("non instantiated inst")
                     }
@@ -432,13 +437,13 @@ pub fn reconstruct<'a, 's>(
                         Some(&ConstOrInst::Inst(i)) => {
                             instructions.push(Inst::LoadRef(i));
                             register_to_inst_const_map
-                                .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                                .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                             generated = true;
                         }
                         Some(ConstOrInst::Const(_)) => unreachable!("cannot load ref of const"),
                         _ => (),
                     },
-                    &BlockInstruction::ConstructIntrinsicComposite(it, ref args) => 'try_emit: {
+                    BlockInstruction::ConstructIntrinsicComposite(it, ref args) => 'try_emit: {
                         let mut arg_refs = Vec::with_capacity(args.len());
                         for a in args.iter() {
                             let Some(x) = register_to_inst_const_map.get(a) else {
@@ -450,10 +455,10 @@ pub fn reconstruct<'a, 's>(
 
                         instructions.push(Inst::ConstructIntrinsicType(it, arg_refs));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
-                    BlockInstruction::ConstructTuple(xs) => 'try_emit: {
+                    BlockInstruction::ConstructTuple(ref xs) => 'try_emit: {
                         let mut arg_refs = Vec::with_capacity(xs.len());
                         for x in xs.iter() {
                             let Some(x) = register_to_inst_const_map.get(x) else {
@@ -465,10 +470,10 @@ pub fn reconstruct<'a, 's>(
 
                         instructions.push(Inst::ConstructComposite(arg_refs));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
-                    BlockInstruction::ConstructStruct(members) => 'try_emit: {
+                    BlockInstruction::ConstructStruct(ref members) => 'try_emit: {
                         let mut arg_refs = Vec::with_capacity(members.len());
                         for x in members.iter() {
                             let Some(x) = register_to_inst_const_map.get(x) else {
@@ -480,10 +485,10 @@ pub fn reconstruct<'a, 's>(
 
                         instructions.push(Inst::ConstructComposite(arg_refs));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
-                    &BlockInstruction::IntrinsicBinaryOp(left, op, right) => 'try_emit: {
+                    BlockInstruction::IntrinsicBinaryOp(left, op, right) => 'try_emit: {
                         let Some(left) = register_to_inst_const_map.get(&left) else {
                             break 'try_emit;
                         };
@@ -493,17 +498,17 @@ pub fn reconstruct<'a, 's>(
 
                         instructions.push(Inst::IntrinsicBinary(left.clone(), op, right.clone()));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
-                    &BlockInstruction::IntrinsicUnaryOp(value, op) => 'try_emit: {
+                    BlockInstruction::IntrinsicUnaryOp(value, op) => 'try_emit: {
                         let Some(value) = register_to_inst_const_map.get(&value) else {
                             break 'try_emit;
                         };
 
                         instructions.push(Inst::IntrinsicUnary(value.clone(), op));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
                     BlockInstruction::IntrinsicFunctionRef(_) => {
@@ -521,18 +526,18 @@ pub fn reconstruct<'a, 's>(
                     BlockInstruction::UserDefinedFunctionRef(_, _) => {
                         unreachable!("all user defined functions inlined")
                     }
-                    BlockInstruction::Swizzle(src, elements) => 'try_emit: {
+                    BlockInstruction::Swizzle(src, ref elements) => 'try_emit: {
                         let Some(src) = register_to_inst_const_map.get(&src) else {
                             break 'try_emit;
                         };
 
                         instructions.push(Inst::Swizzle(src.clone(), elements.clone()));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
                     BlockInstruction::SwizzleRef(_, _) => unimplemented!("Swizzle Ref"),
-                    &BlockInstruction::MemberRef(src, ref name) => match register_to_inst_const_map
+                    BlockInstruction::MemberRef(src, ref name) => match register_to_inst_const_map
                         .get(&src)
                     {
                         Some(&ConstOrInst::Inst(i)) => {
@@ -553,13 +558,13 @@ pub fn reconstruct<'a, 's>(
                                 ConstOrInst::Const(ConstValue::UInt(member_index as _)),
                             ));
                             register_to_inst_const_map
-                                .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                                .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                             generated = true;
                         }
                         Some(&ConstOrInst::Const(_)) => unimplemented!("member ref of const value"),
                         None => (),
                     },
-                    &BlockInstruction::TupleRef(src, index) => {
+                    BlockInstruction::TupleRef(src, index) => {
                         match register_to_inst_const_map.get(&src) {
                             Some(&ConstOrInst::Inst(i)) => {
                                 instructions.push(Inst::CompositeRef(
@@ -567,7 +572,7 @@ pub fn reconstruct<'a, 's>(
                                     ConstOrInst::Const(ConstValue::UInt(index as _)),
                                 ));
                                 register_to_inst_const_map
-                                    .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                                    .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                                 generated = true;
                             }
                             Some(&ConstOrInst::Const(_)) => {
@@ -590,12 +595,12 @@ pub fn reconstruct<'a, 's>(
 
                         instructions.push(Inst::CompositeRef(source, index.clone()));
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
                     BlockInstruction::Phi(_) => unimplemented!("phi decoding"),
                     BlockInstruction::RegisterAlias(_) => unreachable!("Unresolved register alias"),
-                    BlockInstruction::PureIntrinsicCall(identifier, args) => 'try_emit: {
+                    BlockInstruction::PureIntrinsicCall(identifier, ref args) => 'try_emit: {
                         let mut arg_refs = Vec::with_capacity(args.len());
                         for a in args.iter() {
                             let Some(x) = register_to_inst_const_map.get(a) else {
@@ -610,12 +615,13 @@ pub fn reconstruct<'a, 's>(
                             args: arg_refs,
                         });
                         register_to_inst_const_map
-                            .insert(r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
+                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                         generated = true;
                     }
                     BlockInstruction::PureFuncall(_, _) => {
                         unreachable!("all user defined functions inlined")
                     }
+                    BlockInstruction::CompositeInsert { .. } => unimplemented!(),
                 }
             }
         }
@@ -626,6 +632,7 @@ pub fn reconstruct<'a, 's>(
             BlockFlowInstruction::Goto(next) => {
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     next,
@@ -647,6 +654,7 @@ pub fn reconstruct<'a, 's>(
 
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     after.unwrap(),
@@ -691,6 +699,7 @@ pub fn reconstruct<'a, 's>(
                     .insert(result, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     after_return.unwrap(),
@@ -714,6 +723,7 @@ pub fn reconstruct<'a, 's>(
                 let mut true_last_block = n;
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     r#true,
@@ -726,6 +736,7 @@ pub fn reconstruct<'a, 's>(
                 let mut false_last_block = n;
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     r#false,
@@ -736,10 +747,10 @@ pub fn reconstruct<'a, 's>(
                 );
 
                 if let Some((merge_phi_register, merge_phi_incomings)) = blocks[merge.0]
-                    .instructions
+                    .eval_registers
                     .iter()
-                    .find_map(|(r, x)| match x {
-                        BlockInstruction::Phi(incomings) => Some((*r, incomings)),
+                    .find_map(|r| match mod_instructions[r] {
+                        BlockInstruction::Phi(ref incomings) => Some((*r, incomings)),
                         _ => None,
                     })
                 {
@@ -791,6 +802,7 @@ pub fn reconstruct<'a, 's>(
 
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     merge,
@@ -814,6 +826,7 @@ pub fn reconstruct<'a, 's>(
                 let mut body_last_block = body;
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     body,
@@ -829,6 +842,7 @@ pub fn reconstruct<'a, 's>(
                 });
                 process(
                     blocks,
+                    mod_instructions,
                     registers,
                     const_map,
                     r#break,
@@ -857,6 +871,7 @@ pub fn reconstruct<'a, 's>(
 
     process(
         blocks,
+        mod_instructions,
         registers,
         const_map,
         crate::ir::block::BlockRef(0),

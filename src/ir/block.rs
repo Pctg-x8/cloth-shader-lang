@@ -26,9 +26,16 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RegisterRef(pub usize);
 impl RegisterRef {
-    pub fn ty<'c, 's>(self, ctx: &'c BlockGenerationContext<'_, 's>) -> &'c ConcreteType<'s> {
-        ctx.register_type(self)
+    pub fn ty<'c, 's>(
+        self,
+        p: &'c (impl RegisterTypeProvider<'c, 's> + ?Sized),
+    ) -> &'c ConcreteType<'s> {
+        p.register_type(self)
     }
+}
+
+pub trait RegisterTypeProvider<'c, 's> {
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s>;
 }
 
 #[repr(transparent)]
@@ -286,6 +293,11 @@ pub enum BlockInstruction<'a, 's> {
     RegisterAlias(RegisterRef),
     PureIntrinsicCall(&'static str, Vec<RegisterRef>),
     PureFuncall(RegisterRef, Vec<RegisterRef>),
+    CompositeInsert {
+        value: RegisterRef,
+        source: RegisterRef,
+        index: usize,
+    },
 }
 impl<'a, 's> BlockInstruction<'a, 's> {
     #[inline(always)]
@@ -395,6 +407,16 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 relocator(x);
                 modified || x.0 != x0
             }),
+            Self::CompositeInsert {
+                ref mut value,
+                ref mut source,
+                ..
+            } => {
+                let (x0, y0) = (value.0, source.0);
+                relocator(value);
+                relocator(source);
+                x0 != value.0 || y0 != source.0
+            }
         }
     }
 
@@ -534,19 +556,39 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::CompositeInsert {
+                value: RegisterRef(value),
+                source: RegisterRef(source),
+                index,
+            } => write!(w, "CompositeInsert r{source}.{index} <- r{value}"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Block<'a, 's> {
-    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+pub struct Block {
+    pub eval_registers: HashSet<RegisterRef>,
     pub flow: BlockFlowInstruction,
 }
-impl<'a, 's> Block<'a, 's> {
+impl Block {
     #[inline(always)]
-    pub fn has_block_dependent_instructions(&self) -> bool {
-        self.instructions.values().any(|x| x.is_block_dependent())
+    pub fn flow_only(flow: BlockFlowInstruction) -> Self {
+        Self {
+            eval_registers: HashSet::new(),
+            flow,
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_block_dependent_instructions(
+        &self,
+        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+    ) -> bool {
+        self.eval_registers.iter().any(|r| {
+            mod_instructions
+                .get(r)
+                .is_some_and(|x| x.is_block_dependent())
+        })
     }
 
     #[inline(always)]
@@ -558,14 +600,37 @@ impl<'a, 's> Block<'a, 's> {
     }
 
     #[inline(always)]
-    pub fn relocate_register(&mut self, relocator: impl FnMut(&mut RegisterRef) + Copy) -> bool {
-        let mod_insts = self
-            .instructions
-            .values_mut()
-            .fold(false, |m, x| x.relocate_register(relocator) || m);
+    pub fn relocate_register(
+        &mut self,
+        mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+        relocator: impl FnMut(&mut RegisterRef) + Copy,
+    ) -> bool {
+        let mut mod_insts = false;
+        for r in self.eval_registers.iter() {
+            let modified = match mod_instructions.get_mut(r) {
+                Some(x) => x.relocate_register(relocator),
+                None => false,
+            };
+            mod_insts = mod_insts || modified;
+        }
         let mod_flow = self.flow.relocate_register(relocator);
 
         mod_insts || mod_flow
+    }
+
+    /// phiにoldからのものがあったらnewからのものにコピー
+    #[inline]
+    pub fn dup_phi_incoming(
+        &mut self,
+        mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+        old: BlockRef,
+        new: BlockRef,
+    ) {
+        for r in self.eval_registers.iter() {
+            if let Some(x) = mod_instructions.get_mut(r) {
+                x.dup_phi_incoming(old, new);
+            }
+        }
     }
 
     pub fn try_set_next(&mut self, next: BlockRef) -> bool {
@@ -613,21 +678,32 @@ impl<'a, 's> Block<'a, 's> {
 
 pub struct BlockInstructionEmitter<'c, 'a, 's> {
     pub generation_context: &'c mut BlockGenerationContext<'a, 's>,
-    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    pub instruction_emission_context: &'c mut BlockInstructionEmissionContext<'a, 's>,
+    pub block_eval_registers: HashSet<RegisterRef>,
+}
+impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmitter<'c, 'a, 's> {
+    #[inline(always)]
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
+        self.instruction_emission_context.register_type(register)
+    }
 }
 impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     #[inline]
-    pub fn new(generation_context: &'c mut BlockGenerationContext<'a, 's>) -> Self {
+    pub fn new(
+        generation_context: &'c mut BlockGenerationContext<'a, 's>,
+        instruction_emission_context: &'c mut BlockInstructionEmissionContext<'a, 's>,
+    ) -> Self {
         Self {
             generation_context,
-            instructions: HashMap::new(),
+            instruction_emission_context,
+            block_eval_registers: HashSet::new(),
         }
     }
 
     #[inline(always)]
-    pub fn into_block(self, flow: BlockFlowInstruction) -> Block<'a, 's> {
+    pub fn into_block(self, flow: BlockFlowInstruction) -> Block {
         Block {
-            instructions: self.instructions,
+            eval_registers: self.block_eval_registers,
             flow,
         }
     }
@@ -635,29 +711,35 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     #[inline(always)]
     pub fn create_block(self, flow: BlockFlowInstruction) -> BlockRef {
         let blk = Block {
-            instructions: self.instructions,
+            eval_registers: self.block_eval_registers,
             flow,
         };
 
         self.generation_context.add(blk)
     }
 
-    pub fn into_instructions(self) -> HashMap<RegisterRef, BlockInstruction<'a, 's>> {
-        self.instructions
+    pub fn into_eval_registers(self) -> HashSet<RegisterRef> {
+        self.block_eval_registers
+    }
+
+    fn add_instruction(&mut self, dest_reg: RegisterRef, inst: BlockInstruction<'a, 's>) {
+        self.instruction_emission_context
+            .instructions
+            .insert(dest_reg, inst);
+        self.block_eval_registers.insert(dest_reg);
     }
 
     #[inline]
     pub fn loaded(&mut self, ptr: RegisterRef) -> RegisterRef {
-        match ptr.ty(self.generation_context) {
+        match ptr.ty(self) {
             ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => self.load_ref(ptr),
             _ => ptr,
         }
     }
 
     pub fn cast(&mut self, src: RegisterRef, to: ConcreteType<'s>) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(to.clone());
-        self.instructions
-            .insert(dest_register, BlockInstruction::Cast(src, to));
+        let dest_register = self.instruction_emission_context.alloc_register(to.clone());
+        self.add_instruction(dest_register, BlockInstruction::Cast(src, to));
 
         dest_register
     }
@@ -667,8 +749,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         src: RegisterRef,
         to: IntrinsicType,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(to.into());
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(to.into());
+        self.add_instruction(
             dest_register,
             BlockInstruction::InstantiateIntrinsicTypeClass(src, to),
         );
@@ -677,15 +759,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     }
 
     pub fn load_ref(&mut self, ptr: RegisterRef) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(
-            self.generation_context
-                .register_type(ptr)
-                .as_dereferenced()
-                .unwrap()
-                .clone(),
-        );
-        self.instructions
-            .insert(dest_register, BlockInstruction::LoadRef(ptr));
+        let dest_register = self
+            .instruction_emission_context
+            .alloc_register(ptr.ty(self).as_dereferenced().unwrap().clone());
+        self.add_instruction(dest_register, BlockInstruction::LoadRef(ptr));
 
         dest_register
     }
@@ -695,8 +772,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         it: IntrinsicType,
         args: Vec<RegisterRef>,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(it.into());
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(it.into());
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstructIntrinsicComposite(it, args),
         );
@@ -705,16 +782,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     }
 
     pub fn construct_tuple(&mut self, elements: Vec<RegisterRef>) -> RegisterRef {
-        let ty = ConcreteType::Tuple(
-            elements
-                .iter()
-                .map(|r| r.ty(self.generation_context).clone())
-                .collect(),
-        );
+        let ty = ConcreteType::Tuple(elements.iter().map(|r| r.ty(self).clone()).collect());
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::ConstructTuple(elements));
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
 
         dest_register
     }
@@ -724,19 +794,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         elements: Vec<RegisterRef>,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(out_type);
-        self.instructions
-            .insert(dest_register, BlockInstruction::ConstructStruct(elements));
+        let dest_register = self.instruction_emission_context.alloc_register(out_type);
+        self.add_instruction(dest_register, BlockInstruction::ConstructStruct(elements));
 
         dest_register
     }
 
     pub fn promote_int_to_number(&mut self, r: RegisterRef) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(ConcreteType::UnknownNumberClass);
-        self.instructions
-            .insert(dest_register, BlockInstruction::PromoteIntToNumber(r));
+        self.add_instruction(dest_register, BlockInstruction::PromoteIntToNumber(r));
 
         dest_register
     }
@@ -748,8 +816,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         right: RegisterRef,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(out_type);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(out_type);
+        self.add_instruction(
             dest_register,
             BlockInstruction::IntrinsicBinaryOp(left, op, right),
         );
@@ -763,9 +831,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         op: IntrinsicUnaryOperation,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(out_type);
-        self.instructions
-            .insert(dest_register, BlockInstruction::IntrinsicUnaryOp(value, op));
+        let dest_register = self.instruction_emission_context.alloc_register(out_type);
+        self.add_instruction(dest_register, BlockInstruction::IntrinsicUnaryOp(value, op));
 
         dest_register
     }
@@ -775,14 +842,14 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         overloads: Vec<IntrinsicFunctionSymbol>,
     ) -> RegisterRef {
         let dest_register =
-            self.generation_context
+            self.instruction_emission_context
                 .alloc_register(ConcreteType::OverloadedFunctions(
                     overloads
                         .iter()
                         .map(|s| (s.args.clone(), Box::new(s.output.clone())))
                         .collect(),
                 ));
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::IntrinsicFunctionRef(overloads),
         );
@@ -792,9 +859,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn intrinsic_type_constructor_ref(&mut self, it: IntrinsicType) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(ConcreteType::IntrinsicTypeConstructor(it));
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::IntrinsicTypeConstructorRef(it),
         );
@@ -809,8 +876,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.local_vars.borrow()[var_id].ty.clone().imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id),
         );
@@ -825,8 +892,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.local_vars.borrow()[var_id].ty.clone().mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id),
         );
@@ -841,8 +908,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.function_input_vars[var_id].ty.clone().imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id),
         );
@@ -857,8 +924,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.function_input_vars[var_id].ty.clone().mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id),
         );
@@ -883,8 +950,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
             },
         };
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::UserDefinedFunctionRef(PtrEq(scope), SourceRefSliceEq(name)),
         );
@@ -895,16 +962,15 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     pub fn swizzle(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
         let ty = ConcreteType::from(
             source
-                .ty(self.generation_context)
+                .ty(self)
                 .scalar_type()
                 .unwrap()
                 .of_vector(elements.len().try_into().unwrap())
                 .unwrap(),
         );
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::Swizzle(source, elements));
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::Swizzle(source, elements));
 
         dest_register
     }
@@ -912,7 +978,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     pub fn swizzle_ref(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
         let ty = ConcreteType::from(
             source
-                .ty(self.generation_context)
+                .ty(self)
                 .as_dereferenced()
                 .unwrap()
                 .scalar_type()
@@ -922,8 +988,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         )
         .imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::SwizzleRef(source, elements),
         );
@@ -938,7 +1004,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = ConcreteType::from(
             source
-                .ty(self.generation_context)
+                .ty(self)
                 .as_dereferenced()
                 .unwrap()
                 .scalar_type()
@@ -948,8 +1014,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         )
         .mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::SwizzleRef(source, elements),
         );
@@ -965,8 +1031,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = member_type.imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::MemberRef(source, SourceRefSliceEq(name)),
         );
@@ -982,8 +1048,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = member_type.mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions.insert(
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(
             dest_register,
             BlockInstruction::MemberRef(source, SourceRefSliceEq(name)),
         );
@@ -999,9 +1065,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = element_type.imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::ArrayRef { source, index });
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::ArrayRef { source, index });
 
         dest_register
     }
@@ -1014,9 +1079,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = element_type.mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::ArrayRef { source, index });
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::ArrayRef { source, index });
 
         dest_register
     }
@@ -1029,9 +1093,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = element_type.imm_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::TupleRef(source, index));
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::TupleRef(source, index));
 
         dest_register
     }
@@ -1044,18 +1107,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = element_type.mutable_ref();
 
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::TupleRef(source, index));
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::TupleRef(source, index));
 
         dest_register
     }
 
     pub fn const_int(&mut self, repr: SourceRef<'s>) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(ConcreteType::UnknownIntClass);
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstInt(ConstIntLiteral(
                 SourceRefSliceEq(repr),
@@ -1068,9 +1130,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn const_number(&mut self, repr: SourceRef<'s>) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(ConcreteType::UnknownNumberClass);
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstNumber(ConstNumberLiteral(
                 SourceRefSliceEq(repr),
@@ -1083,9 +1145,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn const_uint(&mut self, repr: SourceRef<'s>) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(IntrinsicType::UInt.into());
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstUInt(ConstUIntLiteral(
                 SourceRefSliceEq(repr),
@@ -1098,9 +1160,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn const_sint(&mut self, repr: SourceRef<'s>) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(IntrinsicType::SInt.into());
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstSInt(ConstSIntLiteral(
                 SourceRefSliceEq(repr),
@@ -1113,9 +1175,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn const_float(&mut self, repr: SourceRef<'s>) -> RegisterRef {
         let dest_register = self
-            .generation_context
+            .instruction_emission_context
             .alloc_register(IntrinsicType::Float.into());
-        self.instructions.insert(
+        self.add_instruction(
             dest_register,
             BlockInstruction::ConstFloat(ConstFloatLiteral(
                 SourceRefSliceEq(repr),
@@ -1131,26 +1193,27 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         incoming_selectors: BTreeMap<BlockRef, RegisterRef>,
         ty: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.generation_context.alloc_register(ty);
-        self.instructions
-            .insert(dest_register, BlockInstruction::Phi(incoming_selectors));
+        let dest_register = self.instruction_emission_context.alloc_register(ty);
+        self.add_instruction(dest_register, BlockInstruction::Phi(incoming_selectors));
 
         dest_register
     }
 }
 
-pub struct BlockGenerationContext<'a, 's> {
-    pub symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>,
-    pub blocks: Vec<Block<'a, 's>>,
+pub struct BlockInstructionEmissionContext<'a, 's> {
     pub registers: Vec<ConcreteType<'s>>,
+    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 }
-impl<'a, 's> BlockGenerationContext<'a, 's> {
-    #[inline]
-    pub fn new(symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>) -> Self {
+impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmissionContext<'a, 's> {
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
+        &self.registers[register.0]
+    }
+}
+impl<'a, 's> BlockInstructionEmissionContext<'a, 's> {
+    pub fn new() -> Self {
         Self {
-            symbol_scope_arena,
-            blocks: Vec::new(),
             registers: Vec::new(),
+            instructions: HashMap::new(),
         }
     }
 
@@ -1160,18 +1223,36 @@ impl<'a, 's> BlockGenerationContext<'a, 's> {
         RegisterRef(self.registers.len() - 1)
     }
 
-    pub fn register_type(&self, r: RegisterRef) -> &ConcreteType<'s> {
-        &self.registers[r.0]
+    #[inline]
+    pub fn const_unit(&mut self) -> RegisterRef {
+        let r = self.alloc_register(IntrinsicType::Unit.into());
+        self.instructions.insert(r, BlockInstruction::ConstUnit);
+
+        r
+    }
+}
+
+pub struct BlockGenerationContext<'a, 's> {
+    pub symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>,
+    pub blocks: Vec<Block>,
+}
+impl<'a, 's> BlockGenerationContext<'a, 's> {
+    #[inline]
+    pub fn new(symbol_scope_arena: &'a Arena<SymbolScope<'a, 's>>) -> Self {
+        Self {
+            symbol_scope_arena,
+            blocks: Vec::new(),
+        }
     }
 
-    pub fn add(&mut self, blk: Block<'a, 's>) -> BlockRef {
+    pub fn add(&mut self, blk: Block) -> BlockRef {
         self.blocks.push(blk);
 
         BlockRef(self.blocks.len() - 1)
     }
 
     #[inline(always)]
-    pub fn block_mut(&mut self, index: BlockRef) -> &mut Block<'a, 's> {
+    pub fn block_mut(&mut self, index: BlockRef) -> &mut Block {
         &mut self.blocks[index.0]
     }
 
@@ -1180,10 +1261,15 @@ impl<'a, 's> BlockGenerationContext<'a, 's> {
         self.blocks[from.0].try_set_next(to)
     }
 
-    pub fn dump_blocks(&self, writer: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+    pub fn dump_blocks(
+        &self,
+        writer: &mut (impl Write + ?Sized),
+        registers: &[ConcreteType<'s>],
+        mod_instructions: &HashMap<RegisterRef, BlockInstruction>,
+    ) -> std::io::Result<()> {
         writeln!(writer, "Registers: ")?;
-        dump_registers(writer, &self.registers)?;
-        dump_blocks(writer, &self.blocks)?;
+        dump_registers(writer, registers)?;
+        dump_blocks(writer, &self.blocks, mod_instructions)?;
 
         Ok(())
     }
@@ -1203,17 +1289,20 @@ pub fn dump_registers(
 pub fn dump_blocks(
     writer: &mut (impl std::io::Write + ?Sized),
     blocks: &[Block],
+    mod_instructions: &HashMap<RegisterRef, BlockInstruction>,
 ) -> std::io::Result<()> {
     for (n, b) in blocks.iter().enumerate() {
         writeln!(writer, "b{n}: {{")?;
 
-        if !b.instructions.is_empty() {
-            let mut sorted = b.instructions.iter().collect::<Vec<_>>();
-            sorted.sort_by_key(|&(&RegisterRef(r), _)| r);
-            for (RegisterRef(r), i) in sorted {
-                write!(writer, "  r{r} = ")?;
-                i.dump(writer)?;
-                writer.write(b"\n")?;
+        if !b.eval_registers.is_empty() {
+            let mut sorted = b.eval_registers.iter().collect::<Vec<_>>();
+            sorted.sort_by_key(|&RegisterRef(r)| r);
+            for r in sorted {
+                if let Some(x) = mod_instructions.get(&r) {
+                    write!(writer, "  r{} = ", r.0)?;
+                    x.dump(writer)?;
+                    writer.write(b"\n")?;
+                }
             }
 
             writer.write(b"\n")?;
@@ -1301,6 +1390,7 @@ pub fn transform_statement<'a, 's>(
     statement: StatementNode<'s>,
     scope: &'a SymbolScope<'a, 's>,
     ctx: &mut BlockGenerationContext<'a, 's>,
+    inst_ctx: &mut BlockInstructionEmissionContext<'a, 's>,
 ) -> (BlockRef, BlockRef) {
     match statement {
         StatementNode::Let {
@@ -1310,13 +1400,13 @@ pub fn transform_statement<'a, 's>(
             ..
         } => {
             let expr_scope = ctx.symbol_scope_arena.alloc(scope.new_child());
-            let expr = simplify_expression(expr, ctx, expr_scope);
+            let expr = simplify_expression(expr, ctx, inst_ctx, expr_scope);
 
-            let mut inst = BlockInstructionEmitter::new(ctx);
+            let mut inst = BlockInstructionEmitter::new(ctx, inst_ctx);
             let expr_value = inst.loaded(expr.result);
             let VarId::ScopeLocal(var_id) = scope.declare_local_var(
                 SourceRef::from(&varname_token),
-                expr_value.ty(inst.generation_context).clone(),
+                expr_value.ty(inst.instruction_emission_context).clone(),
                 mut_token.is_some(),
             ) else {
                 unreachable!();
@@ -1340,22 +1430,23 @@ pub fn transform_statement<'a, 's>(
             opeq_token,
             expr,
         } => {
-            let left_ref_expr = simplify_lefthand_expression(left_expr, ctx, scope);
+            let left_ref_expr = simplify_lefthand_expression(left_expr, ctx, inst_ctx, scope);
             let right_expr_scope = ctx.symbol_scope_arena.alloc(scope.new_child());
-            let right_expr = simplify_expression(expr, ctx, right_expr_scope);
+            let right_expr = simplify_expression(expr, ctx, inst_ctx, right_expr_scope);
 
-            let mut inst = BlockInstructionEmitter::new(ctx);
+            let mut inst = BlockInstructionEmitter::new(ctx, inst_ctx);
             let right_value = inst.loaded(right_expr.result);
             let right_value = match opeq_token.slice {
                 "=" => right_value,
                 "+=" | "-=" | "*=" | "/=" | "%=" | "^^=" | "&=" | "|=" | "^=" | "<<=" | ">>="
                 | "&&=" | "||=" => {
-                    let left_expr_loaded = match left_ref_expr.result.ty(inst.generation_context) {
-                        ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
-                            inst.load_ref(left_ref_expr.result)
-                        }
-                        _ => unreachable!("cannot store to right hand value"),
-                    };
+                    let left_expr_loaded =
+                        match left_ref_expr.result.ty(inst.instruction_emission_context) {
+                            ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
+                                inst.load_ref(left_ref_expr.result)
+                            }
+                            _ => unreachable!("cannot store to right hand value"),
+                        };
 
                     binary_op(
                         left_expr_loaded,
@@ -1370,9 +1461,9 @@ pub fn transform_statement<'a, 's>(
                 }
                 _ => unreachable!("unknown opeq token"),
             };
-            let right_value = match left_ref_expr.result.ty(inst.generation_context) {
+            let right_value = match left_ref_expr.result.ty(inst.instruction_emission_context) {
                 ConcreteType::MutableRef(inner) => {
-                    match (right_value.ty(inst.generation_context), &**inner) {
+                    match (right_value.ty(inst.instruction_emission_context), &**inner) {
                         (a, b) if a == b => right_value,
                         (
                             ConcreteType::UnknownIntClass,
@@ -1429,7 +1520,7 @@ pub fn transform_statement<'a, 's>(
             (left_ref_expr.start_block, perform_block)
         }
         StatementNode::Expression(x) => {
-            let expr = simplify_expression(x, ctx, scope);
+            let expr = simplify_expression(x, ctx, inst_ctx, scope);
 
             (expr.start_block, expr.end_block)
         }
@@ -1437,27 +1528,19 @@ pub fn transform_statement<'a, 's>(
             condition, runs, ..
         } => {
             let condition_scope = ctx.symbol_scope_arena.alloc(scope.new_child());
-            let condition = simplify_expression(condition, ctx, condition_scope);
+            let condition = simplify_expression(condition, ctx, inst_ctx, condition_scope);
             let runs_scope = ctx.symbol_scope_arena.alloc(scope.new_child());
-            let runs = simplify_expression(runs, ctx, runs_scope);
+            let runs = simplify_expression(runs, ctx, inst_ctx, runs_scope);
 
-            let runs_final_block = ctx.add(Block {
-                instructions: HashMap::new(),
-                flow: BlockFlowInstruction::Continue,
-            });
-            let merge_block = ctx.add(Block {
-                instructions: HashMap::new(),
-                flow: BlockFlowInstruction::Undetermined,
-            });
-            let loop_head_block = ctx.add(Block {
-                instructions: HashMap::new(),
-                flow: BlockFlowInstruction::ConditionalLoop {
+            let runs_final_block = ctx.add(Block::flow_only(BlockFlowInstruction::Continue));
+            let merge_block = ctx.add(Block::flow_only(BlockFlowInstruction::Undetermined));
+            let loop_head_block =
+                ctx.add(Block::flow_only(BlockFlowInstruction::ConditionalLoop {
                     condition: condition.result,
                     r#break: merge_block,
                     r#continue: condition.start_block,
                     body: runs.start_block,
-                },
-            });
+                }));
 
             assert!(
                 ctx.try_chain(condition.end_block, loop_head_block),

@@ -22,8 +22,8 @@ use crate::{
 
 use super::{
     block::{
-        Block, BlockFlowInstruction, BlockGenerationContext, BlockInstruction, BlockRef,
-        IntrinsicBinaryOperation,
+        Block, BlockFlowInstruction, BlockGenerationContext, BlockInstruction,
+        BlockInstructionEmissionContext, BlockRef, IntrinsicBinaryOperation,
     },
     expr::{ConstModifiers, ScopeCaptureSource, SimplifiedExpression},
     ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral, ExprRef,
@@ -119,7 +119,10 @@ fn replace_inlined_function_input_refs<'a, 's>(
     }
 }
 
-pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
+pub fn merge_simple_goto_blocks<'a, 's>(
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+) -> bool {
     let mut modified = false;
 
     for n in 0..blocks.len() {
@@ -132,10 +135,12 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                 )
             };
 
-            if !merged.has_block_dependent_instructions() && !merged.is_loop_term_block() {
+            if !merged.has_block_dependent_instructions(mod_instructions)
+                && !merged.is_loop_term_block()
+            {
                 current
-                    .instructions
-                    .extend(merged.instructions.iter().map(|(&r, x)| (r, x.clone())));
+                    .eval_registers
+                    .extend(merged.eval_registers.iter().copied());
                 current.flow = merged.flow.clone();
 
                 match merged.flow {
@@ -154,9 +159,7 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
                         println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_after.0);
-                        for x in blocks[new_after.0].instructions.values_mut() {
-                            x.dup_phi_incoming(next, BlockRef(n));
-                        }
+                        blocks[new_after.0].dup_phi_incoming(mod_instructions, next, BlockRef(n));
                     }
                     BlockFlowInstruction::Conditional {
                         r#true: new_true_after,
@@ -165,13 +168,17 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
                         println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_true_after.0);
-                        for x in blocks[new_true_after.0].instructions.values_mut() {
-                            x.dup_phi_incoming(next, BlockRef(n));
-                        }
+                        blocks[new_true_after.0].dup_phi_incoming(
+                            mod_instructions,
+                            next,
+                            BlockRef(n),
+                        );
                         println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_false_after.0);
-                        for x in blocks[new_false_after.0].instructions.values_mut() {
-                            x.dup_phi_incoming(next, BlockRef(n));
-                        }
+                        blocks[new_false_after.0].dup_phi_incoming(
+                            mod_instructions,
+                            next,
+                            BlockRef(n),
+                        );
                     }
                     BlockFlowInstruction::ConditionalLoop {
                         r#break: new_break_after,
@@ -180,13 +187,17 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
                     } => {
                         // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
                         println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_break_after.0);
-                        for x in blocks[new_break_after.0].instructions.values_mut() {
-                            x.dup_phi_incoming(next, BlockRef(n));
-                        }
+                        blocks[new_break_after.0].dup_phi_incoming(
+                            mod_instructions,
+                            next,
+                            BlockRef(n),
+                        );
                         println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_body_after.0);
-                        for x in blocks[new_body_after.0].instructions.values_mut() {
-                            x.dup_phi_incoming(next, BlockRef(n));
-                        }
+                        blocks[new_body_after.0].dup_phi_incoming(
+                            mod_instructions,
+                            next,
+                            BlockRef(n),
+                        );
                     }
                     BlockFlowInstruction::Break | BlockFlowInstruction::Continue => {
                         unreachable!("break/continue cannot determine new_after")
@@ -210,7 +221,10 @@ pub fn merge_simple_goto_blocks(blocks: &mut [Block]) -> bool {
     modified
 }
 
-pub fn strip_unreachable_blocks(blocks: &mut Vec<Block>) -> bool {
+pub fn strip_unreachable_blocks<'a, 's>(
+    blocks: &mut Vec<Block>,
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+) -> bool {
     let mut incomings = HashSet::new();
     // block 0 always have incoming
     incomings.insert(BlockRef(0));
@@ -262,9 +276,9 @@ pub fn strip_unreachable_blocks(blocks: &mut Vec<Block>) -> bool {
 
         // shift refs after n
         for b in blocks.iter_mut() {
-            for x in b.instructions.values_mut() {
-                match x {
-                    BlockInstruction::Phi(ref mut incoming_selectors) => {
+            for r in b.eval_registers.iter() {
+                match mod_instructions.get_mut(r) {
+                    Some(BlockInstruction::Phi(ref mut incoming_selectors)) => {
                         for (k, v) in core::mem::replace(incoming_selectors, BTreeMap::new()) {
                             if k == n {
                                 // drop
@@ -761,13 +775,16 @@ pub fn fold_const_ops<'a, 's>(
     modified
 }
 
-pub fn block_aliasing(blocks: &mut [Block]) -> bool {
+pub fn block_aliasing<'a, 's>(
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+) -> bool {
     let block_aliases_to = blocks
         .iter()
         .enumerate()
         .filter_map(|(n, b)| match b {
             &Block {
-                ref instructions,
+                eval_registers: ref instructions,
                 flow: BlockFlowInstruction::Goto(to),
             } if instructions.is_empty() => Some((BlockRef(n), to)),
             _ => None,
@@ -781,56 +798,23 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
     let mut modified = false;
     for n in 0..blocks.len() {
         match blocks[n].flow {
-            BlockFlowInstruction::Goto(ref mut next) => {
-                if let Some(&skip) = block_aliases_to.get(next) {
-                    // skip先のphiにnextからのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*next, BlockRef(n));
-                    }
-
-                    *next = skip;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::StoreRef {
+            BlockFlowInstruction::Goto(ref mut next)
+            | BlockFlowInstruction::StoreRef {
                 after: Some(ref mut next),
                 ..
-            } => {
-                if let Some(&skip) = block_aliases_to.get(next) {
-                    // skip先のphiにnextからのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*next, BlockRef(n));
-                    }
-
-                    *next = skip;
-                    modified = true;
-                }
             }
-            BlockFlowInstruction::Funcall {
+            | BlockFlowInstruction::Funcall {
+                after_return: Some(ref mut next),
+                ..
+            }
+            | BlockFlowInstruction::IntrinsicImpureFuncall {
                 after_return: Some(ref mut next),
                 ..
             } => {
                 if let Some(&skip) = block_aliases_to.get(next) {
-                    // skip先のphiにnextからのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*next, BlockRef(n));
-                    }
+                    let from = core::mem::replace(next, skip);
+                    blocks[skip.0].dup_phi_incoming(mod_instructions, from, BlockRef(n));
 
-                    *next = skip;
-                    modified = true;
-                }
-            }
-            BlockFlowInstruction::IntrinsicImpureFuncall {
-                after_return: Some(ref mut next),
-                ..
-            } => {
-                if let Some(&skip) = block_aliases_to.get(next) {
-                    // skip先のphiにnextからのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*next, BlockRef(n));
-                    }
-
-                    *next = skip;
                     modified = true;
                 }
             }
@@ -839,23 +823,19 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 ref mut r#false,
                 ..
             } => {
-                if let Some(&skip) = block_aliases_to.get(r#true) {
-                    // skip先のphiに分岐先からのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*r#true, BlockRef(n));
-                    }
+                let old_true = block_aliases_to
+                    .get(r#true)
+                    .map(|&skip| (core::mem::replace(r#true, skip), skip));
+                let old_false = block_aliases_to
+                    .get(r#false)
+                    .map(|&skip| (core::mem::replace(r#false, skip), skip));
 
-                    *r#true = skip;
+                if let Some((from, skip)) = old_true {
+                    blocks[skip.0].dup_phi_incoming(mod_instructions, from, BlockRef(n));
                     modified = true;
                 }
-
-                if let Some(&skip) = block_aliases_to.get(r#false) {
-                    // skip先のphiに分岐先からのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*r#false, BlockRef(n));
-                    }
-
-                    *r#false = skip;
+                if let Some((from, skip)) = old_false {
+                    blocks[skip.0].dup_phi_incoming(mod_instructions, from, BlockRef(n));
                     modified = true;
                 }
             }
@@ -864,23 +844,19 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
                 ref mut body,
                 ..
             } => {
-                if let Some(&skip) = block_aliases_to.get(r#break) {
-                    // skip先のphiに分岐先からのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*r#break, BlockRef(n));
-                    }
+                let old_break = block_aliases_to
+                    .get(r#break)
+                    .map(|&skip| (core::mem::replace(r#break, skip), skip));
+                let old_body = block_aliases_to
+                    .get(body)
+                    .map(|&skip| (core::mem::replace(body, skip), skip));
 
-                    *r#break = skip;
+                if let Some((from, skip)) = old_break {
+                    blocks[skip.0].dup_phi_incoming(mod_instructions, from, BlockRef(n));
                     modified = true;
                 }
-
-                if let Some(&skip) = block_aliases_to.get(body) {
-                    // skip先のphiに分岐先からのものがあったらコピー
-                    for x in blocks[skip.0].instructions.values_mut() {
-                        x.dup_phi_incoming(*body, BlockRef(n));
-                    }
-
-                    *body = skip;
+                if let Some((from, skip)) = old_body {
+                    blocks[skip.0].dup_phi_incoming(mod_instructions, from, BlockRef(n));
                     modified = true;
                 }
             }
@@ -893,6 +869,7 @@ pub fn block_aliasing(blocks: &mut [Block]) -> bool {
 
 pub fn resolve_intrinsic_funcalls<'a, 's>(
     block_ctx: &mut BlockGenerationContext<'a, 's>,
+    inst_ctx: &mut BlockInstructionEmissionContext<'a, 's>,
     const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 ) -> bool {
     let mut modified = false;
@@ -908,7 +885,8 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
                 Some(&BlockInstruction::IntrinsicTypeConstructorRef(ty)) => {
                     let inst = BlockInstruction::ConstructIntrinsicComposite(ty, args.clone());
 
-                    block_ctx.blocks[n].instructions.insert(result, inst);
+                    inst_ctx.instructions.insert(result, inst);
+                    block_ctx.blocks[n].eval_registers.insert(result);
                     block_ctx.blocks[n].flow = BlockFlowInstruction::Goto(after_return.unwrap());
                     modified = true;
                 }
@@ -919,7 +897,7 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
                             o.args
                                 .iter()
                                 .zip(args.iter())
-                                .all(|(def, call)| def == call.ty(block_ctx))
+                                .all(|(def, call)| def == call.ty(inst_ctx))
                         })
                         .expect("Error: no matching overload found");
 
@@ -929,7 +907,8 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
                             args.clone(),
                         );
 
-                        block_ctx.blocks[n].instructions.insert(result, inst);
+                        inst_ctx.instructions.insert(result, inst);
+                        block_ctx.blocks[n].eval_registers.insert(result);
                         block_ctx.blocks[n].flow =
                             BlockFlowInstruction::Goto(after_return.unwrap());
                         modified = true;
@@ -952,7 +931,8 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
 }
 
 pub fn merge_constants<'a, 's>(
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 ) -> bool {
     let mut const_to_register_map = HashMap::new();
@@ -982,7 +962,7 @@ pub fn merge_constants<'a, 's>(
     }
 
     let mut modified = blocks.iter_mut().fold(false, |m, b| {
-        let m1 = b.relocate_register(|r| {
+        let m1 = b.relocate_register(mod_instructions, |r| {
             while let Some(&&nr) = register_rewrite_map.get(r) {
                 *r = nr;
             }
@@ -1003,7 +983,8 @@ pub fn merge_constants<'a, 's>(
 }
 
 pub fn inline_function2<'a, 's>(
-    blocks: &mut Vec<Block<'a, 's>>,
+    blocks: &mut Vec<Block>,
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     scope_arena: &'a Arena<SymbolScope<'a, 's>>,
     function_root_scope: &'a SymbolScope<'a, 's>,
@@ -1088,13 +1069,12 @@ pub fn inline_function2<'a, 's>(
                 let mut setup_blocks = arg_store_set
                     .into_iter()
                     .enumerate()
-                    .map(|(n, (a, ptr, _))| Block {
-                        instructions: HashMap::new(),
-                        flow: BlockFlowInstruction::StoreRef {
+                    .map(|(n, (a, ptr, _))| {
+                        Block::flow_only(BlockFlowInstruction::StoreRef {
                             ptr,
                             value: a,
                             after: Some(BlockRef(n + 1)),
-                        },
+                        })
                     })
                     .collect::<Vec<_>>();
 
@@ -1113,18 +1093,22 @@ pub fn inline_function2<'a, 's>(
                     .enumerate()
                     .map(|(n, b)| {
                         let mut nb = b.clone();
-                        let instruction_count = nb.instructions.len();
-                        for (k, mut v) in core::mem::replace(
-                            &mut nb.instructions,
-                            HashMap::with_capacity(instruction_count),
+                        let instruction_count = nb.eval_registers.len();
+                        for k in core::mem::replace(
+                            &mut nb.eval_registers,
+                            HashSet::with_capacity(instruction_count),
                         ) {
-                            v.relocate_register(|r| {
-                                r.0 += register_offset;
-                            });
-                            v.relocate_block_ref(|b| b.0 += expand_block_base);
+                            let Some(mut x) =
+                                target_function_body.borrow().instructions.get(&k).cloned()
+                            else {
+                                continue;
+                            };
 
-                            nb.instructions
-                                .insert(RegisterRef(k.0 + register_offset), v);
+                            x.relocate_register(|r| r.0 += register_offset);
+                            x.relocate_block_ref(|b| b.0 += expand_block_base);
+
+                            mod_instructions.insert(RegisterRef(k.0 + register_offset), x);
+                            nb.eval_registers.insert(RegisterRef(k.0 + register_offset));
                         }
 
                         match nb.flow {
@@ -1209,10 +1193,9 @@ pub fn inline_function2<'a, 's>(
                         nb
                     })
                     .collect::<Vec<_>>();
+                mod_instructions.insert(result, BlockInstruction::Phi(exit_block_incomings));
                 let funcall_merge_block = Block {
-                    instructions: [(result, BlockInstruction::Phi(exit_block_incomings))]
-                        .into_iter()
-                        .collect(),
+                    eval_registers: [result].into_iter().collect(),
                     flow: match after_return {
                         Some(b) => BlockFlowInstruction::Goto(BlockRef(
                             b.0 - after_block_before_base + after_block_base,
@@ -1222,14 +1205,16 @@ pub fn inline_function2<'a, 's>(
                 };
 
                 for b in blocks.iter_mut() {
-                    for x in b.instructions.values_mut() {
-                        x.relocate_block_ref(|b| {
-                            b.0 += if b.0 > n {
-                                after_block_base - after_block_before_base
-                            } else {
-                                0
-                            }
-                        });
+                    for r in b.eval_registers.iter() {
+                        if let Some(x) = mod_instructions.get_mut(r) {
+                            x.relocate_block_ref(|b| {
+                                b.0 += if b.0 > n {
+                                    after_block_base - after_block_before_base
+                                } else {
+                                    0
+                                }
+                            });
+                        }
                     }
 
                     b.flow.relocate_next_block(|b| {
@@ -1242,14 +1227,16 @@ pub fn inline_function2<'a, 's>(
                 }
 
                 for b in after_blocks.iter_mut() {
-                    for x in b.instructions.values_mut() {
-                        x.relocate_block_ref(|b| {
-                            b.0 += if b.0 > n {
-                                after_block_base - after_block_before_base
-                            } else {
-                                0
-                            }
-                        });
+                    for r in b.eval_registers.iter() {
+                        if let Some(x) = mod_instructions.get_mut(r) {
+                            x.relocate_block_ref(|b| {
+                                b.0 += if b.0 > n {
+                                    after_block_base - after_block_before_base
+                                } else {
+                                    0
+                                }
+                            });
+                        }
                     }
 
                     b.flow.relocate_next_block(|b| {
@@ -1307,7 +1294,8 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
     function_input: &[(SymbolAttribute, bool, SourceRef<'s>, ConcreteType<'s>)],
     function_root_scope: &'a SymbolScope<'a, 's>,
     refpath_binds: &HashMap<&RefPath, &Vec<Decorate>>,
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     registers: &[ConcreteType<'s>],
 ) -> bool {
@@ -1378,13 +1366,17 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
     }
 
     for b in blocks.iter_mut() {
-        let instruction_count = b.instructions.len();
-        for (r, x) in core::mem::replace(
-            &mut b.instructions,
-            HashMap::with_capacity(instruction_count),
+        let instruction_count = b.eval_registers.len();
+        for r in core::mem::replace(
+            &mut b.eval_registers,
+            HashSet::with_capacity(instruction_count),
         ) {
+            let Some(x) = mod_instructions.get(&r) else {
+                continue;
+            };
+
             match x {
-                BlockInstruction::MemberRef(src, member) => {
+                BlockInstruction::MemberRef(src, ref member) => {
                     let Some(ConcreteType::Struct(type_members)) =
                         registers[src.0].as_dereferenced()
                     else {
@@ -1393,7 +1385,7 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
                             registers[src.0]
                         );
                     };
-                    let member_index = type_members.iter().position(|m| m.name == member).unwrap();
+                    let member_index = type_members.iter().position(|m| &m.name == member).unwrap();
                     let member_record = &type_members[member_index];
 
                     let descriptor_bound = match member_record.attribute {
@@ -1434,14 +1426,17 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
                                     binding: d.binding,
                                 },
                             );
+                            mod_instructions.remove(&r);
                             modified = true;
                         }
                         (None, Some(p), None, false) => {
                             const_map.insert(r, BlockInstruction::PushConstantRef(p.offset));
+                            mod_instructions.remove(&r);
                             modified = true;
                         }
                         (None, None, Some(b), false) => {
                             const_map.insert(r, BlockInstruction::BuiltinIORef(b.0));
+                            mod_instructions.remove(&r);
                             modified = true;
                         }
                         (None, None, None, true) => match const_map.get(&src) {
@@ -1455,19 +1450,21 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
                                         member_index,
                                     )),
                                 );
+                                mod_instructions.remove(&r);
                                 modified = true;
                             }
                             _ => unimplemented!("deep refpath resolving"),
                         },
                         (None, None, None, false) => {
-                            b.instructions
-                                .insert(r, BlockInstruction::MemberRef(src, member));
+                            // no replacement
+                            b.eval_registers.insert(r);
                         }
                         _ => panic!("Error: conflicting shader io attributes"),
                     }
                 }
                 _ => {
-                    b.instructions.insert(r, x);
+                    // no replacement
+                    b.eval_registers.insert(r);
                 }
             }
         }
@@ -1527,7 +1524,8 @@ pub fn convert_static_path_ref<'a, 's>(
 }
 
 pub fn build_register_state_map<'a, 's>(
-    blocks: &[Block<'a, 's>],
+    blocks: &[Block],
+    mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 ) -> HashMap<BlockRef, HashMap<RegisterRef, BlockInstruction<'a, 's>>> {
     let mut state_map = HashMap::new();
     let mut loop_stack = Vec::new();
@@ -1537,7 +1535,8 @@ pub fn build_register_state_map<'a, 's>(
     state_map.insert(BlockRef(0), HashMap::new());
 
     fn process<'a, 's>(
-        blocks: &[Block<'a, 's>],
+        blocks: &[Block],
+        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
         n: BlockRef,
         incoming: BlockRef,
         state_map: &mut HashMap<BlockRef, HashMap<RegisterRef, BlockInstruction<'a, 's>>>,
@@ -1564,7 +1563,11 @@ pub fn build_register_state_map<'a, 's>(
                 }
             }
         }
-        for (r, x) in blocks[incoming.0].instructions.iter() {
+        for r in blocks[incoming.0].eval_registers.iter() {
+            let Some(x) = mod_instructions.get(r) else {
+                continue;
+            };
+
             match block_state_map.entry(*r) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(x.clone());
@@ -1573,7 +1576,7 @@ pub fn build_register_state_map<'a, 's>(
                 std::collections::hash_map::Entry::Occupied(e) => {
                     assert!(
                         e.get() == x,
-                        "conflicting register content: {:?} | {:?}",
+                        "conflicting register content? {:?} | {:?}",
                         e.get(),
                         x
                     );
@@ -1589,28 +1592,74 @@ pub fn build_register_state_map<'a, 's>(
 
         processed.insert(n);
         match blocks[n.0].flow {
-            BlockFlowInstruction::Goto(next) => {
-                process(blocks, next, n, state_map, loop_stack, processed)
-            }
+            BlockFlowInstruction::Goto(next) => process(
+                blocks,
+                mod_instructions,
+                next,
+                n,
+                state_map,
+                loop_stack,
+                processed,
+            ),
             BlockFlowInstruction::StoreRef {
                 after: Some(after), ..
-            } => process(blocks, after, n, state_map, loop_stack, processed),
+            } => process(
+                blocks,
+                mod_instructions,
+                after,
+                n,
+                state_map,
+                loop_stack,
+                processed,
+            ),
             BlockFlowInstruction::StoreRef { .. } => (),
             BlockFlowInstruction::Funcall {
                 after_return: Some(after_return),
                 ..
-            } => process(blocks, after_return, n, state_map, loop_stack, processed),
+            } => process(
+                blocks,
+                mod_instructions,
+                after_return,
+                n,
+                state_map,
+                loop_stack,
+                processed,
+            ),
             BlockFlowInstruction::Funcall { .. } => (),
             BlockFlowInstruction::IntrinsicImpureFuncall {
                 after_return: Some(after_return),
                 ..
-            } => process(blocks, after_return, n, state_map, loop_stack, processed),
+            } => process(
+                blocks,
+                mod_instructions,
+                after_return,
+                n,
+                state_map,
+                loop_stack,
+                processed,
+            ),
             BlockFlowInstruction::IntrinsicImpureFuncall { .. } => (),
             BlockFlowInstruction::Conditional {
                 r#true, r#false, ..
             } => {
-                process(blocks, r#true, n, state_map, loop_stack, processed);
-                process(blocks, r#false, n, state_map, loop_stack, processed);
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#true,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#false,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
             }
             BlockFlowInstruction::ConditionalLoop {
                 r#break,
@@ -1619,17 +1668,49 @@ pub fn build_register_state_map<'a, 's>(
                 ..
             } => {
                 loop_stack.push((r#break, r#continue));
-                process(blocks, body, n, state_map, loop_stack, processed);
+                process(
+                    blocks,
+                    mod_instructions,
+                    body,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
                 loop_stack.pop();
-                process(blocks, r#break, n, state_map, loop_stack, processed);
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#break,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
             }
             BlockFlowInstruction::Break => {
                 let &(brk, _) = loop_stack.last().unwrap();
-                process(blocks, brk, n, state_map, loop_stack, processed);
+                process(
+                    blocks,
+                    mod_instructions,
+                    brk,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
             }
             BlockFlowInstruction::Continue => {
                 let &(_, cont) = loop_stack.last().unwrap();
-                process(blocks, cont, n, state_map, loop_stack, processed);
+                process(
+                    blocks,
+                    mod_instructions,
+                    cont,
+                    n,
+                    state_map,
+                    loop_stack,
+                    processed,
+                );
             }
             BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
         }
@@ -1638,6 +1719,7 @@ pub fn build_register_state_map<'a, 's>(
     match blocks[0].flow {
         BlockFlowInstruction::Goto(next) => process(
             blocks,
+            mod_instructions,
             next,
             BlockRef(0),
             &mut state_map,
@@ -1648,6 +1730,7 @@ pub fn build_register_state_map<'a, 's>(
             after: Some(after), ..
         } => process(
             blocks,
+            mod_instructions,
             after,
             BlockRef(0),
             &mut state_map,
@@ -1660,6 +1743,7 @@ pub fn build_register_state_map<'a, 's>(
             ..
         } => process(
             blocks,
+            mod_instructions,
             after_return,
             BlockRef(0),
             &mut state_map,
@@ -1672,6 +1756,7 @@ pub fn build_register_state_map<'a, 's>(
             ..
         } => process(
             blocks,
+            mod_instructions,
             after_return,
             BlockRef(0),
             &mut state_map,
@@ -1684,6 +1769,7 @@ pub fn build_register_state_map<'a, 's>(
         } => {
             process(
                 blocks,
+                mod_instructions,
                 r#true,
                 BlockRef(0),
                 &mut state_map,
@@ -1692,6 +1778,7 @@ pub fn build_register_state_map<'a, 's>(
             );
             process(
                 blocks,
+                mod_instructions,
                 r#false,
                 BlockRef(0),
                 &mut state_map,
@@ -1708,6 +1795,7 @@ pub fn build_register_state_map<'a, 's>(
             loop_stack.push((r#break, r#continue));
             process(
                 blocks,
+                mod_instructions,
                 body,
                 BlockRef(0),
                 &mut state_map,
@@ -1717,6 +1805,7 @@ pub fn build_register_state_map<'a, 's>(
             loop_stack.pop();
             process(
                 blocks,
+                mod_instructions,
                 r#break,
                 BlockRef(0),
                 &mut state_map,
@@ -1728,6 +1817,7 @@ pub fn build_register_state_map<'a, 's>(
             let &(brk, _) = loop_stack.last().unwrap();
             process(
                 blocks,
+                mod_instructions,
                 brk,
                 BlockRef(0),
                 &mut state_map,
@@ -1739,6 +1829,7 @@ pub fn build_register_state_map<'a, 's>(
             let &(_, cont) = loop_stack.last().unwrap();
             process(
                 blocks,
+                mod_instructions,
                 cont,
                 BlockRef(0),
                 &mut state_map,
@@ -1753,7 +1844,8 @@ pub fn build_register_state_map<'a, 's>(
 }
 
 pub fn resolve_register_aliases<'a, 's>(
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     register_state_map: &HashMap<BlockRef, HashMap<RegisterRef, BlockInstruction<'a, 's>>>,
 ) -> bool {
     let mut modified = false;
@@ -1764,20 +1856,23 @@ pub fn resolve_register_aliases<'a, 's>(
         };
 
         let in_block_map = b
-            .instructions
+            .eval_registers
             .iter()
-            .map(|(r, x)| (*r, x.clone()))
+            .filter_map(|r| mod_instructions.get(r).map(|x| (*r, x.clone())))
             .collect::<HashMap<_, _>>();
 
-        for x in b.instructions.values_mut() {
-            let m = x.relocate_register(|x| loop {
-                match state_map.get(x).or_else(|| in_block_map.get(x)) {
-                    Some(&BlockInstruction::RegisterAlias(to)) => {
-                        *x = to;
+        for r in b.eval_registers.iter() {
+            let m = match mod_instructions.get_mut(r) {
+                Some(x) => x.relocate_register(|x| loop {
+                    match state_map.get(x).or_else(|| in_block_map.get(x)) {
+                        Some(&BlockInstruction::RegisterAlias(to)) => {
+                            *x = to;
+                        }
+                        _ => break,
                     }
-                    _ => break,
-                }
-            });
+                }),
+                None => false,
+            };
             modified = modified || m;
         }
 
@@ -1797,12 +1892,17 @@ pub fn resolve_register_aliases<'a, 's>(
 
 pub fn strip_unreferenced_registers(
     blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction>,
     registers: &mut Vec<ConcreteType>,
     const_map: &mut HashMap<RegisterRef, BlockInstruction>,
 ) -> bool {
     let mut referenced_registers = HashSet::new();
     for b in blocks.iter() {
-        for x in b.instructions.values() {
+        for r in b.eval_registers.iter() {
+            let Some(x) = mod_instructions.get(r) else {
+                continue;
+            };
+
             match x {
                 BlockInstruction::ConstUnit
                 | BlockInstruction::ConstInt(_)
@@ -1836,25 +1936,28 @@ pub fn strip_unreferenced_registers(
                 | &BlockInstruction::RegisterAlias(x) => {
                     referenced_registers.insert(x);
                 }
-                &BlockInstruction::IntrinsicBinaryOp(x, _, y)
-                | &BlockInstruction::ArrayRef {
+                BlockInstruction::IntrinsicBinaryOp(x, _, y)
+                | BlockInstruction::ArrayRef {
                     source: x,
                     index: y,
                 } => {
                     referenced_registers.extend([x, y]);
                 }
-                &BlockInstruction::ConstructTuple(ref xs)
-                | &BlockInstruction::ConstructStruct(ref xs)
-                | &BlockInstruction::ConstructIntrinsicComposite(_, ref xs)
-                | &BlockInstruction::PureIntrinsicCall(_, ref xs) => {
+                BlockInstruction::ConstructTuple(ref xs)
+                | BlockInstruction::ConstructStruct(ref xs)
+                | BlockInstruction::ConstructIntrinsicComposite(_, ref xs)
+                | BlockInstruction::PureIntrinsicCall(_, ref xs) => {
                     referenced_registers.extend(xs.iter().copied());
                 }
-                &BlockInstruction::Phi(ref xs) => {
+                BlockInstruction::Phi(ref xs) => {
                     referenced_registers.extend(xs.values().copied());
                 }
                 &BlockInstruction::PureFuncall(callee, ref xs) => {
                     referenced_registers.insert(callee);
                     referenced_registers.extend(xs.iter().copied());
+                }
+                BlockInstruction::CompositeInsert { value, source, .. } => {
+                    referenced_registers.extend([value, source]);
                 }
             }
         }
@@ -1905,19 +2008,24 @@ pub fn strip_unreferenced_registers(
             }
         }
         for b in blocks.iter_mut() {
-            b.instructions.remove(&stripped);
+            b.eval_registers.remove(&stripped);
 
             if swapped_register != stripped {
-                if let Some(s) = b.instructions.remove(&swapped_register) {
-                    b.instructions.insert(stripped, s);
+                if let Some(x) = mod_instructions.remove(&swapped_register) {
+                    mod_instructions.insert(stripped, x);
+                }
+                if b.eval_registers.remove(&swapped_register) {
+                    b.eval_registers.insert(stripped);
                 }
 
-                for x in b.instructions.values_mut() {
-                    x.relocate_register(|r| {
-                        if r == &swapped_register {
-                            *r = stripped;
-                        }
-                    });
+                for r in b.eval_registers.iter() {
+                    if let Some(x) = mod_instructions.get_mut(r) {
+                        x.relocate_register(|r| {
+                            if r == &swapped_register {
+                                *r = stripped;
+                            }
+                        });
+                    }
                 }
 
                 b.flow.relocate_register(|r| {
@@ -1944,7 +2052,8 @@ pub enum IncomingRegister {
 }
 
 pub fn build_scope_local_var_state<'a, 's>(
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     scope_local_var_stores_per_block: &HashMap<
         BlockRef,
         HashMap<(PtrEq<'a, SymbolScope<'a, 's>>, usize), RegisterRef>,
@@ -1958,7 +2067,8 @@ pub fn build_scope_local_var_state<'a, 's>(
     state_map.insert(BlockRef(0), HashMap::new());
 
     fn process<'a, 's>(
-        blocks: &mut [Block<'a, 's>],
+        blocks: &mut [Block],
+        mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
         n: BlockRef,
         incoming: BlockRef,
         scope_local_var_stores_per_block: &HashMap<
@@ -1988,7 +2098,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                     match existing {
                         IncomingRegister::Phied(p) => {
                             let Some(BlockInstruction::Phi(ref mut incomings)) =
-                                blocks[n.0].instructions.get_mut(&p)
+                                mod_instructions.get_mut(&p)
                             else {
                                 unreachable!("no phi instruction reference");
                             };
@@ -2019,9 +2129,8 @@ pub fn build_scope_local_var_state<'a, 's>(
                                 let rp = RegisterRef(registers.len() - 1);
                                 let phi_incomings = r_incomings.clone();
 
-                                blocks[incoming.0]
-                                    .instructions
-                                    .insert(rp, BlockInstruction::Phi(phi_incomings));
+                                mod_instructions.insert(rp, BlockInstruction::Phi(phi_incomings));
+                                blocks[incoming.0].eval_registers.insert(rp);
                                 *r_incoming = IncomingRegister::Phied(rp);
 
                                 rp
@@ -2030,7 +2139,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                             };
 
                             let Some(BlockInstruction::Phi(ref mut incomings)) =
-                                blocks[n.0].instructions.get_mut(&p)
+                                mod_instructions.get_mut(&p)
                             else {
                                 unreachable!("no phi instruction reference");
                             };
@@ -2049,9 +2158,8 @@ pub fn build_scope_local_var_state<'a, 's>(
                                 let rp = RegisterRef(registers.len() - 1);
                                 let phi_incomings = r_incomings.clone();
 
-                                blocks[incoming.0]
-                                    .instructions
-                                    .insert(rp, BlockInstruction::Phi(phi_incomings));
+                                mod_instructions.insert(rp, BlockInstruction::Phi(phi_incomings));
+                                blocks[incoming.0].eval_registers.insert(rp);
                                 r_incomings.clear();
                                 *r_incoming = IncomingRegister::Phied(rp);
 
@@ -2096,6 +2204,7 @@ pub fn build_scope_local_var_state<'a, 's>(
         match blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => process(
                 blocks,
+                mod_instructions,
                 next,
                 n,
                 scope_local_var_stores_per_block,
@@ -2108,6 +2217,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 after: Some(after), ..
             } => process(
                 blocks,
+                mod_instructions,
                 after,
                 n,
                 scope_local_var_stores_per_block,
@@ -2122,6 +2232,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 ..
             } => process(
                 blocks,
+                mod_instructions,
                 after_return,
                 n,
                 scope_local_var_stores_per_block,
@@ -2136,6 +2247,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 ..
             } => process(
                 blocks,
+                mod_instructions,
                 after_return,
                 n,
                 scope_local_var_stores_per_block,
@@ -2150,6 +2262,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             } => {
                 process(
                     blocks,
+                    mod_instructions,
                     r#true,
                     n,
                     scope_local_var_stores_per_block,
@@ -2160,6 +2273,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 );
                 process(
                     blocks,
+                    mod_instructions,
                     r#false,
                     n,
                     scope_local_var_stores_per_block,
@@ -2178,6 +2292,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 loop_stack.push((r#break, r#continue));
                 process(
                     blocks,
+                    mod_instructions,
                     body,
                     n,
                     scope_local_var_stores_per_block,
@@ -2189,6 +2304,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 loop_stack.pop();
                 process(
                     blocks,
+                    mod_instructions,
                     r#break,
                     n,
                     scope_local_var_stores_per_block,
@@ -2202,6 +2318,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 let &(brk, _) = loop_stack.last().unwrap();
                 process(
                     blocks,
+                    mod_instructions,
                     brk,
                     n,
                     scope_local_var_stores_per_block,
@@ -2215,6 +2332,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                 let &(_, cont) = loop_stack.last().unwrap();
                 process(
                     blocks,
+                    mod_instructions,
                     cont,
                     n,
                     scope_local_var_stores_per_block,
@@ -2231,6 +2349,7 @@ pub fn build_scope_local_var_state<'a, 's>(
     match blocks[0].flow {
         BlockFlowInstruction::Goto(next) => process(
             blocks,
+            mod_instructions,
             next,
             BlockRef(0),
             scope_local_var_stores_per_block,
@@ -2243,6 +2362,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             after: Some(after), ..
         } => process(
             blocks,
+            mod_instructions,
             after,
             BlockRef(0),
             scope_local_var_stores_per_block,
@@ -2257,6 +2377,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             ..
         } => process(
             blocks,
+            mod_instructions,
             after_return,
             BlockRef(0),
             scope_local_var_stores_per_block,
@@ -2271,6 +2392,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             ..
         } => process(
             blocks,
+            mod_instructions,
             after_return,
             BlockRef(0),
             scope_local_var_stores_per_block,
@@ -2285,6 +2407,7 @@ pub fn build_scope_local_var_state<'a, 's>(
         } => {
             process(
                 blocks,
+                mod_instructions,
                 r#true,
                 BlockRef(0),
                 scope_local_var_stores_per_block,
@@ -2295,6 +2418,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             );
             process(
                 blocks,
+                mod_instructions,
                 r#false,
                 BlockRef(0),
                 scope_local_var_stores_per_block,
@@ -2313,6 +2437,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             loop_stack.push((r#break, r#continue));
             process(
                 blocks,
+                mod_instructions,
                 body,
                 BlockRef(0),
                 scope_local_var_stores_per_block,
@@ -2324,6 +2449,7 @@ pub fn build_scope_local_var_state<'a, 's>(
             loop_stack.pop();
             process(
                 blocks,
+                mod_instructions,
                 r#break,
                 BlockRef(0),
                 scope_local_var_stores_per_block,
@@ -2342,7 +2468,8 @@ pub fn build_scope_local_var_state<'a, 's>(
 }
 
 pub fn apply_local_var_states<'a, 's>(
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     state_map: &HashMap<
         BlockRef,
@@ -2352,9 +2479,9 @@ pub fn apply_local_var_states<'a, 's>(
     let mut modified = false;
 
     for n in 0..blocks.len() {
-        for x in blocks[n].instructions.values_mut() {
-            match x {
-                BlockInstruction::LoadRef(ptr) => {
+        for r in blocks[n].eval_registers.iter() {
+            match mod_instructions.get_mut(r) {
+                Some(x @ &mut BlockInstruction::LoadRef(ptr)) => {
                     if let Some(&BlockInstruction::ScopeLocalVarRef(scope, vid)) =
                         const_map.get(&ptr)
                     {
@@ -2418,15 +2545,71 @@ pub fn deconstruct_effectless_phi(
     modified
 }
 
+pub fn transform_swizzle_component_store<'a, 's>(
+    blocks: &mut [Block],
+    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    registers: &mut Vec<ConcreteType<'s>>,
+) -> bool {
+    let mut modified = false;
+
+    for b in blocks {
+        match b.flow {
+            BlockFlowInstruction::StoreRef { ptr, value, after } => {
+                // TODO: 一旦同ブロック内のアサインだけで判定する（ほかブロックまで含めるとブロックフローとか考えないといけないので大変）
+                let Some((source, index)) = mod_instructions.get(&ptr).and_then(|x| match x {
+                    BlockInstruction::SwizzleRef(source, ref indices) if indices.len() == 1 => {
+                        Some((*source, indices[0]))
+                    }
+                    _ => None,
+                }) else {
+                    continue;
+                };
+
+                let source_value_ty = registers[source.0]
+                    .as_dereferenced()
+                    .expect("cannot dereference swizzleRef source?")
+                    .clone();
+                registers.push(source_value_ty.clone());
+                let source_value_register = RegisterRef(registers.len() - 1);
+                mod_instructions.insert(source_value_register, BlockInstruction::LoadRef(source));
+                b.eval_registers.insert(source_value_register);
+                registers.push(source_value_ty.clone());
+                let source_updated_register = RegisterRef(registers.len() - 1);
+                mod_instructions.insert(
+                    source_updated_register,
+                    BlockInstruction::CompositeInsert {
+                        value,
+                        source: source_value_register,
+                        index,
+                    },
+                );
+                b.eval_registers.insert(source_updated_register);
+
+                b.flow = BlockFlowInstruction::StoreRef {
+                    ptr: source,
+                    value: source_updated_register,
+                    after,
+                };
+                modified = true;
+            }
+            _ => (),
+        }
+    }
+
+    modified
+}
+
 pub fn track_scope_local_var_aliases<'a, 's>(
-    blocks: &[Block<'a, 's>],
+    blocks: &[Block],
+    mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 ) -> HashMap<BlockRef, HashMap<(PtrEq<'a, SymbolScope<'a, 's>>, usize), RegisterRef>> {
     let mut processed = HashSet::new();
     let mut aliases_per_block = HashMap::new();
 
     fn process<'a, 's>(
-        blocks: &[Block<'a, 's>],
+        blocks: &[Block],
+        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
         n: BlockRef,
         const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
         processed: &mut HashSet<BlockRef>,
@@ -2443,7 +2626,14 @@ pub fn track_scope_local_var_aliases<'a, 's>(
         let mut outgoing_aliases = HashMap::new();
         match blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => {
-                process(blocks, next, const_map, processed, aliases_per_block);
+                process(
+                    blocks,
+                    mod_instructions,
+                    next,
+                    const_map,
+                    processed,
+                    aliases_per_block,
+                );
             }
             BlockFlowInstruction::StoreRef { ptr, value, after } => {
                 if let Some(BlockInstruction::ScopeLocalVarRef(scope, vid)) = const_map.get(&ptr) {
@@ -2451,28 +2641,77 @@ pub fn track_scope_local_var_aliases<'a, 's>(
                 }
 
                 if let Some(after) = after {
-                    process(blocks, after, const_map, processed, aliases_per_block);
+                    process(
+                        blocks,
+                        mod_instructions,
+                        after,
+                        const_map,
+                        processed,
+                        aliases_per_block,
+                    );
                 }
             }
             BlockFlowInstruction::Funcall { after_return, .. } => {
                 if let Some(after) = after_return {
-                    process(blocks, after, const_map, processed, aliases_per_block);
+                    process(
+                        blocks,
+                        mod_instructions,
+                        after,
+                        const_map,
+                        processed,
+                        aliases_per_block,
+                    );
                 }
             }
             BlockFlowInstruction::IntrinsicImpureFuncall { after_return, .. } => {
                 if let Some(after) = after_return {
-                    process(blocks, after, const_map, processed, aliases_per_block);
+                    process(
+                        blocks,
+                        mod_instructions,
+                        after,
+                        const_map,
+                        processed,
+                        aliases_per_block,
+                    );
                 }
             }
             BlockFlowInstruction::Conditional {
                 r#true, r#false, ..
             } => {
-                process(blocks, r#true, const_map, processed, aliases_per_block);
-                process(blocks, r#false, const_map, processed, aliases_per_block);
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#true,
+                    const_map,
+                    processed,
+                    aliases_per_block,
+                );
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#false,
+                    const_map,
+                    processed,
+                    aliases_per_block,
+                );
             }
             BlockFlowInstruction::ConditionalLoop { r#break, body, .. } => {
-                process(blocks, body, const_map, processed, aliases_per_block);
-                process(blocks, r#break, const_map, processed, aliases_per_block);
+                process(
+                    blocks,
+                    mod_instructions,
+                    body,
+                    const_map,
+                    processed,
+                    aliases_per_block,
+                );
+                process(
+                    blocks,
+                    mod_instructions,
+                    r#break,
+                    const_map,
+                    processed,
+                    aliases_per_block,
+                );
             }
             BlockFlowInstruction::Break | BlockFlowInstruction::Continue => (),
             BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
@@ -2483,6 +2722,7 @@ pub fn track_scope_local_var_aliases<'a, 's>(
 
     process(
         blocks,
+        mod_instructions,
         BlockRef(0),
         const_map,
         &mut processed,
@@ -2498,16 +2738,18 @@ pub enum LocalMemoryUsage {
     ReadWrite,
 }
 pub fn collect_scope_local_memory_usages<'a, 's>(
-    blocks: &[Block<'a, 's>],
+    blocks: &[Block],
+    mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
 ) -> HashMap<(PtrEq<'a, SymbolScope<'a, 's>>, usize), LocalMemoryUsage> {
     let mut usage_map = HashMap::new();
 
     for b in blocks {
-        for x in b.instructions.values() {
-            match x {
-                BlockInstruction::LoadRef(ptr) => {
-                    if let Some(&BlockInstruction::ScopeLocalVarRef(scope, id)) = const_map.get(ptr)
+        for r in b.eval_registers.iter() {
+            match mod_instructions.get(r) {
+                Some(BlockInstruction::LoadRef(ptr)) => {
+                    if let Some(&BlockInstruction::ScopeLocalVarRef(scope, id)) =
+                        const_map.get(&ptr)
                     {
                         let e = usage_map
                             .entry((scope, id))
@@ -2542,7 +2784,7 @@ pub fn collect_scope_local_memory_usages<'a, 's>(
 }
 
 pub fn strip_write_only_local_memory<'a, 's>(
-    blocks: &mut [Block<'a, 's>],
+    blocks: &mut [Block],
     const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
     usage_map: &HashMap<(PtrEq<'a, SymbolScope<'a, 's>>, usize), LocalMemoryUsage>,
 ) -> bool {

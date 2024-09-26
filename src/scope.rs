@@ -192,13 +192,13 @@ impl<'a, 's> SymbolScope<'a, 's> {
             "min",
             vec![
                 IntrinsicFunctionSymbol {
-                    name: "Cloth.Intrinsic.Max#UInt",
+                    name: "Cloth.Intrinsic.Min#UInt",
                     args: vec![IntrinsicType::UInt.into(), IntrinsicType::UInt.into()],
                     output: IntrinsicType::UInt.into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
-                    name: "Cloth.Intrinsic.Max#Float",
+                    name: "Cloth.Intrinsic.Min#Float",
                     args: vec![IntrinsicType::Float.into(), IntrinsicType::Float.into()],
                     output: IntrinsicType::Float.into(),
                     is_pure: true,
