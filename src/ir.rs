@@ -20,7 +20,7 @@ impl core::fmt::Debug for ExprRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum InstantiatedConst {
+pub enum Const {
     Bool(bool),
     Int(isize),
     SInt(i32),

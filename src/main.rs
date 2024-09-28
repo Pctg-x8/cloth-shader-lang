@@ -21,10 +21,11 @@ use ir::{
         apply_local_var_states, block_aliasing, build_register_state_map,
         build_scope_local_var_state, collect_scope_local_memory_usages, convert_static_path_ref,
         deconstruct_effectless_phi, extract_constants, fold_const_ops, inline_function2,
-        merge_constants, merge_simple_goto_blocks, optimize_pure_expr, promote_instantiate_const,
+        merge_simple_goto_blocks, optimize_pure_expr, promote_instantiate_const,
         resolve_intrinsic_funcalls, resolve_register_aliases, resolve_shader_io_ref_binds,
         strip_unreachable_blocks, strip_unreferenced_registers, strip_write_only_local_memory,
-        track_scope_local_var_aliases, transform_swizzle_component_store,
+        track_scope_local_var_aliases, transform_swizzle_component_store, unify_constants,
+        unref_swizzle_ref_loads,
     },
     FunctionBody,
 };
@@ -282,37 +283,6 @@ fn main() {
                 o.flush().unwrap();
                 drop(o);
 
-                let local_scope_var_aliases = track_scope_local_var_aliases(
-                    &block_generation_context.blocks,
-                    &block_instruction_emission_context.instructions,
-                    &const_instructions,
-                );
-                println!("Scope Var Aliases:");
-                let mut sorted = local_scope_var_aliases.iter().collect::<Vec<_>>();
-                sorted.sort_by_key(|p| p.0 .0);
-                for (b, a) in sorted {
-                    println!("  After b{}:", b.0);
-                    for ((scope, id), r) in a.iter() {
-                        println!("    {id} at {scope:?} = r{}", r.0);
-                    }
-                }
-
-                let scope_local_var_states = build_scope_local_var_state(
-                    &mut block_generation_context.blocks,
-                    &mut block_instruction_emission_context.instructions,
-                    &local_scope_var_aliases,
-                    &mut block_instruction_emission_context.registers,
-                );
-                println!("Scope Local Var States:");
-                let mut sorted = scope_local_var_states.iter().collect::<Vec<_>>();
-                sorted.sort_by_key(|p| p.0 .0);
-                for (b, a) in sorted {
-                    println!("  Head of b{}:", b.0);
-                    for ((scope, id), r) in a.iter() {
-                        println!("    {id} at {scope:?} = {r:?}");
-                    }
-                }
-
                 let mut last_ir_document = build_ir_document(
                     &block_instruction_emission_context.registers,
                     &const_instructions,
@@ -350,6 +320,154 @@ fn main() {
                         drop(o);
 
                         *last_irdoc = next_irdoc;
+                    }
+                }
+
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    loop {
+                        let modified = promote_instantiate_const(
+                            &mut block_instruction_emission_context.instructions,
+                            &mut const_instructions,
+                        );
+                        needs_reopt = needs_reopt || modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "PromoteInstantiateConst",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
+                            &const_instructions,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+
+                    loop {
+                        let modified = fold_const_ops(
+                            &mut block_instruction_emission_context.instructions,
+                            &mut const_instructions,
+                        );
+                        needs_reopt = needs_reopt || modified;
+
+                        perform_log(
+                            &f.fname_token,
+                            "FoldConst",
+                            modified,
+                            &mut last_ir_document,
+                            &block_generation_context.blocks,
+                            &block_instruction_emission_context.instructions,
+                            &block_instruction_emission_context.registers,
+                            &const_instructions,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+                }
+
+                {
+                    let modified = unify_constants(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.instructions,
+                        &const_instructions,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "UnifyConstants",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
+                        &const_instructions,
+                    );
+                }
+
+                loop {
+                    let modified = unref_swizzle_ref_loads(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.instructions,
+                        &const_instructions,
+                        &mut block_instruction_emission_context.registers,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "UnrefSwizleRefLoads",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
+                        &const_instructions,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+
+                loop {
+                    let modified = transform_swizzle_component_store(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.instructions,
+                        &mut block_instruction_emission_context.registers,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "TransformSwizzleComponentStore",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
+                        &const_instructions,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+
+                let local_scope_var_aliases = track_scope_local_var_aliases(
+                    &block_generation_context.blocks,
+                    &block_instruction_emission_context.instructions,
+                    &const_instructions,
+                );
+                println!("Scope Var Aliases:");
+                let mut sorted = local_scope_var_aliases.iter().collect::<Vec<_>>();
+                sorted.sort_by_key(|p| p.0 .0);
+                for (b, a) in sorted {
+                    println!("  After b{}:", b.0);
+                    for ((scope, id), r) in a.iter() {
+                        println!("    {id} at {scope:?} = r{}", r.0);
+                    }
+                }
+
+                let scope_local_var_states = build_scope_local_var_state(
+                    &mut block_generation_context.blocks,
+                    &mut block_instruction_emission_context.instructions,
+                    &local_scope_var_aliases,
+                    &mut block_instruction_emission_context.registers,
+                );
+                println!("Scope Local Var States:");
+                let mut sorted = scope_local_var_states.iter().collect::<Vec<_>>();
+                sorted.sort_by_key(|p| p.0 .0);
+                for (b, a) in sorted {
+                    println!("  Head of b{}:", b.0);
+                    for ((scope, id), r) in a.iter() {
+                        println!("    {id} at {scope:?} = {r:?}");
                     }
                 }
 
@@ -403,95 +521,28 @@ fn main() {
                     &const_instructions,
                 );
 
+                {
+                    let modified = resolve_intrinsic_funcalls(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context,
+                        &const_instructions,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "ResolveIntrinsicFuncalls",
+                        modified,
+                        &mut last_ir_document,
+                        &block_generation_context.blocks,
+                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.registers,
+                        &const_instructions,
+                    );
+                }
+
                 let mut needs_reopt = true;
                 while needs_reopt {
                     needs_reopt = false;
-
-                    loop {
-                        let modified = promote_instantiate_const(
-                            &mut block_instruction_emission_context.instructions,
-                            &mut const_instructions,
-                        );
-                        needs_reopt |= modified;
-
-                        perform_log(
-                            &f.fname_token,
-                            "PromoteInstantiateConst",
-                            modified,
-                            &mut last_ir_document,
-                            &block_generation_context.blocks,
-                            &block_instruction_emission_context.instructions,
-                            &block_instruction_emission_context.registers,
-                            &const_instructions,
-                        );
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let modified = fold_const_ops(
-                            &mut block_instruction_emission_context.instructions,
-                            &mut const_instructions,
-                        );
-                        needs_reopt |= modified;
-
-                        perform_log(
-                            &f.fname_token,
-                            "FoldConst",
-                            modified,
-                            &mut last_ir_document,
-                            &block_generation_context.blocks,
-                            &block_instruction_emission_context.instructions,
-                            &block_instruction_emission_context.registers,
-                            &const_instructions,
-                        );
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    {
-                        let modified = merge_constants(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.instructions,
-                            &mut const_instructions,
-                        );
-                        needs_reopt |= modified;
-
-                        perform_log(
-                            &f.fname_token,
-                            "UnifyConstants",
-                            modified,
-                            &mut last_ir_document,
-                            &block_generation_context.blocks,
-                            &block_instruction_emission_context.instructions,
-                            &block_instruction_emission_context.registers,
-                            &const_instructions,
-                        );
-                    }
-
-                    {
-                        let modified = resolve_intrinsic_funcalls(
-                            &mut block_generation_context,
-                            &mut block_instruction_emission_context,
-                            &const_instructions,
-                        );
-                        needs_reopt |= modified;
-
-                        perform_log(
-                            &f.fname_token,
-                            "ResolveIntrinsicFuncalls",
-                            modified,
-                            &mut last_ir_document,
-                            &block_generation_context.blocks,
-                            &block_instruction_emission_context.instructions,
-                            &block_instruction_emission_context.registers,
-                            &const_instructions,
-                        );
-                    }
 
                     loop {
                         let modified = merge_simple_goto_blocks(
@@ -572,30 +623,6 @@ fn main() {
                         perform_log(
                             &f.fname_token,
                             "ResolveRegisterAliases",
-                            modified,
-                            &mut last_ir_document,
-                            &block_generation_context.blocks,
-                            &block_instruction_emission_context.instructions,
-                            &block_instruction_emission_context.registers,
-                            &const_instructions,
-                        );
-
-                        if !modified {
-                            break;
-                        }
-                    }
-
-                    loop {
-                        let modified = transform_swizzle_component_store(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.instructions,
-                            &mut block_instruction_emission_context.registers,
-                        );
-                        needs_reopt = needs_reopt || modified;
-
-                        perform_log(
-                            &f.fname_token,
-                            "TransformSwizzleComponentStore",
                             modified,
                             &mut last_ir_document,
                             &block_generation_context.blocks,
@@ -1045,6 +1072,47 @@ fn optimize<'a, 's>(
 
     println!("refpath binds: {refpath_binds:#?}");
 
+    loop {
+        let modified = unref_swizzle_ref_loads(
+            &mut body.blocks,
+            &mut body.instructions,
+            &body.constants,
+            &mut body.registers,
+        );
+
+        perform_log(
+            f,
+            "UnrefSwizzleRefLoads",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
+        }
+    }
+
+    loop {
+        let modified = transform_swizzle_component_store(
+            &mut body.blocks,
+            &mut body.instructions,
+            &mut body.registers,
+        );
+
+        perform_log(
+            f,
+            "TransformSwizzleComponentStore",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
+        }
+    }
+
     let local_scope_var_aliases =
         track_scope_local_var_aliases(&body.blocks, &body.instructions, &body.constants);
     println!("Scope Var Aliases:");
@@ -1169,7 +1237,7 @@ fn optimize<'a, 's>(
         }
 
         loop {
-            let modified = merge_constants(
+            let modified = unify_constants(
                 &mut body.blocks,
                 &mut body.instructions,
                 &mut body.constants,
@@ -1240,27 +1308,6 @@ fn optimize<'a, 's>(
             perform_log(
                 f,
                 "ResolveRegisterAliases",
-                modified,
-                &mut last_ir_document,
-                body,
-            );
-
-            if !modified {
-                break;
-            }
-        }
-
-        loop {
-            let modified = transform_swizzle_component_store(
-                &mut body.blocks,
-                &mut body.instructions,
-                &mut body.registers,
-            );
-            needs_reopt = needs_reopt || modified;
-
-            perform_log(
-                f,
-                "TransformSwizzleComponentStore",
                 modified,
                 &mut last_ir_document,
                 body,

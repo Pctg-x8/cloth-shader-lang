@@ -18,8 +18,8 @@ use crate::{
 
 use super::{
     expr::{binary_op, simplify_expression, simplify_lefthand_expression, ConstModifiers},
-    ConstFloatLiteral, ConstIntLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral,
-    ExprRef, InstantiatedConst,
+    Const, ConstFloatLiteral, ConstIntLiteral, ConstNumberLiteral, ConstSIntLiteral,
+    ConstUIntLiteral, ExprRef,
 };
 
 #[repr(transparent)]
@@ -309,6 +309,28 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
+    pub const fn is_const(&self) -> bool {
+        matches!(
+            self,
+            Self::ConstInt(_)
+                | Self::ConstUInt(_)
+                | Self::ConstSInt(_)
+                | Self::ConstNumber(_)
+                | Self::ConstFloat(_)
+                | Self::ConstUnit
+                | Self::ImmBool(_)
+                | Self::ImmInt(_)
+                | Self::ImmSInt(_)
+                | Self::ImmUInt(_)
+                | Self::ScopeLocalVarRef(_, _)
+                | Self::FunctionInputVarRef(_, _)
+                | Self::UserDefinedFunctionRef(_, _)
+                | Self::IntrinsicFunctionRef(_)
+                | Self::IntrinsicTypeConstructorRef(_)
+        )
+    }
+
+    #[inline(always)]
     pub fn dup_phi_incoming(&mut self, old: BlockRef, new: BlockRef) {
         if let Self::Phi(ref mut incomings) = self {
             if let Some(&r) = incomings.get(&old) {
@@ -318,15 +340,15 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
-    pub fn try_instantiate_const(&self) -> Option<InstantiatedConst> {
+    pub fn try_instantiate_const(&self) -> Option<Const> {
         match self {
-            Self::ConstInt(v) => Some(InstantiatedConst::Int(v.instantiate())),
-            Self::ConstSInt(v) => Some(InstantiatedConst::SInt(v.instantiate())),
-            Self::ConstUInt(v) => Some(InstantiatedConst::UInt(v.instantiate())),
-            &Self::ImmBool(v) => Some(InstantiatedConst::Bool(v)),
-            &Self::ImmInt(v) => Some(InstantiatedConst::Int(v)),
-            &Self::ImmSInt(v) => Some(InstantiatedConst::SInt(v)),
-            &Self::ImmUInt(v) => Some(InstantiatedConst::UInt(v)),
+            Self::ConstInt(v) => Some(Const::Int(v.instantiate())),
+            Self::ConstSInt(v) => Some(Const::SInt(v.instantiate())),
+            Self::ConstUInt(v) => Some(Const::UInt(v.instantiate())),
+            &Self::ImmBool(v) => Some(Const::Bool(v)),
+            &Self::ImmInt(v) => Some(Const::Int(v)),
+            &Self::ImmSInt(v) => Some(Const::SInt(v)),
+            &Self::ImmUInt(v) => Some(Const::UInt(v)),
             _ => None,
         }
     }
@@ -345,6 +367,15 @@ impl<'a, 's> BlockInstruction<'a, 's> {
             }
             _ => false,
         }
+    }
+
+    #[inline(always)]
+    pub fn apply_register_alias(&mut self, map: &HashMap<RegisterRef, RegisterRef>) -> bool {
+        self.relocate_register(|r| {
+            while let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
     }
 
     pub fn relocate_register(&mut self, mut relocator: impl FnMut(&mut RegisterRef)) -> bool {
@@ -511,7 +542,7 @@ impl<'a, 's> BlockInstruction<'a, 's> {
             ),
             Self::ConstructIntrinsicComposite(it, args) => write!(
                 w,
-                "ConstructIntrinsicComposite<{it:?}>({})",
+                "ConstructIntrinsicComposite#{it:?}({})",
                 args.iter()
                     .map(|RegisterRef(r)| format!("r{r}"))
                     .collect::<Vec<_>>()
@@ -597,6 +628,23 @@ impl Block {
             self.flow,
             BlockFlowInstruction::Break | BlockFlowInstruction::Continue
         )
+    }
+
+    #[inline(always)]
+    pub fn apply_flow_register_alias(&mut self, map: &HashMap<RegisterRef, RegisterRef>) -> bool {
+        self.flow.relocate_register(|r| {
+            while let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
+    }
+
+    #[inline(always)]
+    pub fn relocate_flow_register(
+        &mut self,
+        relocator: impl FnMut(&mut RegisterRef) + Copy,
+    ) -> bool {
+        self.flow.relocate_register(relocator)
     }
 
     #[inline(always)]
