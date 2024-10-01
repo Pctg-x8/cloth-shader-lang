@@ -81,7 +81,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
             let base = simplify_expression(*base, block_ctx, inst_ctx, scope);
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-            let result = match base.result.ty(inst.instruction_emission_context) {
+            let result = match *base.result.ty(inst.instruction_emission_context) {
                 ConcreteType::Ref(ref inner) => match &**inner {
                     ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                         (None, _) | (_, None) => panic!("cannot member ref to complex data"),
@@ -127,7 +127,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
                             }
                         }
                     }
-                    ty => {
+                    ref ty => {
                         panic!("unsupported member ref op for type {ty:?}");
                     }
                 },
@@ -170,7 +170,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
                         panic!("unsupported member ref op for type {ty:?}");
                     }
                 },
-                ty => {
+                ref ty => {
                     panic!("unable to store to rhs value {ty:?}");
                 }
             };
@@ -193,14 +193,14 @@ pub fn simplify_lefthand_expression<'a, 's>(
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let ix_value = inst.loaded(ix.result);
-            let result = match base.result.ty(inst.instruction_emission_context) {
-                ConcreteType::Ref(inner) => match &**inner {
+            let result = match *base.result.ty(inst.instruction_emission_context) {
+                ConcreteType::Ref(ref inner) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_ref(base.result, ix_value, *elm.clone())
                     }
                     _ => panic!("Error: cannot indexing this type: {inner:?}"),
                 },
-                ConcreteType::MutableRef(inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_mutable_ref(base.result, ix_value, *elm.clone())
                     }
@@ -209,7 +209,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
                 ConcreteType::Array(_, _) => {
                     unimplemented!("rhs value direct indexing")
                 }
-                ty => panic!("Error: cannot indexing this type: {ty:?}"),
+                ref ty => panic!("Error: cannot indexing this type: {ty:?}"),
             };
 
             let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
@@ -589,7 +589,7 @@ pub fn simplify_expression<'a, 's>(
                     &mut function_load_inst,
                     symbol_scope,
                 );
-                let f = match f.ty(function_load_inst.instruction_emission_context) {
+                let f = match *f.ty(function_load_inst.instruction_emission_context) {
                     ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
                         function_load_inst.load_ref(f)
                     }
@@ -617,12 +617,6 @@ pub fn simplify_expression<'a, 's>(
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let left_value = inst.loaded(left.result);
             let right_value = inst.loaded(right.result);
-            println!(
-                "binop {:?} {} {:?}",
-                left_value.ty(&inst),
-                op.slice,
-                right_value.ty(&inst)
-            );
             let result = binary_op(left_value, SourceRef::from(&op), right_value, &mut inst);
             let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
             assert!(
@@ -805,10 +799,7 @@ pub fn simplify_expression<'a, 's>(
                 None => {
                     // return unit
                     let result = inst_ctx.const_unit();
-                    let block = block_ctx.add(Block {
-                        eval_registers: [result].into_iter().collect(),
-                        flow: BlockFlowInstruction::Undetermined,
-                    });
+                    let block = block_ctx.add(Block::flow_only(BlockFlowInstruction::Undetermined));
                     if let Some(b) = last_block {
                         assert!(block_ctx.try_chain(b, block), "multi out?");
                     }
@@ -825,7 +816,7 @@ pub fn simplify_expression<'a, 's>(
             let base = simplify_expression(*base, block_ctx, inst_ctx, symbol_scope);
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-            let result = match base.result.ty(&inst) {
+            let result = match *base.result.ty(&inst) {
                 ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                     (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                     (_, Some(1)) => panic!("scalar value cannot be swizzled"),
@@ -846,7 +837,7 @@ pub fn simplify_expression<'a, 's>(
                 },
                 ConcreteType::UserDefined {
                     name: ty_name,
-                    generic_args,
+                    ref generic_args,
                 } => {
                     let (_, (_, ty)) = symbol_scope
                         .lookup_user_defined_type(ty_name)
@@ -983,7 +974,7 @@ pub fn simplify_expression<'a, 's>(
                         panic!("Error: unsupported member ref op for type {ty:?}")
                     }
                 },
-                ty => {
+                ref ty => {
                     panic!("Error: unsupported member ref op for type {ty:?}");
                 }
             };
@@ -1006,14 +997,14 @@ pub fn simplify_expression<'a, 's>(
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let index_value = inst.loaded(index.result);
-            let result = match base.result.ty(&inst) {
-                ConcreteType::Ref(inner) => match &**inner {
+            let result = match *base.result.ty(&inst) {
+                ConcreteType::Ref(ref inner) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_ref(base.result, index_value, *elm.clone())
                     }
                     _ => panic!("Error: cannot indexing this type: {inner:?}"),
                 },
-                ConcreteType::MutableRef(inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_mutable_ref(base.result, index_value, *elm.clone())
                     }
@@ -1022,7 +1013,7 @@ pub fn simplify_expression<'a, 's>(
                 ConcreteType::Array(_, _) => {
                     unimplemented!("rhs value direct indexing")
                 }
-                ty => panic!("Error: cannot indexing this type: {ty:?}"),
+                ref ty => panic!("Error: cannot indexing this type: {ty:?}"),
             };
 
             let perform_block = inst.create_block(BlockFlowInstruction::Undetermined);
@@ -1196,7 +1187,7 @@ pub fn simplify_expression<'a, 's>(
                         .expect("initializers have extra member");
                     let initializer = initializers.remove(initializer_pos);
                     let v = simplify_expression(initializer.2, block_ctx, inst_ctx, symbol_scope);
-                    if v.result.ty(inst_ctx) != &m.ty {
+                    if *v.result.ty(inst_ctx) != m.ty {
                         panic!("initializer value type does not match with member type");
                     }
 
@@ -1241,10 +1232,8 @@ pub fn simplify_expression<'a, 's>(
             let else_expr = match else_expr {
                 None => {
                     let r = inst_ctx.const_unit();
-                    let perform_block = block_ctx.add(Block {
-                        eval_registers: [r].into_iter().collect(),
-                        flow: BlockFlowInstruction::Undetermined,
-                    });
+                    let perform_block =
+                        block_ctx.add(Block::flow_only(BlockFlowInstruction::Undetermined));
 
                     SimplifyResult {
                         result: r,
@@ -1255,7 +1244,7 @@ pub fn simplify_expression<'a, 's>(
                 Some(x) => simplify_expression(*x, block_ctx, inst_ctx, symbol_scope),
             };
 
-            let condition = match condition.result.ty(inst_ctx) {
+            let condition = match *condition.result.ty(inst_ctx) {
                 ConcreteType::Intrinsic(IntrinsicType::Bool) => condition,
                 _ => {
                     let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
@@ -1274,220 +1263,188 @@ pub fn simplify_expression<'a, 's>(
                 }
             };
 
-            let (res_ty, then, r#else) =
-                match (then_expr.result.ty(inst_ctx), else_expr.result.ty(inst_ctx)) {
-                    (a, b) if a == b => (a.clone(), then_expr, else_expr),
-                    (ConcreteType::Intrinsic(IntrinsicType::Unit), _) => {
-                        (IntrinsicType::Unit.into(), then_expr, else_expr)
-                    }
-                    (_, ConcreteType::Intrinsic(IntrinsicType::Unit)) => {
-                        (IntrinsicType::Unit.into(), then_expr, else_expr)
-                    }
-                    // TODO: 他の変換は必要になったら書く
-                    (
-                        ConcreteType::UnknownIntClass,
-                        ConcreteType::Intrinsic(IntrinsicType::SInt),
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_then = inst.instantiate_intrinsic_type_class(
-                            then_expr.result,
-                            IntrinsicType::SInt,
-                        );
-                        let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                            "then multiple out?"
-                        );
+            let (res_ty, then, r#else) = match (
+                &*then_expr.result.ty(inst_ctx),
+                &*else_expr.result.ty(inst_ctx),
+            ) {
+                (a, b) if a == b => (a.clone(), then_expr, else_expr),
+                (ConcreteType::Intrinsic(IntrinsicType::Unit), _) => {
+                    (IntrinsicType::Unit.into(), then_expr, else_expr)
+                }
+                (_, ConcreteType::Intrinsic(IntrinsicType::Unit)) => {
+                    (IntrinsicType::Unit.into(), then_expr, else_expr)
+                }
+                // TODO: 他の変換は必要になったら書く
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::SInt)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::SInt);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::SInt.into(),
-                            SimplifyResult {
-                                result: new_then,
-                                start_block: then_expr.start_block,
-                                end_block: new_then_blk,
-                            },
-                            else_expr,
-                        )
-                    }
                     (
-                        ConcreteType::Intrinsic(IntrinsicType::SInt),
-                        ConcreteType::UnknownIntClass,
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_else = inst.instantiate_intrinsic_type_class(
-                            else_expr.result,
-                            IntrinsicType::SInt,
-                        );
-                        let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                            "else multiple out?"
-                        );
+                        IntrinsicType::SInt.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::SInt), ConcreteType::UnknownIntClass) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::SInt);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::SInt.into(),
-                            then_expr,
-                            SimplifyResult {
-                                result: new_else,
-                                start_block: else_expr.start_block,
-                                end_block: new_else_blk,
-                            },
-                        )
-                    }
                     (
-                        ConcreteType::UnknownIntClass,
-                        ConcreteType::Intrinsic(IntrinsicType::UInt),
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_then = inst.instantiate_intrinsic_type_class(
-                            then_expr.result,
-                            IntrinsicType::UInt,
-                        );
-                        let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                            "then multiple out?"
-                        );
+                        IntrinsicType::SInt.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::UInt)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::UInt);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::UInt.into(),
-                            SimplifyResult {
-                                result: new_then,
-                                start_block: then_expr.start_block,
-                                end_block: new_then_blk,
-                            },
-                            else_expr,
-                        )
-                    }
                     (
-                        ConcreteType::Intrinsic(IntrinsicType::UInt),
-                        ConcreteType::UnknownIntClass,
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_else = inst.instantiate_intrinsic_type_class(
-                            else_expr.result,
-                            IntrinsicType::UInt,
-                        );
-                        let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                            "else multiple out?"
-                        );
+                        IntrinsicType::UInt.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::UInt), ConcreteType::UnknownIntClass) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::UInt);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::UInt.into(),
-                            then_expr,
-                            SimplifyResult {
-                                result: new_else,
-                                start_block: else_expr.start_block,
-                                end_block: new_else_blk,
-                            },
-                        )
-                    }
                     (
-                        ConcreteType::UnknownIntClass,
-                        ConcreteType::Intrinsic(IntrinsicType::Float),
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_then = inst.instantiate_intrinsic_type_class(
-                            then_expr.result,
-                            IntrinsicType::Float,
-                        );
-                        let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                            "then multiple out?"
-                        );
+                        IntrinsicType::UInt.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::Float)) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::Float.into(),
-                            SimplifyResult {
-                                result: new_then,
-                                start_block: then_expr.start_block,
-                                end_block: new_then_blk,
-                            },
-                            else_expr,
-                        )
-                    }
                     (
-                        ConcreteType::UnknownNumberClass,
-                        ConcreteType::Intrinsic(IntrinsicType::Float),
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_then = inst.instantiate_intrinsic_type_class(
-                            then_expr.result,
-                            IntrinsicType::Float,
-                        );
-                        let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                            "then multiple out?"
-                        );
+                        IntrinsicType::Float.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (
+                    ConcreteType::UnknownNumberClass,
+                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst
+                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::Float.into(),
-                            SimplifyResult {
-                                result: new_then,
-                                start_block: then_expr.start_block,
-                                end_block: new_then_blk,
-                            },
-                            else_expr,
-                        )
-                    }
                     (
-                        ConcreteType::Intrinsic(IntrinsicType::Float),
-                        ConcreteType::UnknownIntClass,
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_else = inst.instantiate_intrinsic_type_class(
-                            else_expr.result,
-                            IntrinsicType::Float,
-                        );
-                        let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                            "else multiple out?"
-                        );
+                        IntrinsicType::Float.into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::Float.into(),
-                            then_expr,
-                            SimplifyResult {
-                                result: new_else,
-                                start_block: else_expr.start_block,
-                                end_block: new_else_blk,
-                            },
-                        )
-                    }
                     (
-                        ConcreteType::Intrinsic(IntrinsicType::Float),
-                        ConcreteType::UnknownNumberClass,
-                    ) => {
-                        let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                        let new_else = inst.instantiate_intrinsic_type_class(
-                            else_expr.result,
-                            IntrinsicType::Float,
-                        );
-                        let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                        assert!(
-                            block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                            "else multiple out?"
-                        );
+                        IntrinsicType::Float.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                    ConcreteType::UnknownNumberClass,
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst
+                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
 
-                        (
-                            IntrinsicType::Float.into(),
-                            then_expr,
-                            SimplifyResult {
-                                result: new_else,
-                                start_block: else_expr.start_block,
-                                end_block: new_else_blk,
-                            },
-                        )
-                    }
-                    _ => {
-                        panic!("Error: if then block and else block has different result type");
-                    }
-                };
+                    (
+                        IntrinsicType::Float.into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                _ => {
+                    panic!("Error: if then block and else block has different result type");
+                }
+            };
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let result = inst.phi(
@@ -1600,8 +1557,8 @@ pub fn binary_op<'a, 's>(
                 eprintln!(
                     "Error: cannot apply binary op {}({op:?}) between terms ({:?} and {:?})",
                     op.slice,
-                    left.ty(inst),
-                    right.ty(inst)
+                    *left.ty(inst),
+                    *right.ty(inst)
                 );
 
                 (
@@ -1711,8 +1668,8 @@ pub fn binary_op<'a, 's>(
             eprintln!(
                 "Error: cannot apply binary op {} between terms ({:?} and {:?})",
                 op.slice,
-                left.ty(inst),
-                right.ty(inst)
+                *left.ty(inst),
+                *right.ty(inst)
             );
             (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
         }
@@ -1798,13 +1755,13 @@ fn funcall<'a, 's>(
     block_ctx: &mut BlockGenerationContext<'a, 's>,
     inst_ctx: &mut BlockInstructionEmissionContext<'a, 's>,
 ) -> (RegisterRef, BlockRef) {
-    match callee.ty(inst_ctx) {
-        &ConcreteType::IntrinsicTypeConstructor(t) => {
+    match *callee.ty(inst_ctx) {
+        ConcreteType::IntrinsicTypeConstructor(t) => {
             let element_ty = t.scalar_type().unwrap();
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             for a in args.iter_mut() {
                 *a = inst.loaded(*a);
-                match (a.ty(&inst), &element_ty) {
+                match (&*a.ty(&inst), &element_ty) {
                     // TODO: 他の変換は必要になったら書く
                     (ConcreteType::UnknownIntClass, IntrinsicScalarType::Float) => {
                         *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
@@ -1816,10 +1773,10 @@ fn funcall<'a, 's>(
                 }
             }
 
-            let eval_registers = inst.into_eval_registers();
-            let result_register = inst_ctx.alloc_register(t.into());
+            let eval_registers = inst.into_eval_impure_registers();
+            let result_register = RegisterRef::Impure(inst_ctx.alloc_impure_register(t.into()));
             let eval_block = block_ctx.add(Block {
-                eval_registers,
+                eval_impure_registers: eval_registers,
                 flow: BlockFlowInstruction::Funcall {
                     callee,
                     args,
@@ -1830,7 +1787,7 @@ fn funcall<'a, 's>(
 
             (result_register, eval_block)
         }
-        &ConcreteType::Function {
+        ConcreteType::Function {
             args: ref def_arg_types,
             ref output,
         } if def_arg_types.len() == args.len() => {
@@ -1840,7 +1797,7 @@ fn funcall<'a, 's>(
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             for (dt, a) in def_arg_types.iter().zip(args.iter_mut()) {
                 matches = matches
-                    && match (a.ty(&inst), &dt) {
+                    && match (&*a.ty(&inst), dt) {
                         (
                             ConcreteType::UnknownIntClass,
                             ConcreteType::Intrinsic(IntrinsicType::SInt),
@@ -1869,11 +1826,11 @@ fn funcall<'a, 's>(
                             *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
                             true
                         }
-                        (ConcreteType::Ref(c), c2) if &**c == *c2 => {
+                        (ConcreteType::Ref(ref c), c2) if **c == *c2 => {
                             *a = inst.load_ref(*a);
                             true
                         }
-                        (ConcreteType::MutableRef(c), c2) if &**c == *c2 => {
+                        (ConcreteType::MutableRef(ref c), c2) if **c == *c2 => {
                             *a = inst.load_ref(*a);
                             true
                         }
@@ -1885,14 +1842,16 @@ fn funcall<'a, 's>(
                 panic!("Error: argument types mismatched");
             }
 
-            let eval_registers = inst.into_eval_registers();
-            let result_register = inst_ctx.alloc_register(
-                output
-                    .as_ref()
-                    .map_or_else(|| IntrinsicType::Unit.into(), |x| *x.clone()),
+            let eval_registers = inst.into_eval_impure_registers();
+            let result_register = RegisterRef::Impure(
+                inst_ctx.alloc_impure_register(
+                    output
+                        .as_ref()
+                        .map_or_else(|| IntrinsicType::Unit.into(), |x| *x.clone()),
+                ),
             );
             let eval_block = block_ctx.add(Block {
-                eval_registers,
+                eval_impure_registers: eval_registers,
                 flow: BlockFlowInstruction::Funcall {
                     callee,
                     args,
@@ -1903,7 +1862,7 @@ fn funcall<'a, 's>(
 
             (result_register, eval_block)
         }
-        &ConcreteType::Function {
+        ConcreteType::Function {
             args: ref def_args, ..
         } => {
             panic!(
@@ -1911,7 +1870,7 @@ fn funcall<'a, 's>(
                 args.iter().map(|a| a.ty(inst_ctx)).collect::<Vec<_>>()
             );
         }
-        &ConcreteType::OverloadedFunctions(ref xs) => {
+        ConcreteType::OverloadedFunctions(ref xs) => {
             let arg_types = args
                 .iter()
                 .map(|a| a.ty(inst_ctx).clone())
@@ -1945,10 +1904,10 @@ fn funcall<'a, 's>(
                                 }
                             }
 
-                            let eval_registers = inst.into_eval_registers();
-                            let result_register = inst_ctx.alloc_register(output);
+                            let eval_registers = inst.into_eval_impure_registers();
+                            let result_register = RegisterRef::Impure(inst_ctx.alloc_impure_register(output));
                             let eval_block = block_ctx.add(Block {
-                                eval_registers,
+                                eval_impure_registers: eval_registers,
                                 flow: BlockFlowInstruction::Funcall {
                                     callee, args, result: result_register, after_return: None
                                 }
@@ -1960,7 +1919,7 @@ fn funcall<'a, 's>(
                     }
                 },
                 &[n] => {
-                    let result_register = inst_ctx.alloc_register(*xs[n].1.clone());
+                    let result_register = RegisterRef::Impure(inst_ctx.alloc_impure_register(*xs[n].1.clone()));
                     let eval_block = block_ctx.add(Block::flow_only(BlockFlowInstruction::Funcall {
                         callee, args, result: result_register, after_return: None
                     }));

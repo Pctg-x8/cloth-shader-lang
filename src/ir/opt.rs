@@ -1,3 +1,1065 @@
+mod r#const;
+
+use std::{
+    collections::{HashMap, HashSet},
+    f32::consts::E,
+};
+
+use crate::{
+    concrete_type::ConcreteType, ir::block::BlockFlowInstruction, scope::SymbolScope, utils::PtrEq,
+};
+
+pub use self::r#const::*;
+
+use super::block::{
+    Block, BlockInstruction, BlockRef, Constants, ImpureInstructionMap, PureInstructions,
+    RegisterAliasMap, RegisterRef,
+};
+
+#[inline]
+pub fn apply_parallel_register_alias(
+    blocks: &mut [Block],
+    impure_instructions: &mut ImpureInstructionMap,
+    pure_instructions: &mut PureInstructions,
+    alias_map: &RegisterAliasMap,
+) {
+    if alias_map.is_empty() {
+        // レジスタエイリアスなし
+        return;
+    }
+
+    println!("[Register Alias(Parallel)]");
+    let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
+    sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
+    for (from, to) in sorted_alias {
+        println!("  {from:?} -> {to:?}");
+    }
+
+    for x in impure_instructions.values_mut() {
+        x.apply_parallel_register_alias(alias_map);
+    }
+    for x in pure_instructions.iter_mut() {
+        x.apply_parallel_register_alias(alias_map);
+    }
+    for b in blocks.iter_mut() {
+        b.apply_flow_parallel_register_alias(alias_map);
+    }
+}
+
+#[inline]
+pub fn apply_register_alias(
+    blocks: &mut [Block],
+    impure_instructions: &mut ImpureInstructionMap,
+    pure_instructions: &mut PureInstructions,
+    alias_map: &RegisterAliasMap,
+) {
+    if alias_map.is_empty() {
+        // レジスタエイリアスなし
+        return;
+    }
+
+    println!("[Register Alias(ResolveChained)]");
+    let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
+    sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
+    for (from, to) in sorted_alias {
+        println!("  {from:?} -> {to:?}");
+    }
+
+    for x in impure_instructions.values_mut() {
+        x.apply_register_alias(alias_map);
+    }
+    for x in pure_instructions.iter_mut() {
+        x.apply_register_alias(alias_map);
+    }
+    for b in blocks.iter_mut() {
+        b.apply_flow_register_alias(alias_map);
+    }
+}
+
+/// 同じPure命令を若い番号のregisterにまとめる
+pub fn unify_pure_instructions<'a, 's>(
+    pure_instructions: &PureInstructions<'a, 's>,
+) -> RegisterAliasMap {
+    let mut inst_to_register_map = HashMap::new();
+    let mut register_alias_map = HashMap::new();
+    for (r, v) in pure_instructions.iter().enumerate() {
+        match inst_to_register_map.entry(v) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(r);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let last_occurence = *e.get();
+                if last_occurence > r {
+                    // 若い番号を優先する
+                    let mapped = e.insert(r);
+                    register_alias_map.insert(RegisterRef::Pure(mapped), RegisterRef::Pure(r));
+                } else {
+                    register_alias_map
+                        .insert(RegisterRef::Pure(r), RegisterRef::Pure(last_occurence));
+                }
+            }
+        }
+    }
+
+    register_alias_map
+}
+
+/// 使われていないPureレジスタを削除
+pub fn strip_unreferenced_pure_instructions(
+    pure_instructions: &mut PureInstructions,
+    impure_instructions: &ImpureInstructionMap,
+    blocks: &[Block],
+) -> RegisterAliasMap {
+    let mut unreferenced = (0..pure_instructions.len()).collect::<HashSet<_>>();
+
+    for x in pure_instructions.iter() {
+        x.0.enumerate_ref_registers(|r| {
+            if let RegisterRef::Pure(n) = r {
+                unreferenced.remove(&n);
+            }
+        });
+    }
+    for x in impure_instructions.values() {
+        x.enumerate_ref_registers(|r| {
+            if let RegisterRef::Pure(n) = r {
+                unreferenced.remove(&n);
+            }
+        });
+    }
+    for b in blocks {
+        b.flow.enumerate_ref_registers(|r| {
+            if let RegisterRef::Pure(n) = r {
+                unreferenced.remove(&n);
+            }
+        })
+    }
+
+    let mut unreferenced = unreferenced.into_iter().collect::<Vec<_>>();
+    unreferenced.sort_by(|a, b| b.cmp(a));
+    println!("[StripPureInst] Targets: {unreferenced:?}");
+    let mut register_alias_map = HashMap::new();
+    for n in unreferenced {
+        register_alias_map.insert(
+            RegisterRef::Pure(pure_instructions.len() - 1),
+            RegisterRef::Pure(n),
+        );
+        println!(
+            "[StripPureInst] swap remove {} -> {}",
+            pure_instructions.len() - 1,
+            n
+        );
+        pure_instructions.swap_remove(n);
+    }
+
+    register_alias_map
+}
+
+/// 使われていないImpure命令とレジスタを削除
+pub fn strip_unreferenced_impure_instructions<'a, 's>(
+    blocks: &mut [Block],
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    impure_registers: &mut Vec<ConcreteType<'s>>,
+    pure_instructions: &PureInstructions<'a, 's>,
+) -> (RegisterAliasMap, bool) {
+    let mut unreferenced = (0..impure_registers.len()).collect::<HashSet<_>>();
+
+    for x in pure_instructions.iter() {
+        x.0.enumerate_ref_registers(|r| {
+            if let RegisterRef::Impure(n) = r {
+                unreferenced.remove(&n);
+            }
+        });
+    }
+    for x in impure_instructions.values() {
+        x.enumerate_ref_registers(|r| {
+            if let RegisterRef::Impure(n) = r {
+                unreferenced.remove(&n);
+            }
+        });
+    }
+    for b in blocks.iter() {
+        b.flow.enumerate_ref_registers(|r| {
+            if let RegisterRef::Impure(n) = r {
+                unreferenced.remove(&n);
+            }
+        });
+        // Note: Flowのdestはかならずあるものとする（Impureな関数呼び出しはstripしてはいけない）
+        b.flow.enumerate_dest_register(|r| {
+            if let RegisterRef::Impure(n) = r {
+                unreferenced.remove(&n);
+            }
+        })
+    }
+
+    for b in blocks.iter_mut() {
+        b.eval_impure_registers
+            .retain(|n| !unreferenced.contains(n));
+    }
+
+    let mut unreferenced = unreferenced.into_iter().collect::<Vec<_>>();
+    unreferenced.sort_by(|a, b| b.cmp(a));
+    println!("[StripImpureInst] Targets: {unreferenced:?}");
+    let mut register_alias_map = HashMap::new();
+    let mut modified = false;
+    for n in unreferenced {
+        let last_register = impure_registers.len() - 1;
+        if last_register != n {
+            // 最後のレジスタではない（入れ替えが発生する）
+            register_alias_map.insert(RegisterRef::Impure(last_register), RegisterRef::Impure(n));
+            println!("[StripImpureInst] swap remove {last_register} -> {n}");
+            if let Some(last_inst) = impure_instructions.remove(&last_register) {
+                // Note: ない場合がある（BlockFlowInstructionのdestレジスタなど）
+                impure_instructions.insert(n, last_inst);
+            }
+            impure_registers.swap_remove(n);
+
+            for b in blocks.iter_mut() {
+                if b.eval_impure_registers.remove(&last_register) {
+                    b.eval_impure_registers.insert(n);
+                }
+                b.flow.relocate_dest_register(|r| {
+                    if *r == RegisterRef::Impure(last_register) {
+                        *r = RegisterRef::Impure(n);
+                    }
+                });
+            }
+        } else {
+            println!("[StripImpureInst] last remove {n}");
+            impure_instructions.remove(&n);
+            impure_registers.pop();
+        }
+
+        modified = true;
+    }
+
+    (register_alias_map, modified)
+}
+
+pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<BlockRef>> {
+    fn process(
+        blocks: &[Block],
+        processing: BlockRef,
+        incoming: BlockRef,
+        loop_stack: &mut Vec<(BlockRef, BlockRef)>,
+        collect: &mut HashMap<BlockRef, HashSet<BlockRef>>,
+    ) {
+        match collect.entry(processing) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // 初めての処理
+                e.insert(HashSet::new()).insert(incoming);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // 以前にも処理したことがある
+                e.get_mut().insert(incoming);
+                return;
+            }
+        }
+
+        match blocks[processing.0].flow {
+            BlockFlowInstruction::Goto(next) => {
+                process(blocks, next, processing, loop_stack, collect)
+            }
+            BlockFlowInstruction::StoreRef {
+                after: Some(next), ..
+            } => process(blocks, next, processing, loop_stack, collect),
+            BlockFlowInstruction::StoreRef { after: None, .. } => (),
+            BlockFlowInstruction::Funcall {
+                after_return: Some(next),
+                ..
+            } => process(blocks, next, processing, loop_stack, collect),
+            BlockFlowInstruction::Funcall {
+                after_return: None, ..
+            } => (),
+            BlockFlowInstruction::IntrinsicImpureFuncall {
+                after_return: Some(next),
+                ..
+            } => process(blocks, next, processing, loop_stack, collect),
+            BlockFlowInstruction::IntrinsicImpureFuncall {
+                after_return: None, ..
+            } => (),
+            BlockFlowInstruction::Return(_) => (),
+            BlockFlowInstruction::Conditional {
+                r#true, r#false, ..
+            } => {
+                process(blocks, r#true, processing, loop_stack, collect);
+                process(blocks, r#false, processing, loop_stack, collect);
+            }
+            BlockFlowInstruction::ConditionalLoop {
+                r#break,
+                r#continue,
+                body,
+                ..
+            } => {
+                loop_stack.push((r#continue, r#break));
+                process(blocks, body, processing, loop_stack, collect);
+                loop_stack.pop();
+
+                process(blocks, r#break, processing, loop_stack, collect);
+            }
+            BlockFlowInstruction::Continue => {
+                let &(next, _) = loop_stack.last().expect("continue outside a loop");
+                let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+                process(blocks, next, processing, &mut new_stack, collect);
+            }
+            BlockFlowInstruction::Break => {
+                let &(_, next) = loop_stack.last().expect("break outside a loop");
+                let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+                process(blocks, next, processing, &mut new_stack, collect);
+            }
+            BlockFlowInstruction::Undetermined => (),
+        }
+    }
+
+    let mut collect = HashMap::new();
+    let mut loop_stack = Vec::new();
+
+    match blocks[0].flow {
+        BlockFlowInstruction::Goto(next) => {
+            process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect);
+        }
+        BlockFlowInstruction::StoreRef {
+            after: Some(next), ..
+        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        BlockFlowInstruction::StoreRef { after: None, .. } => (),
+        BlockFlowInstruction::Funcall {
+            after_return: Some(next),
+            ..
+        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        BlockFlowInstruction::Funcall {
+            after_return: None, ..
+        } => (),
+        BlockFlowInstruction::IntrinsicImpureFuncall {
+            after_return: Some(next),
+            ..
+        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        BlockFlowInstruction::IntrinsicImpureFuncall {
+            after_return: None, ..
+        } => (),
+        BlockFlowInstruction::Return(_) => (),
+        BlockFlowInstruction::Conditional {
+            r#true, r#false, ..
+        } => {
+            process(blocks, r#true, BlockRef(0), &mut loop_stack, &mut collect);
+            process(blocks, r#false, BlockRef(0), &mut loop_stack, &mut collect);
+        }
+        BlockFlowInstruction::ConditionalLoop {
+            r#break,
+            r#continue,
+            body,
+            ..
+        } => {
+            loop_stack.push((r#continue, r#break));
+            process(blocks, body, BlockRef(0), &mut loop_stack, &mut collect);
+            loop_stack.pop();
+
+            process(blocks, r#break, BlockRef(0), &mut loop_stack, &mut collect);
+        }
+        BlockFlowInstruction::Continue => {
+            let &(next, _) = loop_stack.last().expect("continue outside a loop");
+            let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+            process(blocks, next, BlockRef(0), &mut new_stack, &mut collect);
+        }
+        BlockFlowInstruction::Break => {
+            let &(_, next) = loop_stack.last().expect("break outside a loop");
+            let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+            process(blocks, next, BlockRef(0), &mut new_stack, &mut collect);
+        }
+        BlockFlowInstruction::Undetermined => (),
+    }
+
+    collect
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LocalMemoryIdentifier<'a, 's> {
+    Var(PtrEq<'a, SymbolScope<'a, 's>>, usize),
+    FunArg(PtrEq<'a, SymbolScope<'a, 's>>, usize),
+}
+
+pub fn collect_block_local_memory_stores<'a, 's>(
+    blocks: &[Block],
+    impure_instructions: &ImpureInstructionMap<'a, 's>,
+    pure_instructions: &PureInstructions<'a, 's>,
+) -> HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)> {
+    let mut collect = HashMap::new();
+
+    for (n, b) in blocks.iter().enumerate() {
+        match b.flow {
+            BlockFlowInstruction::Goto(_) => (),
+            BlockFlowInstruction::StoreRef {
+                ptr: RegisterRef::Pure(r),
+                value,
+                ..
+            } => match pure_instructions[r].0 {
+                BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                    collect.insert(BlockRef(n), (LocalMemoryIdentifier::Var(scope, vid), value));
+                }
+                BlockInstruction::FunctionInputVarRef(scope, id) => {
+                    collect.insert(
+                        BlockRef(n),
+                        (LocalMemoryIdentifier::FunArg(scope, id), value),
+                    );
+                }
+                _ => (),
+            },
+            BlockFlowInstruction::StoreRef { .. } => (),
+            BlockFlowInstruction::Funcall { .. } => (),
+            BlockFlowInstruction::IntrinsicImpureFuncall { .. } => (),
+            BlockFlowInstruction::Return(_) => (),
+            BlockFlowInstruction::Conditional { .. } => (),
+            BlockFlowInstruction::ConditionalLoop { .. } => (),
+            BlockFlowInstruction::Break => (),
+            BlockFlowInstruction::Continue => (),
+            BlockFlowInstruction::Undetermined => (),
+        }
+    }
+
+    collect
+}
+
+/// ローカルメモリ（ローカル変数/引数）への代入をトラックして、前のブロックからのphi命令を生成して固有のレジスタを割り当てる
+///
+/// 無駄なphiは後工程で消すので、ここでは一旦何も考えずに個々のブロックですべてのローカルメモリに対してphi命令を生成して唯一のレジスタを割り当てます
+/// （ローカルメモリに紐づくレジスタが途中で変わると後のブロック全てで変える必要があり大変面倒なため）
+pub fn propagate_local_memory_stores<'a, 's>(
+    blocks: &mut [Block],
+    impure_registers: &mut Vec<ConcreteType<'s>>,
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &PureInstructions<'a, 's>,
+    constants: &Constants<'s>,
+    block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
+) -> HashMap<BlockRef, HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>> {
+    struct BlockMetadata<'a, 's> {
+        pub local_mem_aliased_registers: HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>,
+    }
+
+    fn process<'a, 's>(
+        blocks: &mut [Block],
+        impure_registers: &mut Vec<ConcreteType<'s>>,
+        impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+        pure_instructions: &PureInstructions<'a, 's>,
+        constants: &Constants<'s>,
+        block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
+        processing: BlockRef,
+        incoming: BlockRef,
+        meta: &mut HashMap<BlockRef, BlockMetadata<'a, 's>>,
+        loop_stack: &mut Vec<(BlockRef, BlockRef)>,
+    ) {
+        // 流入ブロックでの最終的なローカルメモリマップ（流入ブロックにおけるincoming state + 流入ブロックの変数代入操作）
+        let incoming_stores = meta[&incoming]
+            .local_mem_aliased_registers
+            .iter()
+            .chain(
+                block_local_memory_stores
+                    .get(&incoming)
+                    .map(|(a, b)| (a, b)),
+            )
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>();
+
+        match meta.entry(processing) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // 再訪
+                let bm = e.get_mut();
+
+                for (k, v) in incoming_stores {
+                    let ty = match v {
+                        RegisterRef::Const(n) => constants[n].ty(),
+                        RegisterRef::Pure(n) => pure_instructions[n].1.clone(),
+                        RegisterRef::Impure(n) => impure_registers[n].clone(),
+                    };
+
+                    match bm.local_mem_aliased_registers.entry(k.clone()) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // 新しいLocalMemStore
+                            impure_registers.push(ty);
+                            let vreg = impure_registers.len() - 1;
+                            impure_instructions.insert(
+                                vreg,
+                                BlockInstruction::Phi([(incoming, v)].into_iter().collect()),
+                            );
+                            blocks[processing.0].eval_impure_registers.insert(vreg);
+                            e.insert(RegisterRef::Impure(vreg));
+                        }
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            // すでにあるLocalMemStore
+                            let RegisterRef::Impure(vreg) = e.get() else {
+                                unreachable!("not imported entry");
+                            };
+                            assert_eq!(impure_registers[*vreg], ty);
+                            let BlockInstruction::Phi(ref mut incomings) =
+                                impure_instructions.get_mut(&vreg).unwrap()
+                            else {
+                                unreachable!("not a phi entry");
+                            };
+
+                            incomings.insert(incoming, v);
+                        }
+                    }
+                }
+
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // 初
+                let bm = e.insert(BlockMetadata {
+                    local_mem_aliased_registers: HashMap::new(),
+                });
+
+                for (k, v) in incoming_stores {
+                    let ty = match v {
+                        RegisterRef::Const(n) => constants[n].ty(),
+                        RegisterRef::Pure(n) => pure_instructions[n].1.clone(),
+                        RegisterRef::Impure(n) => impure_registers[n].clone(),
+                    };
+
+                    match bm.local_mem_aliased_registers.entry(k.clone()) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // 新しいLocalMemStore
+                            impure_registers.push(ty);
+                            let vreg = impure_registers.len() - 1;
+                            impure_instructions.insert(
+                                vreg,
+                                BlockInstruction::Phi([(incoming, v)].into_iter().collect()),
+                            );
+                            blocks[processing.0].eval_impure_registers.insert(vreg);
+                            e.insert(RegisterRef::Impure(vreg));
+                        }
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            // すでにあるLocalMemStore
+                            let RegisterRef::Impure(vreg) = e.get() else {
+                                unreachable!("not imported entry");
+                            };
+                            assert_eq!(impure_registers[*vreg], ty);
+                            let BlockInstruction::Phi(ref mut incomings) =
+                                impure_instructions.get_mut(&vreg).unwrap()
+                            else {
+                                unreachable!("not a phi entry");
+                            };
+
+                            incomings.insert(incoming, v);
+                        }
+                    }
+                }
+
+                match blocks[processing.0].flow {
+                    BlockFlowInstruction::Goto(next) => process(
+                        blocks,
+                        impure_registers,
+                        impure_instructions,
+                        pure_instructions,
+                        constants,
+                        block_local_memory_stores,
+                        next,
+                        processing,
+                        meta,
+                        loop_stack,
+                    ),
+                    BlockFlowInstruction::StoreRef {
+                        after: Some(next), ..
+                    } => process(
+                        blocks,
+                        impure_registers,
+                        impure_instructions,
+                        pure_instructions,
+                        constants,
+                        block_local_memory_stores,
+                        next,
+                        processing,
+                        meta,
+                        loop_stack,
+                    ),
+                    BlockFlowInstruction::StoreRef { after: None, .. } => (),
+                    BlockFlowInstruction::Funcall {
+                        after_return: Some(after_return),
+                        ..
+                    } => process(
+                        blocks,
+                        impure_registers,
+                        impure_instructions,
+                        pure_instructions,
+                        constants,
+                        block_local_memory_stores,
+                        after_return,
+                        processing,
+                        meta,
+                        loop_stack,
+                    ),
+                    BlockFlowInstruction::Funcall {
+                        after_return: None, ..
+                    } => (),
+                    BlockFlowInstruction::IntrinsicImpureFuncall {
+                        after_return: Some(after_return),
+                        ..
+                    } => process(
+                        blocks,
+                        impure_registers,
+                        impure_instructions,
+                        pure_instructions,
+                        constants,
+                        block_local_memory_stores,
+                        after_return,
+                        processing,
+                        meta,
+                        loop_stack,
+                    ),
+                    BlockFlowInstruction::IntrinsicImpureFuncall {
+                        after_return: None, ..
+                    } => (),
+                    BlockFlowInstruction::Conditional {
+                        r#true, r#false, ..
+                    } => {
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            r#true,
+                            processing,
+                            meta,
+                            loop_stack,
+                        );
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            r#false,
+                            processing,
+                            meta,
+                            loop_stack,
+                        );
+                    }
+                    BlockFlowInstruction::ConditionalLoop {
+                        r#break,
+                        r#continue,
+                        body,
+                        ..
+                    } => {
+                        loop_stack.push((r#continue, r#break));
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            body,
+                            processing,
+                            meta,
+                            loop_stack,
+                        );
+                        loop_stack.pop();
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            r#break,
+                            processing,
+                            meta,
+                            loop_stack,
+                        );
+                    }
+                    BlockFlowInstruction::Continue => {
+                        let &(c, _) = loop_stack.last().expect("continue not in a loop");
+                        let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            c,
+                            processing,
+                            meta,
+                            &mut new_loop_stack,
+                        );
+                    }
+                    BlockFlowInstruction::Break => {
+                        let &(_, b) = loop_stack.last().expect("break not in a loop");
+                        let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+                        process(
+                            blocks,
+                            impure_registers,
+                            impure_instructions,
+                            pure_instructions,
+                            constants,
+                            block_local_memory_stores,
+                            b,
+                            processing,
+                            meta,
+                            &mut new_loop_stack,
+                        );
+                    }
+                    BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
+                }
+            }
+        }
+    }
+
+    let mut meta = HashMap::new();
+    let mut loop_stack = Vec::new();
+
+    // b0 has empty state
+    meta.insert(
+        BlockRef(0),
+        BlockMetadata {
+            local_mem_aliased_registers: HashMap::new(),
+        },
+    );
+
+    match blocks[0].flow {
+        BlockFlowInstruction::Goto(next) => process(
+            blocks,
+            impure_registers,
+            impure_instructions,
+            pure_instructions,
+            constants,
+            block_local_memory_stores,
+            next,
+            BlockRef(0),
+            &mut meta,
+            &mut loop_stack,
+        ),
+        BlockFlowInstruction::StoreRef {
+            after: Some(next), ..
+        } => process(
+            blocks,
+            impure_registers,
+            impure_instructions,
+            pure_instructions,
+            constants,
+            block_local_memory_stores,
+            next,
+            BlockRef(0),
+            &mut meta,
+            &mut loop_stack,
+        ),
+        BlockFlowInstruction::StoreRef { after: None, .. } => (),
+        BlockFlowInstruction::Funcall {
+            after_return: Some(after_return),
+            ..
+        } => process(
+            blocks,
+            impure_registers,
+            impure_instructions,
+            pure_instructions,
+            constants,
+            block_local_memory_stores,
+            after_return,
+            BlockRef(0),
+            &mut meta,
+            &mut loop_stack,
+        ),
+        BlockFlowInstruction::Funcall {
+            after_return: None, ..
+        } => (),
+        BlockFlowInstruction::IntrinsicImpureFuncall {
+            after_return: Some(after_return),
+            ..
+        } => process(
+            blocks,
+            impure_registers,
+            impure_instructions,
+            pure_instructions,
+            constants,
+            block_local_memory_stores,
+            after_return,
+            BlockRef(0),
+            &mut meta,
+            &mut loop_stack,
+        ),
+        BlockFlowInstruction::IntrinsicImpureFuncall {
+            after_return: None, ..
+        } => (),
+        BlockFlowInstruction::Conditional {
+            r#true, r#false, ..
+        } => {
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                r#true,
+                BlockRef(0),
+                &mut meta,
+                &mut loop_stack,
+            );
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                r#false,
+                BlockRef(0),
+                &mut meta,
+                &mut loop_stack,
+            );
+        }
+        BlockFlowInstruction::ConditionalLoop {
+            r#break,
+            r#continue,
+            body,
+            ..
+        } => {
+            loop_stack.push((r#continue, r#break));
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                body,
+                BlockRef(0),
+                &mut meta,
+                &mut loop_stack,
+            );
+            loop_stack.pop();
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                r#break,
+                BlockRef(0),
+                &mut meta,
+                &mut loop_stack,
+            );
+        }
+        BlockFlowInstruction::Continue => {
+            let &(c, _) = loop_stack.last().expect("continue not in a loop");
+            let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                c,
+                BlockRef(0),
+                &mut meta,
+                &mut new_loop_stack,
+            );
+        }
+        BlockFlowInstruction::Break => {
+            let &(_, b) = loop_stack.last().expect("break not in a loop");
+            let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
+            process(
+                blocks,
+                impure_registers,
+                impure_instructions,
+                pure_instructions,
+                constants,
+                block_local_memory_stores,
+                b,
+                BlockRef(0),
+                &mut meta,
+                &mut new_loop_stack,
+            );
+        }
+        BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
+    }
+
+    meta.into_iter()
+        .map(|(k, v)| (k, v.local_mem_aliased_registers))
+        .collect()
+}
+
+/// ローカルメモリのLoadを対応するレジスタへのエイリアスに変える
+pub fn replace_local_memory_load<'a, 's>(
+    blocks: &[Block],
+    per_block_local_memory_register_map: &HashMap<
+        BlockRef,
+        HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>,
+    >,
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &PureInstructions<'a, 's>,
+) {
+    for (bx, b) in blocks.iter().enumerate() {
+        let local_memory_register_map = &per_block_local_memory_register_map[&BlockRef(bx)];
+
+        for x in b.eval_impure_registers.iter() {
+            match impure_instructions[x] {
+                BlockInstruction::LoadRef(RegisterRef::Pure(n)) => match pure_instructions[n].0 {
+                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                        if let Some(&r) =
+                            local_memory_register_map.get(&LocalMemoryIdentifier::Var(scope, vid))
+                        {
+                            match r {
+                                RegisterRef::Impure(n) if b.eval_impure_registers.contains(&n) => {
+                                    // Impure（phi）かつ、同ブロック内で評価されるものであれば直接それに変える
+                                    impure_instructions.insert(*x, impure_instructions[&n].clone());
+                                }
+                                _ => {
+                                    impure_instructions
+                                        .insert(*x, BlockInstruction::RegisterAlias(r));
+                                }
+                            }
+                        }
+                    }
+                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                        if let Some(&r) =
+                            local_memory_register_map.get(&LocalMemoryIdentifier::FunArg(scope, id))
+                        {
+                            match r {
+                                RegisterRef::Impure(n) if b.eval_impure_registers.contains(&n) => {
+                                    // Impure（phi）かつ、同ブロック内で評価されるものであれば直接それに変える
+                                    impure_instructions.insert(*x, impure_instructions[&n].clone());
+                                }
+                                _ => {
+                                    impure_instructions
+                                        .insert(*x, BlockInstruction::RegisterAlias(r));
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
+    }
+}
+
+/// 一つもLoad命令がないローカルメモリのStore命令を削除する
+///
+/// 本当はRead after WriteじゃないStore命令（つまりStore -> Storeが連続しているもの）も消したいが、フローを含めて正しくRead after Writeを検出するのが難しそうなので一旦諦める
+pub fn strip_never_load_local_memory_stores<'a, 's>(
+    blocks: &mut [Block],
+    impure_instructions: &ImpureInstructionMap<'a, 's>,
+    pure_instructions: &PureInstructions<'a, 's>,
+) -> bool {
+    let mut loaded_local_memories = HashSet::new();
+    for b in blocks.iter() {
+        for x in b.eval_impure_registers.iter() {
+            match impure_instructions[x] {
+                BlockInstruction::LoadRef(RegisterRef::Pure(n)) => match pure_instructions[n].0 {
+                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                        loaded_local_memories.insert(LocalMemoryIdentifier::Var(scope, vid));
+                    }
+                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                        loaded_local_memories.insert(LocalMemoryIdentifier::FunArg(scope, id));
+                    }
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
+    }
+
+    let mut modified = false;
+    for b in blocks.iter_mut() {
+        match b.flow {
+            BlockFlowInstruction::StoreRef {
+                ptr: RegisterRef::Pure(n),
+                after,
+                ..
+            } => {
+                let loaded = match pure_instructions[n].0 {
+                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                        loaded_local_memories.contains(&LocalMemoryIdentifier::Var(scope, vid))
+                    }
+                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                        loaded_local_memories.contains(&LocalMemoryIdentifier::FunArg(scope, id))
+                    }
+                    // 上記以外は一旦保守的にLoadあるものとして判定
+                    _ => true,
+                };
+
+                if !loaded {
+                    // Load命令がないのでStoreを剥がす
+                    b.flow = match after {
+                        Some(n) => BlockFlowInstruction::Goto(n),
+                        None => BlockFlowInstruction::Undetermined,
+                    };
+                    modified = true;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    modified
+}
+
+/// 解決先レジスタがすべて同じなphi命令をエイリアスに置き換える
+pub fn deconstruct_effectless_phi<'a, 's>(
+    blocks: &mut [Block],
+    impure_registers: &[ConcreteType<'s>],
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &mut PureInstructions<'a, 's>,
+) -> RegisterAliasMap {
+    let mut register_alias_map = HashMap::new();
+
+    for (r, x) in core::mem::replace(
+        impure_instructions,
+        HashMap::with_capacity(impure_instructions.len()),
+    ) {
+        match x {
+            BlockInstruction::Phi(xs) => {
+                let unique_registers = xs
+                    .values()
+                    .fold(HashSet::new(), |mut h, &r| {
+                        h.insert(r);
+                        h
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+
+                if let &[r1] = &unique_registers[..] {
+                    // 唯一にunifyできた
+                    pure_instructions.push(
+                        BlockInstruction::RegisterAlias(r1).typed(impure_registers[r].clone()),
+                    );
+                    register_alias_map.insert(
+                        RegisterRef::Impure(r),
+                        RegisterRef::Pure(pure_instructions.len() - 1),
+                    );
+                    for b in blocks.iter_mut() {
+                        b.eval_impure_registers.remove(&r);
+                    }
+                } else {
+                    impure_instructions.insert(r, BlockInstruction::Phi(xs));
+                }
+            }
+            _ => {
+                impure_instructions.insert(r, x);
+            }
+        }
+    }
+
+    register_alias_map
+}
+
+/// エントロピーが小さい方（Impure>Pure>Constで、レジスタ番号が小さい方）へのレジスタエイリアスを計算する
+pub fn collect_register_aliases(pure_instructions: &PureInstructions) -> RegisterAliasMap {
+    pure_instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(from, x)| match x.0 {
+            BlockInstruction::RegisterAlias(to) => Some((RegisterRef::Pure(from), to)),
+            _ => None,
+        })
+        .collect()
+}
+
+/*
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Write,
@@ -7,7 +1069,7 @@ use typed_arena::Arena;
 
 use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
-    ir::block::RegisterRef,
+    ir::block::{BaseRegisters, RegisterRef},
     parser::FunctionDeclarationInputArguments,
     ref_path::RefPath,
     scope::{self, SymbolScope, VarId},
@@ -20,17 +1082,52 @@ use crate::{
     utils::PtrEq,
 };
 
-mod r#const;
-pub use self::r#const::*;
-
 use super::{
     block::{
         Block, BlockFlowInstruction, BlockGenerationContext, BlockInstruction,
-        BlockInstructionEmissionContext, BlockRef, IntrinsicBinaryOperation,
+        BlockInstructionEmissionContext, BlockRef, Constants, ImpureInstructionMap,
+        IntrinsicBinaryOperation, PureInstructionMap, RegisterAliasMap,
     },
     expr::{ConstModifiers, ScopeCaptureSource, SimplifiedExpression},
-    Const, ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral, ExprRef,
+    ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral, ExprRef,
+    LosslessConst,
 };
+
+pub fn split_instructions<'a, 's>(
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+) -> (Constants<'s>, PureInstructionMap<'a, 's>, RegisterAliasMap) {
+    let mut constants = Vec::new();
+    let mut pure_instructions = HashMap::new();
+    let mut register_alias_map = HashMap::new();
+    let mut pure_last_index = 0;
+
+    for (r, x) in core::mem::replace(
+        impure_instructions,
+        HashMap::with_capacity(impure_instructions.len()),
+    ) {
+        let x = match x.try_into_const_inst() {
+            Ok(x) => {
+                constants.push(x);
+                register_alias_map.insert(
+                    RegisterRef::Impure(r),
+                    RegisterRef::Const(constants.len() - 1),
+                );
+                continue;
+            }
+            Err(x) => x,
+        };
+
+        if x.is_pure() {
+            pure_instructions.insert(pure_last_index, x);
+            register_alias_map.insert(RegisterRef::Impure(r), RegisterRef::Pure(pure_last_index));
+            pure_last_index += 1;
+        } else {
+            impure_instructions.insert(r, x);
+        }
+    }
+
+    (constants, pure_instructions, register_alias_map)
+}
 
 #[derive(Clone, Copy)]
 pub enum LocalVarUsage {
@@ -141,8 +1238,8 @@ pub fn merge_simple_goto_blocks<'a, 's>(
                 && !merged.is_loop_term_block()
             {
                 current
-                    .eval_registers
-                    .extend(merged.eval_registers.iter().copied());
+                    .eval_impure_registers
+                    .extend(merged.eval_impure_registers.iter().copied());
                 current.flow = merged.flow.clone();
 
                 match merged.flow {
@@ -282,7 +1379,7 @@ pub fn strip_unreachable_blocks<'a, 's>(
 
         // shift refs after n
         for b in blocks.iter_mut() {
-            for r in b.eval_registers.iter() {
+            for r in b.eval_impure_registers.iter() {
                 match mod_instructions.get_mut(r) {
                     Some(BlockInstruction::Phi(ref mut incoming_selectors)) => {
                         for (k, v) in core::mem::replace(incoming_selectors, BTreeMap::new()) {
@@ -317,7 +1414,7 @@ pub fn block_aliasing<'a, 's>(
         .enumerate()
         .filter_map(|(n, b)| match b {
             &Block {
-                eval_registers: ref instructions,
+                eval_impure_registers: ref instructions,
                 flow: BlockFlowInstruction::Goto(to),
             } if instructions.is_empty() => Some((BlockRef(n), to)),
             _ => None,
@@ -423,7 +1520,7 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
                         result,
                         BlockInstruction::ConstructIntrinsicComposite(ty, args.clone()),
                     );
-                    b.eval_registers.insert(result);
+                    b.eval_impure_registers.insert(result);
                     b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
                     modified = true;
                 }
@@ -448,7 +1545,7 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
                                 args.clone(),
                             ),
                         );
-                        b.eval_registers.insert(result);
+                        b.eval_impure_registers.insert(result);
                         b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
                         modified = true;
                     } else {
@@ -474,25 +1571,27 @@ pub fn resolve_intrinsic_funcalls<'a, 's>(
 
 pub fn inline_function2<'a, 's>(
     blocks: &mut Vec<Block>,
-    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &mut PureInstructionMap<'a, 's>,
+    constants: &mut Constants<'s>,
     scope_arena: &'a Arena<SymbolScope<'a, 's>>,
     function_root_scope: &'a SymbolScope<'a, 's>,
-    registers: &mut Vec<ConcreteType<'s>>,
+    pure_registers: &mut Vec<ConcreteType<'s>>,
+    impure_registers: &mut Vec<ConcreteType<'s>>,
 ) -> bool {
     let mut modified = false;
 
     let mut n = 0;
     while n < blocks.len() {
         if let BlockFlowInstruction::Funcall {
-            callee,
+            callee: RegisterRef::Pure(callee),
             ref args,
             result,
             after_return,
         } = blocks[n].flow
         {
-            if let Some(BlockInstruction::UserDefinedFunctionRef(scope, name)) =
-                const_map.get(&callee)
+            if let BlockInstruction::UserDefinedFunctionRef(scope, name) =
+                pure_instructions[&callee]
             {
                 let target_function_symbol =
                     scope.0.user_defined_function_symbol(name.0.slice).unwrap();
@@ -503,6 +1602,11 @@ pub fn inline_function2<'a, 's>(
                 println!("  symbol = {target_function_symbol:#?}");
                 println!("  body: {target_function_body:#?}");
 
+                // 定数は単純に合体
+                let inlined_const_base_register = constants.len();
+                constants.extend(target_function_body.borrow().constants.iter().cloned());
+
+                // 引数は変数化する
                 let tmp_scope = scope_arena.alloc(function_root_scope.new_child());
                 let mut arg_store_set = Vec::with_capacity(args.len());
                 let mut function_input_remap = HashMap::new();
@@ -516,42 +1620,45 @@ pub fn inline_function2<'a, 's>(
                     else {
                         unreachable!();
                     };
-                    registers.push(def.3.clone().mutable_ref());
-                    let ptr = RegisterRef(registers.len() - 1);
+                    pure_registers.push(def.3.clone().mutable_ref());
+                    let ptr = RegisterRef::Pure(pure_registers.len() - 1);
                     arg_store_set.push((*ee, ptr, varid));
                     function_input_remap.insert(n, varid);
                 }
 
-                let register_offset = registers.len();
-                registers.extend(target_function_body.borrow().registers.iter().cloned());
-                const_map.extend(
+                // Pure/Impureはレジスタだけ合体させる
+                let inlined_pure_base_register = pure_registers.len();
+                pure_registers.extend(target_function_body.borrow().pure_registers.iter().cloned());
+                let inlined_impure_base_register = impure_registers.len();
+                impure_registers.extend(
                     target_function_body
                         .borrow()
-                        .constants
+                        .impure_registers
                         .iter()
-                        .map(|(k, v)| {
-                            if let BlockInstruction::FunctionInputVarRef(scope, id) = v {
-                                if *scope == PtrEq(target_function_body.borrow().symbol_scope) {
-                                    let Some(&varid) = function_input_remap.get(&id) else {
-                                        unreachable!("no function arg to var remap");
-                                    };
+                        .cloned(),
+                );
 
-                                    return (
-                                        RegisterRef(k.0 + register_offset),
-                                        BlockInstruction::ScopeLocalVarRef(PtrEq(tmp_scope), varid),
-                                    );
-                                }
-                            }
+                let base_registers = BaseRegisters {
+                    r#const: inlined_const_base_register,
+                    pure: inlined_pure_base_register,
+                    impure: inlined_impure_base_register,
+                };
 
-                            (RegisterRef(k.0 + register_offset), v.clone())
+                // relocateしながらPure命令列を合体
+                pure_instructions.extend(
+                    target_function_body
+                        .borrow()
+                        .pure_instructions
+                        .iter()
+                        .map(|(res, x)| {
+                            let mut x2 = x.clone();
+                            x2.relocate_register(|r| {
+                                *r = r.based_on(&base_registers);
+                            });
+
+                            (res + base_registers.pure, x2)
                         }),
                 );
-                const_map.extend(arg_store_set.iter().map(|(_, ptr, varid)| {
-                    (
-                        *ptr,
-                        BlockInstruction::ScopeLocalVarRef(PtrEq(tmp_scope), *varid),
-                    )
-                }));
 
                 dbg!(n);
                 let mut after_blocks = blocks.split_off(n + 1);
@@ -583,9 +1690,9 @@ pub fn inline_function2<'a, 's>(
                     .enumerate()
                     .map(|(n, b)| {
                         let mut nb = b.clone();
-                        let instruction_count = nb.eval_registers.len();
+                        let instruction_count = nb.eval_impure_registers.len();
                         for k in core::mem::replace(
-                            &mut nb.eval_registers,
+                            &mut nb.eval_impure_registers,
                             HashSet::with_capacity(instruction_count),
                         ) {
                             let Some(mut x) =
@@ -598,7 +1705,8 @@ pub fn inline_function2<'a, 's>(
                             x.relocate_block_ref(|b| b.0 += expand_block_base);
 
                             mod_instructions.insert(RegisterRef(k.0 + register_offset), x);
-                            nb.eval_registers.insert(RegisterRef(k.0 + register_offset));
+                            nb.eval_impure_registers
+                                .insert(RegisterRef(k.0 + register_offset));
                         }
 
                         match nb.flow {
@@ -685,7 +1793,7 @@ pub fn inline_function2<'a, 's>(
                     .collect::<Vec<_>>();
                 mod_instructions.insert(result, BlockInstruction::Phi(exit_block_incomings));
                 let funcall_merge_block = Block {
-                    eval_registers: [result].into_iter().collect(),
+                    eval_impure_registers: [result].into_iter().collect(),
                     flow: match after_return {
                         Some(b) => BlockFlowInstruction::Goto(BlockRef(
                             b.0 - after_block_before_base + after_block_base,
@@ -695,7 +1803,7 @@ pub fn inline_function2<'a, 's>(
                 };
 
                 for b in blocks.iter_mut() {
-                    for r in b.eval_registers.iter() {
+                    for r in b.eval_impure_registers.iter() {
                         if let Some(x) = mod_instructions.get_mut(r) {
                             x.relocate_block_ref(|b| {
                                 b.0 += if b.0 > n {
@@ -717,7 +1825,7 @@ pub fn inline_function2<'a, 's>(
                 }
 
                 for b in after_blocks.iter_mut() {
-                    for r in b.eval_registers.iter() {
+                    for r in b.eval_impure_registers.iter() {
                         if let Some(x) = mod_instructions.get_mut(r) {
                             x.relocate_block_ref(|b| {
                                 b.0 += if b.0 > n {
@@ -786,12 +1894,13 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
     refpath_binds: &HashMap<&RefPath, &Vec<Decorate>>,
     blocks: &mut [Block],
     mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    pure_instructions: &mut PureInstructionMap<'a, 's>,
     registers: &[ConcreteType<'s>],
+    pure_registers: &[ConcreteType<'s>],
 ) -> bool {
     let mut modified = false;
 
-    for v in const_map.values_mut() {
+    for v in pure_instructions.values_mut() {
         match v {
             BlockInstruction::FunctionInputVarRef(scope, x)
                 if *scope == PtrEq(function_root_scope) =>
@@ -855,157 +1964,96 @@ pub fn resolve_shader_io_ref_binds<'a, 's>(
         }
     }
 
-    for b in blocks.iter_mut() {
-        let instruction_count = b.eval_registers.len();
-        for r in core::mem::replace(
-            &mut b.eval_registers,
-            HashSet::with_capacity(instruction_count),
-        ) {
-            let Some(x) = mod_instructions.get(&r) else {
-                continue;
-            };
-
-            match x {
-                BlockInstruction::MemberRef(src, ref member) => {
-                    let Some(ConcreteType::Struct(type_members)) =
-                        registers[src.0].as_dereferenced()
-                    else {
-                        panic!(
-                            "Error: cannot ref member of this type: {:?}",
-                            registers[src.0]
-                        );
-                    };
-                    let member_index = type_members.iter().position(|m| &m.name == member).unwrap();
-                    let member_record = &type_members[member_index];
-
-                    let descriptor_bound = match member_record.attribute {
-                        SymbolAttribute {
-                            descriptor_set_location: Some(set),
-                            descriptor_set_binding: Some(binding),
-                            ..
-                        } => Some(DescriptorBound { set, binding }),
-                        _ => None,
-                    };
-                    let push_constant_bound = match member_record.attribute {
-                        SymbolAttribute {
-                            push_constant_offset: Some(offset),
-                            ..
-                        } => Some(PushConstantBound { offset }),
-                        _ => None,
-                    };
-                    let builtin_bound = match member_record.attribute {
-                        SymbolAttribute {
-                            bound_builtin_io: Some(builtin),
-                            ..
-                        } => Some(BuiltinBound(builtin)),
-                        _ => None,
-                    };
-                    let workgroup_shared = member_record.attribute.workgroup_shared;
-
-                    match (
-                        descriptor_bound,
-                        push_constant_bound,
-                        builtin_bound,
-                        workgroup_shared,
-                    ) {
-                        (Some(d), None, None, false) => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::DescriptorRef {
-                                    set: d.set,
-                                    binding: d.binding,
-                                },
-                            );
-                            mod_instructions.remove(&r);
-                            modified = true;
-                        }
-                        (None, Some(p), None, false) => {
-                            const_map.insert(r, BlockInstruction::PushConstantRef(p.offset));
-                            mod_instructions.remove(&r);
-                            modified = true;
-                        }
-                        (None, None, Some(b), false) => {
-                            const_map.insert(r, BlockInstruction::BuiltinIORef(b.0));
-                            mod_instructions.remove(&r);
-                            modified = true;
-                        }
-                        (None, None, None, true) => match const_map.get(&src) {
-                            Some(&BlockInstruction::FunctionInputVarRef(scope, id))
-                                if scope == PtrEq(function_root_scope) =>
-                            {
-                                const_map.insert(
-                                    r,
-                                    BlockInstruction::WorkgroupSharedMemoryRef(RefPath::Member(
-                                        Box::new(RefPath::FunctionInput(id)),
-                                        member_index,
-                                    )),
-                                );
-                                mod_instructions.remove(&r);
-                                modified = true;
-                            }
-                            _ => unimplemented!("deep refpath resolving"),
-                        },
-                        (None, None, None, false) => {
-                            // no replacement
-                            b.eval_registers.insert(r);
-                        }
-                        _ => panic!("Error: conflicting shader io attributes"),
-                    }
-                }
-                _ => {
-                    // no replacement
-                    b.eval_registers.insert(r);
-                }
-            }
-        }
-    }
-
-    modified
-}
-
-pub fn convert_static_path_ref<'a, 's>(
-    function_scope: &'a SymbolScope<'a, 's>,
-    instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    registers: &[ConcreteType<'s>],
-) -> bool {
-    let mut modified = false;
-
-    for x in const_map.values_mut() {
+    for (r, x) in core::mem::replace(
+        pure_instructions,
+        HashMap::with_capacity(pure_instructions.len()),
+    ) {
         match x {
-            &mut BlockInstruction::FunctionInputVarRef(scope, vid)
-                if scope == PtrEq(function_scope) =>
-            {
-                *x = BlockInstruction::StaticPathRef(RefPath::FunctionInput(vid));
-                modified = true;
-            }
-            _ => (),
-        }
-    }
-
-    for (r, x) in core::mem::replace(instructions, HashMap::with_capacity(instructions.len())) {
-        match x {
-            BlockInstruction::MemberRef(src, member) => {
-                let ConcreteType::Struct(type_members) =
-                    registers[src.0].as_dereferenced().unwrap()
+            BlockInstruction::MemberRef(RegisterRef::Pure(src), ref member) => {
+                let Some(ConcreteType::Struct(type_members)) =
+                    pure_registers[src].as_dereferenced()
                 else {
-                    unreachable!("Error: cannot reference member for this type");
+                    panic!(
+                        "Error: cannot ref member of this type: {:?}",
+                        pure_registers[src]
+                    );
                 };
-                let member_index = type_members.iter().position(|m| m.name == member).unwrap();
+                let member_index = type_members.iter().position(|m| &m.name == member).unwrap();
+                let member_info = &type_members[member_index];
 
-                match const_map.get(&src) {
-                    Some(BlockInstruction::StaticPathRef(path)) => {
-                        let path = RefPath::Member(Box::new(path.clone()), member_index);
-                        const_map.insert(r, BlockInstruction::StaticPathRef(path));
+                let descriptor_bound = match member_info.attribute {
+                    SymbolAttribute {
+                        descriptor_set_location: Some(set),
+                        descriptor_set_binding: Some(binding),
+                        ..
+                    } => Some(DescriptorBound { set, binding }),
+                    _ => None,
+                };
+                let push_constant_bound = match member_info.attribute {
+                    SymbolAttribute {
+                        push_constant_offset: Some(offset),
+                        ..
+                    } => Some(PushConstantBound { offset }),
+                    _ => None,
+                };
+                let builtin_bound = match member_info.attribute {
+                    SymbolAttribute {
+                        bound_builtin_io: Some(builtin),
+                        ..
+                    } => Some(BuiltinBound(builtin)),
+                    _ => None,
+                };
+                let workgroup_shared = member_info.attribute.workgroup_shared;
+
+                match (
+                    descriptor_bound,
+                    push_constant_bound,
+                    builtin_bound,
+                    workgroup_shared,
+                ) {
+                    (Some(d), None, None, false) => {
+                        pure_instructions.insert(
+                            r,
+                            BlockInstruction::DescriptorRef {
+                                set: d.set,
+                                binding: d.binding,
+                            },
+                        );
                         modified = true;
                     }
-                    _ => {
-                        instructions.insert(r, BlockInstruction::MemberRef(src, member));
+                    (None, Some(p), None, false) => {
+                        pure_instructions.insert(r, BlockInstruction::PushConstantRef(p.offset));
+                        modified = true;
                     }
+                    (None, None, Some(b), false) => {
+                        pure_instructions.insert(r, BlockInstruction::BuiltinIORef(b.0));
+                        modified = true;
+                    }
+                    (None, None, None, true) => match pure_instructions[&src] {
+                        BlockInstruction::FunctionInputVarRef(scope, id)
+                            if scope == PtrEq(function_root_scope) =>
+                        {
+                            pure_instructions.insert(
+                                r,
+                                BlockInstruction::WorkgroupSharedMemoryRef(RefPath::Member(
+                                    Box::new(RefPath::FunctionInput(id)),
+                                    member_index,
+                                )),
+                            );
+                            modified = true;
+                        }
+                        _ => unimplemented!("deep refpath resolving"),
+                    },
+                    (None, None, None, false) => {
+                        // no replacement
+                        pure_instructions.insert(r, x);
+                    }
+                    _ => panic!("Error: conflicting shader io attributes"),
                 }
             }
             _ => {
-                instructions.insert(r, x);
+                // no replacement
+                pure_instructions.insert(r, x);
             }
         }
     }
@@ -1053,7 +2101,7 @@ pub fn build_register_state_map<'a, 's>(
                 }
             }
         }
-        for r in blocks[incoming.0].eval_registers.iter() {
+        for r in blocks[incoming.0].eval_impure_registers.iter() {
             let Some(x) = mod_instructions.get(r) else {
                 continue;
             };
@@ -1346,12 +2394,12 @@ pub fn resolve_register_aliases<'a, 's>(
         };
 
         let in_block_map = b
-            .eval_registers
+            .eval_impure_registers
             .iter()
             .filter_map(|r| mod_instructions.get(r).map(|x| (*r, x.clone())))
             .collect::<HashMap<_, _>>();
 
-        for r in b.eval_registers.iter() {
+        for r in b.eval_impure_registers.iter() {
             let m = match mod_instructions.get_mut(r) {
                 Some(x) => x.relocate_register(|x| loop {
                     match state_map.get(x).or_else(|| in_block_map.get(x)) {
@@ -1388,7 +2436,7 @@ pub fn strip_unreferenced_registers(
 ) -> bool {
     let mut referenced_registers = HashSet::new();
     for b in blocks.iter() {
-        for r in b.eval_registers.iter() {
+        for r in b.eval_impure_registers.iter() {
             let Some(x) = mod_instructions.get(r) else {
                 continue;
             };
@@ -1498,17 +2546,17 @@ pub fn strip_unreferenced_registers(
             }
         }
         for b in blocks.iter_mut() {
-            b.eval_registers.remove(&stripped);
+            b.eval_impure_registers.remove(&stripped);
 
             if swapped_register != stripped {
                 if let Some(x) = mod_instructions.remove(&swapped_register) {
                     mod_instructions.insert(stripped, x);
                 }
-                if b.eval_registers.remove(&swapped_register) {
-                    b.eval_registers.insert(stripped);
+                if b.eval_impure_registers.remove(&swapped_register) {
+                    b.eval_impure_registers.insert(stripped);
                 }
 
-                for r in b.eval_registers.iter() {
+                for r in b.eval_impure_registers.iter() {
                     if let Some(x) = mod_instructions.get_mut(r) {
                         x.relocate_register(|r| {
                             if r == &swapped_register {
@@ -1620,7 +2668,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                                 let phi_incomings = r_incomings.clone();
 
                                 mod_instructions.insert(rp, BlockInstruction::Phi(phi_incomings));
-                                blocks[incoming.0].eval_registers.insert(rp);
+                                blocks[incoming.0].eval_impure_registers.insert(rp);
                                 *r_incoming = IncomingRegister::Phied(rp);
 
                                 rp
@@ -1649,7 +2697,7 @@ pub fn build_scope_local_var_state<'a, 's>(
                                 let phi_incomings = r_incomings.clone();
 
                                 mod_instructions.insert(rp, BlockInstruction::Phi(phi_incomings));
-                                blocks[incoming.0].eval_registers.insert(rp);
+                                blocks[incoming.0].eval_impure_registers.insert(rp);
                                 r_incomings.clear();
                                 *r_incoming = IncomingRegister::Phied(rp);
 
@@ -1969,7 +3017,7 @@ pub fn apply_local_var_states<'a, 's>(
     let mut modified = false;
 
     for n in 0..blocks.len() {
-        for r in blocks[n].eval_registers.iter() {
+        for r in blocks[n].eval_impure_registers.iter() {
             match mod_instructions.get_mut(r) {
                 Some(x @ &mut BlockInstruction::LoadRef(ptr)) => {
                     if let Some(&BlockInstruction::ScopeLocalVarRef(scope, vid)) =
@@ -1996,89 +3044,61 @@ pub fn apply_local_var_states<'a, 's>(
     modified
 }
 
-pub fn deconstruct_effectless_phi(
-    instructions: &mut HashMap<RegisterRef, BlockInstruction>,
-) -> bool {
-    let mut modified = false;
-    for (r, x) in instructions.iter_mut() {
-        match x {
-            BlockInstruction::Phi(xs) => {
-                let unique_registers = xs
-                    .values()
-                    .fold(HashSet::new(), |mut h, &r| {
-                        h.insert(r);
-                        h
-                    })
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                match &unique_registers[..] {
-                    &[r] => {
-                        *x = BlockInstruction::RegisterAlias(r);
-                        modified = true;
-                    }
-                    &[r1, r2] => {
-                        if r1 == *r && r2 != *r {
-                            *x = BlockInstruction::RegisterAlias(r2);
-                            modified = true;
-                        } else if r1 != *r && r2 == *r {
-                            *x = BlockInstruction::RegisterAlias(r1);
-                            modified = true;
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            _ => (),
-        }
-    }
-
-    modified
-}
-
 pub fn transform_swizzle_component_store<'a, 's>(
     blocks: &mut [Block],
-    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &mut PureInstructionMap<'a, 's>,
     registers: &mut Vec<ConcreteType<'s>>,
+    pure_registers: &mut Vec<ConcreteType<'s>>,
 ) -> bool {
     let mut modified = false;
 
     for b in blocks {
         match b.flow {
-            BlockFlowInstruction::StoreRef { ptr, value, after } => {
+            BlockFlowInstruction::StoreRef {
+                ptr: RegisterRef::Pure(ptr),
+                value,
+                after,
+            } => {
                 // TODO: 一旦同ブロック内のアサインだけで判定する（ほかブロックまで含めるとブロックフローとか考えないといけないので大変）
-                let Some((source, index)) = mod_instructions.get(&ptr).and_then(|x| match x {
-                    BlockInstruction::SwizzleRef(source, ref indices) if indices.len() == 1 => {
-                        Some((*source, indices[0]))
+                let Some((source, index)) = (match pure_instructions[&ptr] {
+                    BlockInstruction::SwizzleRef(RegisterRef::Pure(source), ref indices)
+                        if indices.len() == 1 =>
+                    {
+                        Some((source, indices[0]))
                     }
                     _ => None,
                 }) else {
                     continue;
                 };
 
-                let source_value_ty = registers[source.0]
+                let source_value_ty = pure_registers[source]
                     .as_dereferenced()
                     .expect("cannot dereference swizzleRef source?")
                     .clone();
                 registers.push(source_value_ty.clone());
-                let source_value_register = RegisterRef(registers.len() - 1);
-                mod_instructions.insert(source_value_register, BlockInstruction::LoadRef(source));
-                b.eval_registers.insert(source_value_register);
-                registers.push(source_value_ty.clone());
-                let source_updated_register = RegisterRef(registers.len() - 1);
-                mod_instructions.insert(
+                let source_value_register = registers.len() - 1;
+                impure_instructions.insert(
+                    source_value_register,
+                    BlockInstruction::LoadRef(RegisterRef::Pure(source)),
+                );
+                b.eval_impure_registers
+                    .insert(RegisterRef::Impure(source_value_register));
+                pure_registers.push(source_value_ty.clone());
+                let source_updated_register = pure_registers.len() - 1;
+                pure_instructions.insert(
                     source_updated_register,
                     BlockInstruction::CompositeInsert {
                         value,
-                        source: source_value_register,
+                        source: RegisterRef::Impure(source_value_register),
                         index,
                     },
                 );
-                b.eval_registers.insert(source_updated_register);
 
                 // TODO: ここでptr変えたらローカル変数のtrackもやり直しなのでなんか考える必要がある
                 b.flow = BlockFlowInstruction::StoreRef {
-                    ptr: source,
-                    value: source_updated_register,
+                    ptr: RegisterRef::Pure(source),
+                    value: RegisterRef::Pure(source_updated_register),
                     after,
                 };
                 modified = true;
@@ -2236,7 +3256,7 @@ pub fn collect_scope_local_memory_usages<'a, 's>(
     let mut usage_map = HashMap::new();
 
     for b in blocks {
-        for r in b.eval_registers.iter() {
+        for r in b.eval_impure_registers.iter() {
             match mod_instructions.get(r) {
                 Some(BlockInstruction::LoadRef(ptr)) => {
                     if let Some(&BlockInstruction::ScopeLocalVarRef(scope, id)) =
@@ -2313,24 +3333,29 @@ pub fn strip_write_only_local_memory<'a, 's>(
     modified
 }
 
+/// Load + SwizzleRefをSwizzle + 元refのLoadに分解する
 pub fn unref_swizzle_ref_loads<'a, 's>(
     blocks: &mut [Block],
-    instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    registers: &mut Vec<ConcreteType<'s>>,
-) -> bool {
-    let mut modified = false;
+    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    pure_instructions: &mut PureInstructionMap<'a, 's>,
+    constants: &Constants<'s>,
+    impure_registers: &mut Vec<ConcreteType<'s>>,
+    pure_registers: &mut Vec<ConcreteType<'s>>,
+) -> RegisterAliasMap {
+    let mut register_alias_map = HashMap::new();
 
     'flp: for b in blocks.iter_mut() {
         let (r, src, indices) = 'find: {
-            for r in b.eval_registers.iter() {
-                match instructions.get(r) {
-                    Some(BlockInstruction::LoadRef(rload)) => match instructions.get(&rload) {
-                        Some(BlockInstruction::SwizzleRef(src, ref indices)) => {
-                            break 'find (*r, src, indices.clone());
+            for r in b.eval_impure_registers.iter() {
+                match impure_instructions.get(r) {
+                    Some(BlockInstruction::LoadRef(RegisterRef::Pure(rload))) => {
+                        match pure_instructions[&rload] {
+                            BlockInstruction::SwizzleRef(src, ref indices) => {
+                                break 'find (*r, src, indices.clone());
+                            }
+                            _ => (),
                         }
-                        _ => (),
-                    },
+                    }
                     _ => (),
                 }
             }
@@ -2338,21 +3363,31 @@ pub fn unref_swizzle_ref_loads<'a, 's>(
             continue 'flp;
         };
 
-        registers.push(
-            registers[src.0]
+        impure_registers.push(match src {
+            RegisterRef::Const(src) => constants[src]
+                .ty()
                 .as_dereferenced()
                 .expect("cannot dereference source of SwizzleRef")
                 .clone(),
+            RegisterRef::Pure(src) => pure_registers[src]
+                .as_dereferenced()
+                .expect("cannot dereference source of SwizzleRef")
+                .clone(),
+            RegisterRef::Impure(_) => unreachable!("SwizzleRef applied for impure source?"),
+        });
+        let src_value_reg = impure_registers.len() - 1;
+        impure_instructions.insert(src_value_reg, BlockInstruction::LoadRef(src));
+        pure_instructions.insert(
+            r,
+            BlockInstruction::Swizzle(RegisterRef::Impure(src_value_reg), indices.clone()),
         );
-        let src_value_reg = RegisterRef(registers.len() - 1);
-        instructions.insert(src_value_reg, BlockInstruction::LoadRef(*src));
-        instructions.insert(r, BlockInstruction::Swizzle(src_value_reg, indices.clone()));
 
-        b.eval_registers.insert(src_value_reg);
-        modified = true;
+        b.eval_impure_registers.insert(src_value_reg);
+        b.eval_impure_registers.remove(&r);
+        register_alias_map.insert(RegisterRef::Impure(r), RegisterRef::Pure(r));
     }
 
-    modified
+    register_alias_map
 }
 
 fn flatten_composite_outputs_rec<'a, 's>(
@@ -3574,3 +4609,5 @@ fn promote_local_var_scope<'a, 's>(
         _ => (),
     }
 }
+
+*/

@@ -27,17 +27,20 @@ impl<'s> From<&'_ Token<'s>> for SourceRefSliceEq<'s> {
     }
 }
 impl core::fmt::Debug for SourceRefSliceEq<'_> {
+    #[inline(always)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <SourceRef as core::fmt::Debug>::fmt(&self.0, f)
     }
 }
 impl core::cmp::PartialEq for SourceRefSliceEq<'_> {
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         self.0.slice == other.0.slice
     }
 }
 impl core::cmp::Eq for SourceRefSliceEq<'_> {}
 impl core::hash::Hash for SourceRefSliceEq<'_> {
+    #[inline(always)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.slice.hash(state)
     }

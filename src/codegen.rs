@@ -1,3 +1,4 @@
+/*
 use std::collections::{HashMap, HashSet};
 
 use entrypoint::ShaderEntryPointDescription;
@@ -3769,3 +3770,4 @@ pub fn emit_entry_point_spv_ops<'s>(
 //     ctx.emitted_expression_id.insert(expr_id, result.clone());
 //     result
 // }
+*/

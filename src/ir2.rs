@@ -1,3 +1,4 @@
+/*
 use crate::concrete_type::IntrinsicType;
 use crate::ir::block::BlockFlowInstruction;
 use crate::ir::{ConstIntLiteral, ConstNumberLiteral};
@@ -371,7 +372,7 @@ pub fn reconstruct<'a, 's>(
         while generated {
             generated = false;
 
-            for r in blocks[n.0].eval_registers.iter() {
+            for r in blocks[n.0].eval_impure_registers.iter() {
                 if register_to_inst_const_map.contains_key(r) {
                     // 生成済み
                     continue;
@@ -747,7 +748,7 @@ pub fn reconstruct<'a, 's>(
                 );
 
                 if let Some((merge_phi_register, merge_phi_incomings)) = blocks[merge.0]
-                    .eval_registers
+                    .eval_impure_registers
                     .iter()
                     .find_map(|r| match mod_instructions[r] {
                         BlockInstruction::Phi(ref incomings) => Some((*r, incomings)),
@@ -883,3 +884,4 @@ pub fn reconstruct<'a, 's>(
 
     function
 }
+*/

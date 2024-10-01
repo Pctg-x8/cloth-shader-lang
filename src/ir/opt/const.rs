@@ -1,541 +1,492 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     concrete_type::IntrinsicType,
     ir::{
-        block::{Block, BlockInstruction, IntrinsicBinaryOperation, RegisterRef},
-        Const, ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral,
+        block::{
+            Block, BlockConstInstruction, BlockInstruction, Constants, ImpureInstructionMap,
+            IntrinsicBinaryOperation, PureInstructions, RegisterAliasMap, RegisterRef,
+        },
+        ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral, LosslessConst,
     },
 };
 
-/// 定数命令を抽出
-pub fn extract_constants<'a, 's>(
-    instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> HashMap<RegisterRef, BlockInstruction<'a, 's>> {
-    let mut const_instructions = HashMap::new();
-
-    for (r, x) in core::mem::replace(instructions, HashMap::with_capacity(instructions.len())) {
-        if x.is_const() {
-            const_instructions.insert(r, x);
-        } else {
-            instructions.insert(r, x);
-        }
-    }
-
-    const_instructions
-}
-
 /// 定数のInstantiateIntrinsicTypeClassを演算して定数化する
 pub fn promote_instantiate_const<'a, 's>(
-    instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> bool {
-    let mut modified = false;
+    pure_instructions: &mut PureInstructions<'a, 's>,
+    constants: &mut Constants<'s>,
+) -> RegisterAliasMap {
+    let mut register_alias_map = HashMap::new();
+    let mut pure_instruction_register_shifts = 0;
 
-    for (r, x) in core::mem::replace(instructions, HashMap::with_capacity(instructions.len())) {
-        let transformed = match x {
-            BlockInstruction::InstantiateIntrinsicTypeClass(src, ty) => {
-                match const_map.get(&src) {
-                    Some(BlockInstruction::ConstInt(l)) => match ty {
-                        IntrinsicType::UInt => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ConstUInt(ConstUIntLiteral(l.0.clone(), l.1)),
-                            );
-                            true
-                        }
-                        IntrinsicType::SInt => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ConstSInt(ConstSIntLiteral(l.0.clone(), l.1)),
-                            );
-                            true
-                        }
-                        IntrinsicType::Float => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ConstFloat(ConstFloatLiteral(l.0.clone(), l.1)),
-                            );
-                            true
-                        }
-                        _ => false,
+    for (n, x) in core::mem::replace(
+        pure_instructions,
+        Vec::with_capacity(pure_instructions.len()),
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let promoted = match x.0 {
+            BlockInstruction::InstantiateIntrinsicTypeClass(RegisterRef::Const(src), ty) => {
+                match constants[src] {
+                    BlockConstInstruction::LitInt(ref l) => match ty {
+                        IntrinsicType::UInt => Some(BlockConstInstruction::LitUInt(
+                            ConstUIntLiteral(l.0.clone(), l.1),
+                        )),
+                        IntrinsicType::SInt => Some(BlockConstInstruction::LitSInt(
+                            ConstSIntLiteral(l.0.clone(), l.1),
+                        )),
+                        IntrinsicType::Float => Some(BlockConstInstruction::LitFloat(
+                            ConstFloatLiteral(l.0.clone(), l.1),
+                        )),
+                        _ => None,
                     },
-                    Some(BlockInstruction::ConstNumber(l)) => match ty {
-                        IntrinsicType::Float => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ConstFloat(ConstFloatLiteral(l.0.clone(), l.1)),
-                            );
-                            true
-                        }
+                    BlockConstInstruction::LitNum(ref l) => match ty {
+                        IntrinsicType::Float => Some(BlockConstInstruction::LitFloat(
+                            ConstFloatLiteral(l.0.clone(), l.1),
+                        )),
                         IntrinsicType::UInt | IntrinsicType::SInt => {
                             eprintln!("not promoted: number -> int can cause unintended precision dropping");
-                            false
+                            None
                         }
-                        _ => false,
+                        _ => None,
                     },
-                    Some(&BlockInstruction::ImmInt(v)) => match ty {
-                        IntrinsicType::UInt => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ImmUInt(v.try_into().expect("cannot promote")),
-                            );
-                            true
-                        }
-                        IntrinsicType::SInt => {
-                            const_map.insert(
-                                r,
-                                BlockInstruction::ImmSInt(v.try_into().expect("cannot promote")),
-                            );
-                            true
-                        }
-                        _ => false,
+                    BlockConstInstruction::ImmInt(v) => match ty {
+                        IntrinsicType::UInt => Some(BlockConstInstruction::ImmUInt(
+                            v.try_into().expect("cannot promote"),
+                        )),
+                        IntrinsicType::SInt => Some(BlockConstInstruction::ImmSInt(
+                            v.try_into().expect("cannot promote"),
+                        )),
+                        _ => None,
                     },
-                    _ => false,
+                    _ => None,
                 }
             }
-            BlockInstruction::PromoteIntToNumber(value) => match const_map.get(&value) {
-                Some(BlockInstruction::ConstInt(l)) => {
-                    const_map.insert(
-                        r,
-                        BlockInstruction::ConstNumber(ConstNumberLiteral(l.0.clone(), l.1)),
-                    );
-                    true
+            BlockInstruction::PromoteIntToNumber(RegisterRef::Const(value)) => {
+                match constants[value] {
+                    BlockConstInstruction::LitInt(ref l) => Some(BlockConstInstruction::LitNum(
+                        ConstNumberLiteral(l.0.clone(), l.1),
+                    )),
+                    _ => None,
                 }
-                _ => false,
-            },
-            _ => false,
+            }
+            _ => None,
         };
 
-        if !transformed {
-            // 変換なし
-            instructions.insert(r, x);
+        if let Some(c) = promoted {
+            // 定数化した
+            constants.push(c);
+            register_alias_map.insert(
+                RegisterRef::Pure(n),
+                RegisterRef::Const(constants.len() - 1),
+            );
+            pure_instruction_register_shifts += 1;
+        } else {
+            // Pure命令のまま
+            pure_instructions.push(x);
+            if pure_instruction_register_shifts > 0 {
+                // レジスタシフトが発生している状況
+                register_alias_map.insert(
+                    RegisterRef::Pure(n),
+                    RegisterRef::Pure(n - pure_instruction_register_shifts),
+                );
+            }
         }
-
-        modified = modified || transformed;
     }
 
-    modified
+    register_alias_map
 }
 
 pub fn fold_const_ops<'a, 's>(
-    instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> bool {
-    let mut modified = false;
+    pure_instructions: &mut PureInstructions,
+    constants: &mut Constants,
+) -> RegisterAliasMap {
+    let mut register_alias_map = HashMap::new();
+    let mut pure_register_shifts = 0;
 
-    for (res, x) in core::mem::replace(instructions, HashMap::with_capacity(instructions.len())) {
-        match x {
-            BlockInstruction::IntrinsicBinaryOp(left, op, right) => {
-                let Some(left) = const_map
-                    .get(&left)
-                    .and_then(BlockInstruction::try_instantiate_const)
-                else {
-                    // 左辺が定数じゃない
-                    instructions.insert(res, x);
+    for (n, x) in core::mem::replace(
+        pure_instructions,
+        Vec::with_capacity(pure_instructions.len()),
+    )
+    .into_iter()
+    .enumerate()
+    {
+        match x.0 {
+            BlockInstruction::IntrinsicBinaryOp(
+                RegisterRef::Const(left),
+                op,
+                RegisterRef::Const(right),
+            ) => {
+                let Some(left) = constants[left].try_instantiate_lossless_const() else {
+                    // 左辺が演算可能な定数じゃない
+                    pure_instructions.push(x);
+                    if pure_register_shifts > 0 {
+                        // レジスタシフトが発生している状況
+                        register_alias_map.insert(
+                            RegisterRef::Pure(n),
+                            RegisterRef::Pure(n - pure_register_shifts),
+                        );
+                    }
                     continue;
                 };
-                let Some(right) = const_map
-                    .get(&right)
-                    .and_then(BlockInstruction::try_instantiate_const)
-                else {
-                    // 右辺が定数じゃない
-                    instructions.insert(res, x);
+                let Some(right) = constants[right].try_instantiate_lossless_const() else {
+                    // 右辺が演算可能な定数じゃない
+                    pure_instructions.push(x);
+                    if pure_register_shifts > 0 {
+                        // レジスタシフトが発生している状況
+                        register_alias_map.insert(
+                            RegisterRef::Pure(n),
+                            RegisterRef::Pure(n - pure_register_shifts),
+                        );
+                    }
                     continue;
                 };
 
-                match op {
+                let reduced = match op {
                     IntrinsicBinaryOperation::Add => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l + r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l + r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l + r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l + r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l + r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l + r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Sub => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l - r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l - r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l - r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l - r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l - r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l - r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Mul => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l * r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l * r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l * r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l * r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l * r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l * r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Div => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l / r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l / r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l / r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l / r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l / r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l / r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Rem => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l % r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l % r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l % r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l % r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l % r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l % r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Pow => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(
-                                res,
-                                BlockInstruction::ImmInt(l.pow(r.try_into().unwrap())),
-                            );
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l.pow(r.try_into().unwrap())))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(
-                                res,
-                                BlockInstruction::ImmSInt(l.pow(r.try_into().unwrap())),
-                            );
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l.pow(r.try_into().unwrap())))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l.pow(r)));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l.pow(r)))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::BitAnd => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l & r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l & r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l & r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l & r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l & r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l & r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::BitOr => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l | r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l | r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l | r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l | r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l | r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l | r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::BitXor => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l ^ r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l ^ r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l ^ r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l ^ r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l ^ r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l ^ r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::LeftShift => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l << r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l << r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l << r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l << r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l << r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l << r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::RightShift => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmInt(l >> r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmInt(l >> r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmSInt(l >> r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmSInt(l >> r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmUInt(l >> r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmUInt(l >> r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Eq => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l == r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l == r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l == r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l == r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l == r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l == r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Ne => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Lt => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l < r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l < r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l < r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l < r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l < r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l < r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Gt => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l > r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l > r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l > r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l > r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l > r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l > r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Le => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l <= r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l <= r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l <= r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l <= r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l <= r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l <= r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::Ge => match (left, right) {
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l >= r));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l >= r))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l >= r));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l >= r))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l >= r));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l >= r))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::LogAnd => match (left, right) {
-                        (Const::Bool(l), Const::Bool(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l && r));
-                            modified = true;
+                        (LosslessConst::Bool(l), LosslessConst::Bool(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l && r))
                         }
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 && r != 0));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 && r != 0))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 && r != 0));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 && r != 0))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 && r != 0));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 && r != 0))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
                     IntrinsicBinaryOperation::LogOr => match (left, right) {
-                        (Const::Bool(l), Const::Bool(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l || r));
-                            modified = true;
+                        (LosslessConst::Bool(l), LosslessConst::Bool(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l || r))
                         }
-                        (Const::Int(l), Const::Int(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 || r != 0));
-                            modified = true;
+                        (LosslessConst::Int(l), LosslessConst::Int(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 || r != 0))
                         }
-                        (Const::SInt(l), Const::SInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 || r != 0));
-                            modified = true;
+                        (LosslessConst::SInt(l), LosslessConst::SInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 || r != 0))
                         }
-                        (Const::UInt(l), Const::UInt(r)) => {
-                            const_map.insert(res, BlockInstruction::ImmBool(l != 0 || r != 0));
-                            modified = true;
+                        (LosslessConst::UInt(l), LosslessConst::UInt(r)) => {
+                            Some(BlockConstInstruction::ImmBool(l != 0 || r != 0))
                         }
-                        _ => {
-                            instructions.insert(res, x);
-                        }
+                        _ => None,
                     },
+                };
+
+                if let Some(c) = reduced {
+                    constants.push(c);
+                    register_alias_map.insert(
+                        RegisterRef::Pure(n),
+                        RegisterRef::Const(constants.len() - 1),
+                    );
+                    pure_register_shifts += 1;
+                } else {
+                    pure_instructions.push(x);
+                    if pure_register_shifts > 0 {
+                        // レジスタシフトが発生している状況
+                        register_alias_map.insert(
+                            RegisterRef::Pure(n),
+                            RegisterRef::Pure(n - pure_register_shifts),
+                        );
+                    }
                 }
             }
             _ => {
-                instructions.insert(res, x);
+                pure_instructions.push(x);
+                if pure_register_shifts > 0 {
+                    // レジスタシフトが発生している状況
+                    register_alias_map.insert(
+                        RegisterRef::Pure(n),
+                        RegisterRef::Pure(n - pure_register_shifts),
+                    );
+                }
             }
         }
     }
 
-    modified
+    register_alias_map
 }
 
 /// 同じconstant命令を若い番号のregisterにまとめる
-pub fn unify_constants<'a, 's>(
-    blocks: &mut [Block],
-    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> bool {
+pub fn unify_constants<'a, 's>(constants: &Constants<'s>) -> RegisterAliasMap {
     let mut const_to_register_map = HashMap::new();
-    let mut register_rewrite_map = HashMap::new();
-    for (r, v) in const_map.iter() {
+    let mut register_alias_map = HashMap::new();
+    for (r, v) in constants.iter().enumerate() {
         match const_to_register_map.entry(v) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(r);
             }
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if e.get().0 > r.0 {
+                let last_occurence = *e.get();
+                if last_occurence > r {
                     // 若い番号を優先する
                     let mapped = e.insert(r);
-                    register_rewrite_map.insert(*mapped, *r);
+                    register_alias_map.insert(RegisterRef::Const(mapped), RegisterRef::Const(r));
                 } else {
-                    register_rewrite_map.insert(*r, **e.get());
+                    register_alias_map
+                        .insert(RegisterRef::Const(r), RegisterRef::Const(last_occurence));
                 }
             }
         }
     }
 
-    if !register_rewrite_map.is_empty() {
-        println!("register rewrite map:");
-        for (from, to) in register_rewrite_map.iter() {
-            println!("  r{} -> r{}", from.0, to.0);
-        }
+    register_alias_map
+}
+
+/// 使われていないConstレジスタを削除
+pub fn strip_unreferenced_const(
+    constants: &mut Constants,
+    pure_instructions: &PureInstructions,
+    impure_instructions: &ImpureInstructionMap,
+    blocks: &[Block],
+) -> RegisterAliasMap {
+    let mut unreferenced_constants = (0..constants.len()).collect::<HashSet<_>>();
+
+    for x in pure_instructions {
+        x.0.enumerate_ref_registers(|r| {
+            if let RegisterRef::Const(n) = r {
+                unreferenced_constants.remove(&n);
+            }
+        });
+    }
+    for x in impure_instructions.values() {
+        x.enumerate_ref_registers(|r| {
+            if let RegisterRef::Const(n) = r {
+                unreferenced_constants.remove(&n);
+            }
+        });
+    }
+    for b in blocks {
+        b.flow.enumerate_ref_registers(|r| {
+            if let RegisterRef::Const(n) = r {
+                unreferenced_constants.remove(&n);
+            }
+        })
     }
 
-    let mut modified = false;
-    for x in mod_instructions.values_mut() {
-        let m1 = x.apply_register_alias(&register_rewrite_map);
-
-        modified = modified || m1;
+    let mut unreferenced_constants = unreferenced_constants.into_iter().collect::<Vec<_>>();
+    unreferenced_constants.sort_by(|a, b| b.cmp(a));
+    println!("[StripConstant] Targets: {unreferenced_constants:?}");
+    let mut register_alias_map = HashMap::new();
+    for n in unreferenced_constants {
+        register_alias_map.insert(
+            RegisterRef::Const(constants.len() - 1),
+            RegisterRef::Const(n),
+        );
+        println!(
+            "[StripConstant] swap remove {} -> {}",
+            constants.len() - 1,
+            n
+        );
+        constants.swap_remove(n);
     }
-    for b in blocks.iter_mut() {
-        let m1 = b.apply_flow_register_alias(&register_rewrite_map);
 
-        modified = modified || m1;
-    }
-
-    modified
+    register_alias_map
 }

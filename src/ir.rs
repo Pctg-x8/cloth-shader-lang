@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use block::{Block, BlockInstruction, RegisterRef};
+use block::{
+    Block, BlockConstInstruction, BlockInstruction, ImpureInstructionMap, PureInstructions,
+    RegisterRef,
+};
 use expr::ConstModifiers;
 
 use crate::{concrete_type::ConcreteType, scope::SymbolScope, source_ref::SourceRefSliceEq};
@@ -20,7 +23,7 @@ impl core::fmt::Debug for ExprRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Const {
+pub enum LosslessConst {
     Bool(bool),
     Int(isize),
     SInt(i32),
@@ -158,8 +161,9 @@ impl<'s> ConstFloatLiteral<'s> {
 #[derive(Debug, Clone)]
 pub struct FunctionBody<'a, 's> {
     pub symbol_scope: &'a SymbolScope<'a, 's>,
-    pub registers: Vec<ConcreteType<'s>>,
-    pub constants: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    pub impure_registers: Vec<ConcreteType<'s>>,
+    pub constants: Vec<BlockConstInstruction<'s>>,
+    pub pure_instructions: PureInstructions<'a, 's>,
+    pub impure_instructions: ImpureInstructionMap<'a, 's>,
     pub blocks: Vec<Block>,
 }

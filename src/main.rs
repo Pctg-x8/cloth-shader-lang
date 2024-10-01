@@ -4,28 +4,21 @@ use std::{
 };
 
 use clap::Parser;
-use codegen::{
-    emit_block, emit_entry_point_spv_ops, emit_entry_point_spv_ops2, emit_shader_interface_vars,
-    entrypoint::ShaderEntryPointDescription, SpvFunctionBodyEmissionContext,
-    SpvModuleEmissionContext, SpvSectionLocalId,
-};
 use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
         BlockGenerationContext, BlockInstruction, BlockInstructionEmissionContext, BlockRef,
-        RegisterRef,
+        Constants, ImpureInstructionMap, PureInstructions, RegisterRef,
     },
     expr::simplify_expression,
     opt::{
-        apply_local_var_states, block_aliasing, build_register_state_map,
-        build_scope_local_var_state, collect_scope_local_memory_usages, convert_static_path_ref,
-        deconstruct_effectless_phi, extract_constants, fold_const_ops, inline_function2,
-        merge_simple_goto_blocks, optimize_pure_expr, promote_instantiate_const,
-        resolve_intrinsic_funcalls, resolve_register_aliases, resolve_shader_io_ref_binds,
-        strip_unreachable_blocks, strip_unreferenced_registers, strip_write_only_local_memory,
-        track_scope_local_var_aliases, transform_swizzle_component_store, unify_constants,
-        unref_swizzle_ref_loads,
+        apply_parallel_register_alias, apply_register_alias, collect_block_incomings,
+        collect_block_local_memory_stores, collect_register_aliases, deconstruct_effectless_phi,
+        fold_const_ops, promote_instantiate_const, propagate_local_memory_stores,
+        replace_local_memory_load, strip_never_load_local_memory_stores, strip_unreferenced_const,
+        strip_unreferenced_impure_instructions, strip_unreferenced_pure_instructions,
+        unify_constants, unify_pure_instructions,
     },
     FunctionBody,
 };
@@ -257,53 +250,43 @@ fn main() {
                 block_generation_context
                     .dump_blocks(
                         &mut o,
-                        &block_instruction_emission_context.registers,
-                        &block_instruction_emission_context.instructions,
-                    )
-                    .unwrap();
-                o.flush().unwrap();
-                drop(o);
-
-                let mut const_instructions =
-                    extract_constants(&mut block_instruction_emission_context.instructions);
-
-                println!("ConstInstPromotion:");
-                println!("Constants:");
-                for (k, v) in const_instructions.iter() {
-                    println!("  r{}: {v:?}", k.0);
-                }
-                let mut o = std::io::stdout().lock();
-                block_generation_context
-                    .dump_blocks(
-                        &mut o,
-                        &block_instruction_emission_context.registers,
-                        &block_instruction_emission_context.instructions,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
                     )
                     .unwrap();
                 o.flush().unwrap();
                 drop(o);
 
                 let mut last_ir_document = build_ir_document(
-                    &block_instruction_emission_context.registers,
-                    &const_instructions,
+                    &block_instruction_emission_context.constants,
+                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.impure_registers,
+                    &block_instruction_emission_context.impure_instructions,
                     &block_generation_context.blocks,
-                    &block_instruction_emission_context.instructions,
                 );
                 fn perform_log(
                     fname: &parser::Token,
                     step_name: &str,
                     modified: bool,
                     last_irdoc: &mut String,
+                    constants: &Constants,
+                    pure_instructions: &PureInstructions,
+                    impure_registers: &[ConcreteType],
+                    impure_instructions: &ImpureInstructionMap,
                     blocks: &[Block],
-                    instructions: &HashMap<RegisterRef, BlockInstruction>,
-                    registers: &[ConcreteType],
-                    const_map: &HashMap<RegisterRef, BlockInstruction>,
                 ) {
                     print_step_header(fname.slice, step_name, modified);
 
                     if modified {
-                        let next_irdoc =
-                            build_ir_document(registers, const_map, blocks, instructions);
+                        let next_irdoc = build_ir_document(
+                            constants,
+                            pure_instructions,
+                            impure_registers,
+                            impure_instructions,
+                            blocks,
+                        );
 
                         let diff = similar::TextDiff::from_lines(last_irdoc, &next_irdoc);
                         let mut o = std::io::stdout().lock();
@@ -322,6 +305,431 @@ fn main() {
                         *last_irdoc = next_irdoc;
                     }
                 }
+
+                // constant optimization
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    loop {
+                        let register_alias_map = promote_instantiate_const(
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &mut block_instruction_emission_context.constants,
+                        );
+                        apply_parallel_register_alias(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.impure_instructions,
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &register_alias_map,
+                        );
+                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+                        perform_log(
+                            &f.fname_token,
+                            "PromoteInstantiateConst",
+                            !register_alias_map.is_empty(),
+                            &mut last_ir_document,
+                            &block_instruction_emission_context.constants,
+                            &block_instruction_emission_context.pure_instructions,
+                            &block_instruction_emission_context.impure_registers,
+                            &block_instruction_emission_context.impure_instructions,
+                            &block_generation_context.blocks,
+                        );
+
+                        if register_alias_map.is_empty() {
+                            break;
+                        }
+                    }
+
+                    loop {
+                        let register_alias_map = fold_const_ops(
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &mut block_instruction_emission_context.constants,
+                        );
+                        apply_parallel_register_alias(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.impure_instructions,
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &register_alias_map,
+                        );
+                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+                        perform_log(
+                            &f.fname_token,
+                            "FoldConst",
+                            !register_alias_map.is_empty(),
+                            &mut last_ir_document,
+                            &block_instruction_emission_context.constants,
+                            &block_instruction_emission_context.pure_instructions,
+                            &block_instruction_emission_context.impure_registers,
+                            &block_instruction_emission_context.impure_instructions,
+                            &block_generation_context.blocks,
+                        );
+
+                        if register_alias_map.is_empty() {
+                            break;
+                        }
+                    }
+                }
+
+                {
+                    let register_alias_map =
+                        unify_constants(&block_instruction_emission_context.constants);
+                    apply_parallel_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "UnifyConst",
+                        !register_alias_map.is_empty(),
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+                }
+
+                {
+                    let register_alias_map = strip_unreferenced_const(
+                        &mut block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+                    apply_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedConst",
+                        !register_alias_map.is_empty(),
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+                }
+
+                // Pure optimization
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    {
+                        let register_alias_map = unify_pure_instructions(
+                            &block_instruction_emission_context.pure_instructions,
+                        );
+                        apply_parallel_register_alias(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.impure_instructions,
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &register_alias_map,
+                        );
+                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+                        perform_log(
+                            &f.fname_token,
+                            "UnifyPureInstructions",
+                            !register_alias_map.is_empty(),
+                            &mut last_ir_document,
+                            &block_instruction_emission_context.constants,
+                            &block_instruction_emission_context.pure_instructions,
+                            &block_instruction_emission_context.impure_registers,
+                            &block_instruction_emission_context.impure_instructions,
+                            &block_generation_context.blocks,
+                        );
+                    }
+
+                    {
+                        let register_alias_map = strip_unreferenced_pure_instructions(
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &block_instruction_emission_context.impure_instructions,
+                            &block_generation_context.blocks,
+                        );
+                        apply_register_alias(
+                            &mut block_generation_context.blocks,
+                            &mut block_instruction_emission_context.impure_instructions,
+                            &mut block_instruction_emission_context.pure_instructions,
+                            &register_alias_map,
+                        );
+
+                        perform_log(
+                            &f.fname_token,
+                            "StripUnreferencedPureInst",
+                            !register_alias_map.is_empty(),
+                            &mut last_ir_document,
+                            &block_instruction_emission_context.constants,
+                            &block_instruction_emission_context.pure_instructions,
+                            &block_instruction_emission_context.impure_registers,
+                            &block_instruction_emission_context.impure_instructions,
+                            &block_generation_context.blocks,
+                        );
+                    }
+                }
+
+                let block_local_memory_stores = collect_block_local_memory_stores(
+                    &block_generation_context.blocks,
+                    &block_instruction_emission_context.impure_instructions,
+                    &block_instruction_emission_context.pure_instructions,
+                );
+                let per_block_local_mem_current_register_map = propagate_local_memory_stores(
+                    &mut block_generation_context.blocks,
+                    &mut block_instruction_emission_context.impure_registers,
+                    &mut block_instruction_emission_context.impure_instructions,
+                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.constants,
+                    &block_local_memory_stores,
+                );
+
+                perform_log(
+                    &f.fname_token,
+                    "PropagateLocalMemoryStores",
+                    true,
+                    &mut last_ir_document,
+                    &block_instruction_emission_context.constants,
+                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.impure_registers,
+                    &block_instruction_emission_context.impure_instructions,
+                    &block_generation_context.blocks,
+                );
+                println!("PerBlock LocalMem -> Register Map:");
+                let mut block_sorted = per_block_local_mem_current_register_map
+                    .iter()
+                    .collect::<Vec<_>>();
+                block_sorted.sort_by_key(|(k, _)| k.0);
+                for (bx, map) in block_sorted {
+                    println!("  b{}", bx.0);
+                    for (mid, v) in map {
+                        print!("    {mid:?} = {v} = ");
+                        let mut o = std::io::stdout().lock();
+                        match v {
+                            &RegisterRef::Const(n) => block_instruction_emission_context.constants
+                                [n]
+                                .dump(&mut o)
+                                .unwrap(),
+                            &RegisterRef::Pure(n) => block_instruction_emission_context
+                                .pure_instructions[n]
+                                .0
+                                .dump(&mut o)
+                                .unwrap(),
+                            &RegisterRef::Impure(n) => block_instruction_emission_context
+                                .impure_instructions[&n]
+                                .dump(&mut o)
+                                .unwrap(),
+                        }
+                        o.flush().unwrap();
+                        println!();
+                    }
+                }
+
+                replace_local_memory_load(
+                    &block_generation_context.blocks,
+                    &per_block_local_mem_current_register_map,
+                    &mut block_instruction_emission_context.impure_instructions,
+                    &block_instruction_emission_context.pure_instructions,
+                );
+                perform_log(
+                    &f.fname_token,
+                    "ReplaceLocalMemoryLoad",
+                    true,
+                    &mut last_ir_document,
+                    &block_instruction_emission_context.constants,
+                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.impure_registers,
+                    &block_instruction_emission_context.impure_instructions,
+                    &block_generation_context.blocks,
+                );
+
+                let modified = strip_never_load_local_memory_stores(
+                    &mut block_generation_context.blocks,
+                    &block_instruction_emission_context.impure_instructions,
+                    &block_instruction_emission_context.pure_instructions,
+                );
+                perform_log(
+                    &f.fname_token,
+                    "StripNeverLoadLocalMemStores",
+                    modified,
+                    &mut last_ir_document,
+                    &block_instruction_emission_context.constants,
+                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.impure_registers,
+                    &block_instruction_emission_context.impure_instructions,
+                    &block_generation_context.blocks,
+                );
+
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    let register_alias_map = deconstruct_effectless_phi(
+                        &mut block_generation_context.blocks,
+                        &block_instruction_emission_context.impure_registers,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                    );
+                    apply_parallel_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+                    perform_log(
+                        &f.fname_token,
+                        "DeconstructEffectlessPhi",
+                        !register_alias_map.is_empty(),
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+
+                    let register_alias_map = collect_register_aliases(
+                        &block_instruction_emission_context.pure_instructions,
+                    );
+                    apply_parallel_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+                    perform_log(
+                        &f.fname_token,
+                        "ResolveLowestEntropyRegisterAlias",
+                        !register_alias_map.is_empty(),
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+
+                    needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+                    let register_alias_map = strip_unreferenced_pure_instructions(
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+                    apply_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedPureInst",
+                        !register_alias_map.is_empty(),
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+                }
+
+                loop {
+                    let (register_alias_map, modified) = strip_unreferenced_impure_instructions(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.pure_instructions,
+                    );
+                    apply_register_alias(
+                        &mut block_generation_context.blocks,
+                        &mut block_instruction_emission_context.impure_instructions,
+                        &mut block_instruction_emission_context.pure_instructions,
+                        &register_alias_map,
+                    );
+
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedImpureInst",
+                        modified,
+                        &mut last_ir_document,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                        &block_generation_context.blocks,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+
+                // let block_incomings = collect_block_incomings(&block_generation_context.blocks);
+                // let block_local_memory_stores = collect_block_local_memory_stores(
+                //     &block_generation_context.blocks,
+                //     &block_instruction_emission_context.impure_instructions,
+                //     &block_instruction_emission_context.pure_instructions,
+                // );
+                // let block_local_memory_final_stores =
+                //     track_single_incoming_local_memory_final_stores(
+                //         &block_generation_context.blocks,
+                //         &block_incomings,
+                //         &block_local_memory_stores,
+                //     );
+                // let mut block_incomings_target_sorted = block_incomings.iter().collect::<Vec<_>>();
+                // block_incomings_target_sorted.sort_by_key(|(k, _)| k.0);
+                // println!("Block Incomings:");
+                // for bx in 0..block_generation_context.blocks.len() {
+                //     println!("  b{bx}");
+
+                //     if let Some(fx) = block_incomings.get(&BlockRef(bx)) {
+                //         for f in fx {
+                //             println!("    from b{}", f.0);
+                //         }
+                //     }
+
+                //     if let Some(xs) = block_local_memory_final_stores.get(&BlockRef(bx)) {
+                //         for (mid, val) in xs {
+                //             println!("    {mid:?} = {val}");
+                //         }
+                //     }
+
+                //     if let Some((mid, val)) = block_local_memory_stores.get(&BlockRef(bx)) {
+                //         println!("    Store {mid:?} = {val}");
+                //     }
+                // }
+
+                /*
+                let mut const_instructions =
+                    extract_constants(&mut block_instruction_emission_context.instructions);
+
+                println!("ConstInstPromotion:");
+                println!("Constants:");
+                for (k, v) in const_instructions.iter() {
+                    println!("  r{}: {v:?}", k.0);
+                }
+                let mut o = std::io::stdout().lock();
+                block_generation_context
+                    .dump_blocks(
+                        &mut o,
+                        &block_instruction_emission_context.registers,
+                        &block_instruction_emission_context.instructions,
+                    )
+                    .unwrap();
+                o.flush().unwrap();
+                drop(o);
 
                 let mut needs_reopt = true;
                 while needs_reopt {
@@ -719,6 +1127,21 @@ fn main() {
                         );
                     }
                 }
+                */
+
+                println!("First Optimized({}):", f.fname_token.slice);
+                let mut o = std::io::stdout().lock();
+                block_generation_context
+                    .dump_blocks(
+                        &mut o,
+                        &block_instruction_emission_context.constants,
+                        &block_instruction_emission_context.pure_instructions,
+                        &block_instruction_emission_context.impure_registers,
+                        &block_instruction_emission_context.impure_instructions,
+                    )
+                    .unwrap();
+                o.flush().unwrap();
+                drop(o);
 
                 if fn_symbol.attribute.module_entry_point {
                     match fn_symbol.attribute.shader_model.unwrap() {
@@ -809,9 +1232,10 @@ fn main() {
                     f.fname_token.slice,
                     FunctionBody {
                         symbol_scope: function_symbol_scope,
-                        registers: block_instruction_emission_context.registers,
-                        constants: const_instructions,
-                        instructions: block_instruction_emission_context.instructions,
+                        constants: block_instruction_emission_context.constants,
+                        impure_registers: block_instruction_emission_context.impure_registers,
+                        pure_instructions: block_instruction_emission_context.pure_instructions,
+                        impure_instructions: block_instruction_emission_context.impure_instructions,
                         blocks: block_generation_context.blocks,
                     },
                 );
@@ -820,138 +1244,139 @@ fn main() {
         }
     }
 
-    let entry_points = top_scope
-        .iter_user_defined_function_symbols()
-        .filter_map(|f| {
-            if !f.attribute.module_entry_point {
-                return None;
-            }
+    // let entry_points = top_scope
+    //     .iter_user_defined_function_symbols()
+    //     .filter_map(|f| {
+    //         if !f.attribute.module_entry_point {
+    //             return None;
+    //         }
 
-            Some(ShaderEntryPointDescription::extract(f, &top_scope))
-        })
-        .collect::<Vec<_>>();
+    //         // Some(ShaderEntryPointDescription::extract(f, &top_scope))
+    //         None
+    //     })
+    //     .collect::<Vec<_>>();
 
-    struct OptimizedShaderEntryPoint<'s> {
-        pub info: ShaderEntryPointDescription<'s>,
-        pub ir2: ir2::Function<'s>,
-    }
+    // struct OptimizedShaderEntryPoint<'s> {
+    //     pub info: ShaderEntryPointDescription<'s>,
+    //     pub ir2: ir2::Function<'s>,
+    // }
 
-    let optimized_entry_points = entry_points
-        .into_iter()
-        .map(|ep| {
-            let sym = top_scope.user_defined_function_symbol(ep.name).unwrap();
-            let body = top_scope
-                .user_defined_function_body(ep.name)
-                .expect("cannot emit entry point without body");
-            optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
-            let ir2 = ir2::reconstruct(
-                &body.borrow().blocks,
-                &body.borrow().instructions,
-                &body.borrow().registers,
-                &body.borrow().constants,
-            );
+    // let optimized_entry_points = entry_points
+    //     .into_iter()
+    //     .map(|ep| {
+    //         let sym = top_scope.user_defined_function_symbol(ep.name).unwrap();
+    //         let body = top_scope
+    //             .user_defined_function_body(ep.name)
+    //             .expect("cannot emit entry point without body");
+    //         optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
+    //         let ir2 = ir2::reconstruct(
+    //             &body.borrow().blocks,
+    //             &body.borrow().instructions,
+    //             &body.borrow().registers,
+    //             &body.borrow().constants,
+    //         );
 
-            println!("IR2({}):", ep.name);
-            let mut o = std::io::stdout().lock();
-            ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
-            o.flush().unwrap();
-            drop(o);
+    //         println!("IR2({}):", ep.name);
+    //         let mut o = std::io::stdout().lock();
+    //         ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
+    //         o.flush().unwrap();
+    //         drop(o);
 
-            OptimizedShaderEntryPoint { info: ep, ir2 }
-        })
-        .collect::<Vec<_>>();
+    //         OptimizedShaderEntryPoint { info: ep, ir2 }
+    //     })
+    //     .collect::<Vec<_>>();
 
-    let mut spv_context = SpvModuleEmissionContext::new();
-    spv_context
-        .capabilities
-        .insert(spv::asm::Capability::Shader);
-    spv_context
-        .capabilities
-        .insert(spv::asm::Capability::InputAttachment);
-    for e in optimized_entry_points {
-        unimplemented!("codegen");
+    // let mut spv_context = SpvModuleEmissionContext::new();
+    // spv_context
+    //     .capabilities
+    //     .insert(spv::asm::Capability::Shader);
+    // spv_context
+    //     .capabilities
+    //     .insert(spv::asm::Capability::InputAttachment);
+    // for e in optimized_entry_points {
+    //     unimplemented!("codegen");
 
-        // let shader_if = emit_shader_interface_vars(sym, &body.borrow(), &mut spv_context);
-        // let mut body_context = SpvFunctionBodyEmissionContext::new(&mut spv_context);
-        // let main_label_id = body_context.new_id();
-        // body_context.ops.push(spv::Instruction::Label {
-        //     result: main_label_id,
-        // });
-        // emit_block(
-        //     &shader_if,
-        //     &body.borrow().constants,
-        //     &body.borrow().blocks,
-        //     BlockRef(0),
-        //     &mut body_context,
-        // );
-        // // body_context.ops.push(spv::Instruction::Return);
-        // let SpvFunctionBodyEmissionContext {
-        //     latest_id: body_latest_id,
-        //     ops: body_ops,
-        //     ..
-        // } = body_context;
+    //     // let shader_if = emit_shader_interface_vars(sym, &body.borrow(), &mut spv_context);
+    //     // let mut body_context = SpvFunctionBodyEmissionContext::new(&mut spv_context);
+    //     // let main_label_id = body_context.new_id();
+    //     // body_context.ops.push(spv::Instruction::Label {
+    //     //     result: main_label_id,
+    //     // });
+    //     // emit_block(
+    //     //     &shader_if,
+    //     //     &body.borrow().constants,
+    //     //     &body.borrow().blocks,
+    //     //     BlockRef(0),
+    //     //     &mut body_context,
+    //     // );
+    //     // // body_context.ops.push(spv::Instruction::Return);
+    //     // let SpvFunctionBodyEmissionContext {
+    //     //     latest_id: body_latest_id,
+    //     //     ops: body_ops,
+    //     //     ..
+    //     // } = body_context;
 
-        // let fn_result_ty = spv_context.request_type_id(spv::Type::Void);
-        // let fnty = spv_context.request_type_id(spv::Type::Function {
-        //     return_type: Box::new(spv::Type::Void),
-        //     parameter_types: Vec::new(),
-        // });
-        // let fnid = spv_context.new_function_id();
-        // spv_context.function_ops.push(spv::Instruction::Function {
-        //     result_type: fn_result_ty,
-        //     result: fnid,
-        //     function_control: spv::asm::FunctionControl::empty(),
-        //     function_type: fnty,
-        // });
-        // let fnid_offset = spv_context.latest_function_id;
-        // spv_context.latest_function_id += body_latest_id;
-        // spv_context
-        //     .function_ops
-        //     .extend(body_ops.into_iter().map(|x| {
-        //         x.relocate(|id| match id {
-        //             SpvSectionLocalId::CurrentFunction(x) => {
-        //                 SpvSectionLocalId::Function(x + fnid_offset)
-        //             }
-        //             x => x,
-        //         })
-        //     }));
-        // spv_context.function_ops.push(spv::Instruction::FunctionEnd);
-        // spv_context
-        //     .entry_point_ops
-        //     .push(spv::Instruction::EntryPoint {
-        //         execution_model: e.execution_model,
-        //         entry_point: fnid,
-        //         name: e.name.into(),
-        //         interface: shader_if.iter_interface_global_vars().copied().collect(),
-        //     });
-        // spv_context
-        //     .execution_mode_ops
-        //     .extend(e.execution_mode_modifiers.iter().map(|m| match m {
-        //         spv::ExecutionModeModifier::OriginUpperLeft => spv::Instruction::ExecutionMode {
-        //             entry_point: fnid,
-        //             mode: spv::asm::ExecutionMode::OriginUpperLeft,
-        //             args: Vec::new(),
-        //         },
-        //     }));
-    }
+    //     // let fn_result_ty = spv_context.request_type_id(spv::Type::Void);
+    //     // let fnty = spv_context.request_type_id(spv::Type::Function {
+    //     //     return_type: Box::new(spv::Type::Void),
+    //     //     parameter_types: Vec::new(),
+    //     // });
+    //     // let fnid = spv_context.new_function_id();
+    //     // spv_context.function_ops.push(spv::Instruction::Function {
+    //     //     result_type: fn_result_ty,
+    //     //     result: fnid,
+    //     //     function_control: spv::asm::FunctionControl::empty(),
+    //     //     function_type: fnty,
+    //     // });
+    //     // let fnid_offset = spv_context.latest_function_id;
+    //     // spv_context.latest_function_id += body_latest_id;
+    //     // spv_context
+    //     //     .function_ops
+    //     //     .extend(body_ops.into_iter().map(|x| {
+    //     //         x.relocate(|id| match id {
+    //     //             SpvSectionLocalId::CurrentFunction(x) => {
+    //     //                 SpvSectionLocalId::Function(x + fnid_offset)
+    //     //             }
+    //     //             x => x,
+    //     //         })
+    //     //     }));
+    //     // spv_context.function_ops.push(spv::Instruction::FunctionEnd);
+    //     // spv_context
+    //     //     .entry_point_ops
+    //     //     .push(spv::Instruction::EntryPoint {
+    //     //         execution_model: e.execution_model,
+    //     //         entry_point: fnid,
+    //     //         name: e.name.into(),
+    //     //         interface: shader_if.iter_interface_global_vars().copied().collect(),
+    //     //     });
+    //     // spv_context
+    //     //     .execution_mode_ops
+    //     //     .extend(e.execution_mode_modifiers.iter().map(|m| match m {
+    //     //         spv::ExecutionModeModifier::OriginUpperLeft => spv::Instruction::ExecutionMode {
+    //     //             entry_point: fnid,
+    //     //             mode: spv::asm::ExecutionMode::OriginUpperLeft,
+    //     //             args: Vec::new(),
+    //     //         },
+    //     //     }));
+    // }
 
-    let (module_ops, max_id) = spv_context.serialize_ops();
+    // let (module_ops, max_id) = spv_context.serialize_ops();
 
-    let outfile = std::fs::File::options()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("out.spv")
-        .expect("Failed to open outfile");
-    let mut writer = std::io::BufWriter::new(outfile);
-    module_header(max_id + 1)
-        .serialize(&mut writer)
-        .expect("Failed to serialize module header");
-    for x in module_ops.iter() {
-        x.serialize_binary(&mut writer)
-            .expect("Failed to serialize op");
-    }
-    writer.flush().expect("Failed to flush bufwriter");
+    // let outfile = std::fs::File::options()
+    //     .create(true)
+    //     .write(true)
+    //     .truncate(true)
+    //     .open("out.spv")
+    //     .expect("Failed to open outfile");
+    // let mut writer = std::io::BufWriter::new(outfile);
+    // module_header(max_id + 1)
+    //     .serialize(&mut writer)
+    //     .expect("Failed to serialize module header");
+    // for x in module_ops.iter() {
+    //     x.serialize_binary(&mut writer)
+    //         .expect("Failed to serialize op");
+    // }
+    // writer.flush().expect("Failed to flush bufwriter");
 }
 
 #[inline]
@@ -973,387 +1398,380 @@ fn print_step_header(fname: &str, step_name: &str, modified: bool) {
     );
 }
 fn build_ir_document(
-    registers: &[ConcreteType],
-    const_map: &HashMap<RegisterRef, BlockInstruction>,
+    constants: &Constants,
+    pure_instructions: &PureInstructions,
+    impure_registers: &[ConcreteType],
+    impure_instructions: &ImpureInstructionMap,
     blocks: &[Block],
-    instructions: &HashMap<RegisterRef, BlockInstruction>,
 ) -> String {
-    use std::io::Write;
-
     let mut sink = Vec::new();
-    for (rn, rt) in registers.iter().enumerate() {
-        match const_map.get(&RegisterRef(rn)) {
-            Some(c) => writeln!(sink, "  r{rn}: {rt:?} = {c:?}").unwrap(),
-            None => writeln!(sink, "  r{rn}: {rt:?}").unwrap(),
-        }
-    }
-
-    dump_blocks(&mut sink, blocks, instructions).unwrap();
+    dump_registers(&mut sink, constants, pure_instructions, impure_registers).unwrap();
+    dump_blocks(&mut sink, blocks, impure_instructions).unwrap();
 
     unsafe { String::from_utf8_unchecked(sink) }
 }
 
-fn optimize<'a, 's>(
-    ep: &ShaderEntryPointDescription,
-    f: &UserDefinedFunctionSymbol<'s>,
-    body: &mut FunctionBody<'a, 's>,
-    scope_arena: &'a Arena<SymbolScope<'a, 's>>,
-) {
-    let refpath_binds = ep
-        .global_variables
-        .inputs
-        .iter()
-        .map(|v| (&v.original_refpath, &v.decorations))
-        .chain(
-            ep.global_variables
-                .uniforms
-                .iter()
-                .map(|v| (&v.original_refpath, &v.decorations)),
-        )
-        .collect::<HashMap<_, _>>();
+// fn optimize<'a, 's>(
+//     ep: &ShaderEntryPointDescription,
+//     f: &UserDefinedFunctionSymbol<'s>,
+//     body: &mut FunctionBody<'a, 's>,
+//     scope_arena: &'a Arena<SymbolScope<'a, 's>>,
+// ) {
+//     let refpath_binds = ep
+//         .global_variables
+//         .inputs
+//         .iter()
+//         .map(|v| (&v.original_refpath, &v.decorations))
+//         .chain(
+//             ep.global_variables
+//                 .uniforms
+//                 .iter()
+//                 .map(|v| (&v.original_refpath, &v.decorations)),
+//         )
+//         .collect::<HashMap<_, _>>();
 
-    let mut last_ir_document = build_ir_document(
-        &body.registers,
-        &body.constants,
-        &body.blocks,
-        &body.instructions,
-    );
-    fn perform_log(
-        f: &UserDefinedFunctionSymbol,
-        step_name: &str,
-        modified: bool,
-        last_irdoc: &mut String,
-        body: &FunctionBody,
-    ) {
-        print_step_header(&f.name(), step_name, modified);
+//     let mut last_ir_document = build_ir_document(
+//         &body.registers,
+//         &body.constants,
+//         &body.blocks,
+//         &body.instructions,
+//     );
+//     fn perform_log(
+//         f: &UserDefinedFunctionSymbol,
+//         step_name: &str,
+//         modified: bool,
+//         last_irdoc: &mut String,
+//         body: &FunctionBody,
+//     ) {
+//         print_step_header(&f.name(), step_name, modified);
 
-        if modified {
-            let new_irdoc = build_ir_document(
-                &body.registers,
-                &body.constants,
-                &body.blocks,
-                &body.instructions,
-            );
+//         if modified {
+//             let new_irdoc = build_ir_document(
+//                 &body.registers,
+//                 &body.constants,
+//                 &body.blocks,
+//                 &body.instructions,
+//             );
 
-            let mut o = std::io::stdout().lock();
-            let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
-            for c in diff.iter_all_changes() {
-                let sign = match c.tag() {
-                    similar::ChangeTag::Equal => " ",
-                    similar::ChangeTag::Insert => "+",
-                    similar::ChangeTag::Delete => "-",
-                };
+//             let mut o = std::io::stdout().lock();
+//             let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
+//             for c in diff.iter_all_changes() {
+//                 let sign = match c.tag() {
+//                     similar::ChangeTag::Equal => " ",
+//                     similar::ChangeTag::Insert => "+",
+//                     similar::ChangeTag::Delete => "-",
+//                 };
 
-                write!(o, "{sign} {c}").unwrap();
-            }
-            o.flush().unwrap();
-            drop(o);
+//                 write!(o, "{sign} {c}").unwrap();
+//             }
+//             o.flush().unwrap();
+//             drop(o);
 
-            *last_irdoc = new_irdoc;
-        }
-    }
+//             *last_irdoc = new_irdoc;
+//         }
+//     }
 
-    loop {
-        let modified = inline_function2(
-            &mut body.blocks,
-            &mut body.instructions,
-            &mut body.constants,
-            scope_arena,
-            body.symbol_scope,
-            &mut body.registers,
-        );
+//     loop {
+//         let modified = inline_function2(
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &mut body.constants,
+//             scope_arena,
+//             body.symbol_scope,
+//             &mut body.registers,
+//         );
 
-        perform_log(f, "InlineFunction", modified, &mut last_ir_document, body);
+//         perform_log(f, "InlineFunction", modified, &mut last_ir_document, body);
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    println!("refpath binds: {refpath_binds:#?}");
+//     println!("refpath binds: {refpath_binds:#?}");
 
-    loop {
-        let modified = unref_swizzle_ref_loads(
-            &mut body.blocks,
-            &mut body.instructions,
-            &body.constants,
-            &mut body.registers,
-        );
+//     loop {
+//         let modified = unref_swizzle_ref_loads(
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &body.constants,
+//             &mut body.registers,
+//         );
 
-        perform_log(
-            f,
-            "UnrefSwizzleRefLoads",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "UnrefSwizzleRefLoads",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    loop {
-        let modified = transform_swizzle_component_store(
-            &mut body.blocks,
-            &mut body.instructions,
-            &mut body.registers,
-        );
+//     loop {
+//         let modified = transform_swizzle_component_store(
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &mut body.registers,
+//         );
 
-        perform_log(
-            f,
-            "TransformSwizzleComponentStore",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "TransformSwizzleComponentStore",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    let local_scope_var_aliases =
-        track_scope_local_var_aliases(&body.blocks, &body.instructions, &body.constants);
-    println!("Scope Var Aliases:");
-    let mut sorted = local_scope_var_aliases.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|p| p.0 .0);
-    for (b, a) in sorted {
-        println!("  After b{}:", b.0);
-        for ((scope, id), r) in a.iter() {
-            println!("    {id} at {scope:?} = r{}", r.0);
-        }
-    }
+//     let local_scope_var_aliases =
+//         track_scope_local_var_aliases(&body.blocks, &body.instructions, &body.constants);
+//     println!("Scope Var Aliases:");
+//     let mut sorted = local_scope_var_aliases.iter().collect::<Vec<_>>();
+//     sorted.sort_by_key(|p| p.0 .0);
+//     for (b, a) in sorted {
+//         println!("  After b{}:", b.0);
+//         for ((scope, id), r) in a.iter() {
+//             println!("    {id} at {scope:?} = r{}", r.0);
+//         }
+//     }
 
-    let scope_local_var_states = build_scope_local_var_state(
-        &mut body.blocks,
-        &mut body.instructions,
-        &local_scope_var_aliases,
-        &mut body.registers,
-    );
-    println!("Scope Local Var States:");
-    let mut sorted = scope_local_var_states.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|p| p.0 .0);
-    for (b, a) in sorted {
-        println!("  Head of b{}:", b.0);
-        for ((scope, id), r) in a.iter() {
-            println!("    {id} at {scope:?} = {r:?}");
-        }
-    }
+//     let scope_local_var_states = build_scope_local_var_state(
+//         &mut body.blocks,
+//         &mut body.instructions,
+//         &local_scope_var_aliases,
+//         &mut body.registers,
+//     );
+//     println!("Scope Local Var States:");
+//     let mut sorted = scope_local_var_states.iter().collect::<Vec<_>>();
+//     sorted.sort_by_key(|p| p.0 .0);
+//     for (b, a) in sorted {
+//         println!("  Head of b{}:", b.0);
+//         for ((scope, id), r) in a.iter() {
+//             println!("    {id} at {scope:?} = {r:?}");
+//         }
+//     }
 
-    loop {
-        let modified = apply_local_var_states(
-            &mut body.blocks,
-            &mut body.instructions,
-            &body.constants,
-            &scope_local_var_states,
-        );
+//     loop {
+//         let modified = apply_local_var_states(
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &body.constants,
+//             &scope_local_var_states,
+//         );
 
-        perform_log(
-            f,
-            "ApplyLocalVarStates",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "ApplyLocalVarStates",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    let local_memory_usages =
-        collect_scope_local_memory_usages(&body.blocks, &body.instructions, &body.constants);
-    println!("LocalMemoryUsages:");
-    for ((scope, id), usage) in local_memory_usages.iter() {
-        println!("  {id} @ {scope:?}: {usage:?}");
-    }
+//     let local_memory_usages =
+//         collect_scope_local_memory_usages(&body.blocks, &body.instructions, &body.constants);
+//     println!("LocalMemoryUsages:");
+//     for ((scope, id), usage) in local_memory_usages.iter() {
+//         println!("  {id} @ {scope:?}: {usage:?}");
+//     }
 
-    let modified =
-        strip_write_only_local_memory(&mut body.blocks, &body.constants, &local_memory_usages);
+//     let modified =
+//         strip_write_only_local_memory(&mut body.blocks, &body.constants, &local_memory_usages);
 
-    perform_log(
-        f,
-        "StripWriteOnlyLocalMemory",
-        modified,
-        &mut last_ir_document,
-        body,
-    );
+//     perform_log(
+//         f,
+//         "StripWriteOnlyLocalMemory",
+//         modified,
+//         &mut last_ir_document,
+//         body,
+//     );
 
-    loop {
-        let modified = resolve_shader_io_ref_binds(
-            &f.inputs,
-            body.symbol_scope,
-            &refpath_binds,
-            &mut body.blocks,
-            &mut body.instructions,
-            &mut body.constants,
-            &body.registers,
-        );
+//     loop {
+//         let modified = resolve_shader_io_ref_binds(
+//             &f.inputs,
+//             body.symbol_scope,
+//             &refpath_binds,
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &mut body.constants,
+//             &body.registers,
+//         );
 
-        perform_log(
-            f,
-            "ResolveShaderIORefBinds",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "ResolveShaderIORefBinds",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    let mut needs_reopt = true;
-    while needs_reopt {
-        needs_reopt = false;
+//     let mut needs_reopt = true;
+//     while needs_reopt {
+//         needs_reopt = false;
 
-        loop {
-            let modified = promote_instantiate_const(&mut body.instructions, &mut body.constants);
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let modified = promote_instantiate_const(&mut body.instructions, &mut body.constants);
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(
-                f,
-                "PromoteInstantiateConst",
-                modified,
-                &mut last_ir_document,
-                body,
-            );
+//             perform_log(
+//                 f,
+//                 "PromoteInstantiateConst",
+//                 modified,
+//                 &mut last_ir_document,
+//                 body,
+//             );
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let modified = fold_const_ops(&mut body.instructions, &mut body.constants);
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let modified = fold_const_ops(&mut body.instructions, &mut body.constants);
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(f, "FoldConstants", modified, &mut last_ir_document, body);
+//             perform_log(f, "FoldConstants", modified, &mut last_ir_document, body);
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let modified = unify_constants(
-                &mut body.blocks,
-                &mut body.instructions,
-                &mut body.constants,
-            );
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let modified = unify_constants(
+//                 &mut body.blocks,
+//                 &mut body.instructions,
+//                 &mut body.constants,
+//             );
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(f, "UnifyConstants", modified, &mut last_ir_document, body);
+//             perform_log(f, "UnifyConstants", modified, &mut last_ir_document, body);
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let modified = merge_simple_goto_blocks(&mut body.blocks, &mut body.instructions);
-            needs_reopt |= modified;
+//         loop {
+//             let modified = merge_simple_goto_blocks(&mut body.blocks, &mut body.instructions);
+//             needs_reopt |= modified;
 
-            perform_log(
-                f,
-                "MergeSimpleGotoBlocks",
-                modified,
-                &mut last_ir_document,
-                body,
-            );
+//             perform_log(
+//                 f,
+//                 "MergeSimpleGotoBlocks",
+//                 modified,
+//                 &mut last_ir_document,
+//                 body,
+//             );
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let modified = block_aliasing(&mut body.blocks, &mut body.instructions);
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let modified = block_aliasing(&mut body.blocks, &mut body.instructions);
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(f, "BlockAliasing", modified, &mut last_ir_document, body);
+//             perform_log(f, "BlockAliasing", modified, &mut last_ir_document, body);
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let modified = deconstruct_effectless_phi(&mut body.instructions);
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let modified = deconstruct_effectless_phi(&mut body.instructions);
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(
-                f,
-                "DeconstructEffectlessPhi",
-                modified,
-                &mut last_ir_document,
-                body,
-            );
+//             perform_log(
+//                 f,
+//                 "DeconstructEffectlessPhi",
+//                 modified,
+//                 &mut last_ir_document,
+//                 body,
+//             );
 
-            if !modified {
-                break;
-            }
-        }
+//             if !modified {
+//                 break;
+//             }
+//         }
 
-        loop {
-            let register_state_map = build_register_state_map(&body.blocks, &mut body.instructions);
-            let modified = resolve_register_aliases(
-                &mut body.blocks,
-                &mut body.instructions,
-                &register_state_map,
-            );
-            needs_reopt = needs_reopt || modified;
+//         loop {
+//             let register_state_map = build_register_state_map(&body.blocks, &mut body.instructions);
+//             let modified = resolve_register_aliases(
+//                 &mut body.blocks,
+//                 &mut body.instructions,
+//                 &register_state_map,
+//             );
+//             needs_reopt = needs_reopt || modified;
 
-            perform_log(
-                f,
-                "ResolveRegisterAliases",
-                modified,
-                &mut last_ir_document,
-                body,
-            );
+//             perform_log(
+//                 f,
+//                 "ResolveRegisterAliases",
+//                 modified,
+//                 &mut last_ir_document,
+//                 body,
+//             );
 
-            if !modified {
-                break;
-            }
-        }
-    }
+//             if !modified {
+//                 break;
+//             }
+//         }
+//     }
 
-    loop {
-        let modified = strip_unreachable_blocks(&mut body.blocks, &mut body.instructions);
-        needs_reopt = needs_reopt || modified;
+//     loop {
+//         let modified = strip_unreachable_blocks(&mut body.blocks, &mut body.instructions);
+//         needs_reopt = needs_reopt || modified;
 
-        perform_log(
-            f,
-            "StripUnreachableBlocks",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "StripUnreachableBlocks",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
+//         if !modified {
+//             break;
+//         }
+//     }
 
-    loop {
-        let modified = strip_unreferenced_registers(
-            &mut body.blocks,
-            &mut body.instructions,
-            &mut body.registers,
-            &mut body.constants,
-        );
+//     loop {
+//         let modified = strip_unreferenced_registers(
+//             &mut body.blocks,
+//             &mut body.instructions,
+//             &mut body.registers,
+//             &mut body.constants,
+//         );
 
-        perform_log(
-            f,
-            "StripUnreferencedRegisters",
-            modified,
-            &mut last_ir_document,
-            body,
-        );
+//         perform_log(
+//             f,
+//             "StripUnreferencedRegisters",
+//             modified,
+//             &mut last_ir_document,
+//             body,
+//         );
 
-        if !modified {
-            break;
-        }
-    }
-}
+//         if !modified {
+//             break;
+//         }
+//     }
+// }

@@ -11,31 +11,104 @@ use crate::{
     ref_path::RefPath,
     scope::{SymbolScope, VarId},
     source_ref::{SourceRef, SourceRefSliceEq},
-    spirv as spv,
     symbol::{meta::BuiltinInputOutput, IntrinsicFunctionSymbol},
     utils::PtrEq,
 };
 
 use super::{
     expr::{binary_op, simplify_expression, simplify_lefthand_expression, ConstModifiers},
-    Const, ConstFloatLiteral, ConstIntLiteral, ConstNumberLiteral, ConstSIntLiteral,
-    ConstUIntLiteral, ExprRef,
+    ConstFloatLiteral, ConstIntLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral,
+    LosslessConst,
 };
 
-#[repr(transparent)]
+pub struct BaseRegisters {
+    pub r#const: usize,
+    pub pure: usize,
+    pub impure: usize,
+}
+
+pub enum ConcreteTypeRef<'c, 's> {
+    Computed(ConcreteType<'s>),
+    Ref(&'c ConcreteType<'s>),
+}
+impl core::fmt::Debug for ConcreteTypeRef<'_, '_> {
+    #[inline(always)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Computed(x) => x.fmt(f),
+            Self::Ref(x) => x.fmt(f),
+        }
+    }
+}
+impl<'s> core::ops::Deref for ConcreteTypeRef<'_, 's> {
+    type Target = ConcreteType<'s>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Computed(r) => r,
+            Self::Ref(r) => *r,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RegisterRef(pub usize);
+pub enum RegisterRef {
+    Const(usize),
+    Pure(usize),
+    Impure(usize),
+}
 impl RegisterRef {
     pub fn ty<'c, 's>(
         self,
         p: &'c (impl RegisterTypeProvider<'c, 's> + ?Sized),
-    ) -> &'c ConcreteType<'s> {
+    ) -> ConcreteTypeRef<'c, 's> {
         p.register_type(self)
+    }
+
+    #[inline(always)]
+    pub const fn based_on(self, base: &BaseRegisters) -> Self {
+        match self {
+            Self::Const(n) => Self::Const(n + base.r#const),
+            Self::Pure(n) => Self::Pure(n + base.pure),
+            Self::Impure(n) => Self::Impure(n + base.impure),
+        }
+    }
+
+    #[inline]
+    pub fn entropy_order(&self, other: &Self) -> core::cmp::Ordering {
+        match (self, other) {
+            (Self::Const(a), Self::Const(b)) => a.cmp(b),
+            (Self::Const(_), Self::Pure(_)) => core::cmp::Ordering::Less,
+            (Self::Const(_), Self::Impure(_)) => core::cmp::Ordering::Less,
+            (Self::Pure(_), Self::Const(_)) => core::cmp::Ordering::Greater,
+            (Self::Pure(a), Self::Pure(b)) => a.cmp(b),
+            (Self::Pure(_), Self::Impure(_)) => core::cmp::Ordering::Less,
+            (Self::Impure(_), Self::Const(_)) => core::cmp::Ordering::Greater,
+            (Self::Impure(_), Self::Pure(_)) => core::cmp::Ordering::Greater,
+            (Self::Impure(a), Self::Impure(b)) => a.cmp(b),
+        }
+    }
+}
+impl core::fmt::Display for RegisterRef {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Const(x) => write!(f, "c{x}"),
+            Self::Pure(x) => write!(f, "p{x}"),
+            Self::Impure(x) => write!(f, "r{x}"),
+        }
     }
 }
 
+pub type ImpureInstructionMap<'a, 's> = HashMap<usize, BlockInstruction<'a, 's>>;
+pub type PureInstructions<'a, 's> = Vec<TypedBlockInstruction<'a, 's>>;
+pub type Constants<'s> = Vec<BlockConstInstruction<'s>>;
+
+pub type RegisterAliasMap = HashMap<RegisterRef, RegisterRef>;
+
 pub trait RegisterTypeProvider<'c, 's> {
-    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s>;
+    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's>;
 }
 
 #[repr(transparent)]
@@ -87,9 +160,9 @@ impl BlockFlowInstruction {
         match self {
             Self::Funcall { ref mut result, .. }
             | Self::IntrinsicImpureFuncall { ref mut result, .. } => {
-                let x0 = result.0;
+                let x0 = *result;
                 relocator(result);
-                result.0 != x0
+                *result != x0
             }
             Self::Goto(_)
             | Self::StoreRef { .. }
@@ -102,6 +175,52 @@ impl BlockFlowInstruction {
         }
     }
 
+    #[inline(always)]
+    pub fn apply_register_alias(&mut self, map: &RegisterAliasMap) -> bool {
+        self.relocate_register(|r| {
+            while let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
+    }
+
+    #[inline(always)]
+    pub fn apply_parallel_register_alias(&mut self, map: &RegisterAliasMap) -> bool {
+        self.relocate_register(|r| {
+            if let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
+    }
+
+    pub fn enumerate_ref_registers(&self, mut reporter: impl FnMut(RegisterRef)) {
+        match self {
+            Self::Goto(_) => (),
+            &Self::StoreRef { ptr, value, .. } => {
+                reporter(ptr);
+                reporter(value);
+            }
+            &Self::Funcall {
+                callee, ref args, ..
+            } => {
+                reporter(callee);
+                for x in args {
+                    reporter(*x);
+                }
+            }
+            &Self::IntrinsicImpureFuncall { ref args, .. } => {
+                for x in args {
+                    reporter(*x);
+                }
+            }
+            &Self::Conditional { source, .. } => reporter(source),
+            &Self::ConditionalLoop { condition, .. } => reporter(condition),
+            Self::Break | Self::Continue => (),
+            &Self::Return(r) => reporter(r),
+            Self::Undetermined => (),
+        }
+    }
+
     pub fn relocate_register(&mut self, mut relocator: impl FnMut(&mut RegisterRef)) -> bool {
         match self {
             Self::Goto(_) => false,
@@ -110,52 +229,88 @@ impl BlockFlowInstruction {
                 ref mut value,
                 ..
             } => {
-                let x0 = value.0;
+                let x0 = *value;
                 relocator(value);
-                let p0 = ptr.0;
+                let p0 = *ptr;
                 relocator(ptr);
-                value.0 != x0 || ptr.0 != p0
+                *value != x0 || *ptr != p0
             }
             Self::Funcall {
                 ref mut callee,
                 ref mut args,
                 ..
             } => {
-                let x0 = callee.0;
+                let x0 = *callee;
                 relocator(callee);
                 let a = args.iter_mut().fold(false, |a, r| {
-                    let x0 = r.0;
+                    let x0 = *r;
                     relocator(r);
-                    r.0 != x0 || a
+                    *r != x0 || a
                 });
-                callee.0 != x0 || a
+                *callee != x0 || a
             }
             Self::IntrinsicImpureFuncall { ref mut args, .. } => {
                 args.iter_mut().fold(false, |a, r| {
-                    let x0 = r.0;
+                    let x0 = *r;
                     relocator(r);
-                    r.0 != x0 || a
+                    *r != x0 || a
                 })
             }
             Self::Conditional { ref mut source, .. } => {
-                let x0 = source.0;
+                let x0 = *source;
                 relocator(source);
-                source.0 != x0
+                *source != x0
             }
             Self::ConditionalLoop {
                 ref mut condition, ..
             } => {
-                let x0 = condition.0;
+                let x0 = *condition;
                 relocator(condition);
-                condition.0 != x0
+                *condition != x0
             }
             Self::Break | Self::Continue => false,
             Self::Return(ref mut r) => {
-                let x0 = r.0;
+                let x0 = *r;
                 relocator(r);
-                r.0 != x0
+                *r != x0
             }
             Self::Undetermined => false,
+        }
+    }
+
+    pub fn enumerate_dest_register(&self, mut reporter: impl FnMut(RegisterRef)) {
+        match self {
+            Self::Goto(_)
+            | Self::StoreRef { .. }
+            | Self::Conditional { .. }
+            | Self::ConditionalLoop { .. }
+            | Self::Break
+            | Self::Continue
+            | Self::Return(_)
+            | Self::Undetermined => (),
+            &Self::Funcall { result, .. } | &Self::IntrinsicImpureFuncall { result, .. } => {
+                reporter(result);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn relocate_dest_register(&mut self, mut relocator: impl FnMut(&mut RegisterRef)) -> bool {
+        match self {
+            Self::Goto(_)
+            | Self::StoreRef { .. }
+            | Self::Conditional { .. }
+            | Self::ConditionalLoop { .. }
+            | Self::Break
+            | Self::Continue
+            | Self::Return(_)
+            | Self::Undetermined => false,
+            Self::Funcall { ref mut result, .. }
+            | Self::IntrinsicImpureFuncall { ref mut result, .. } => {
+                let x0 = *result;
+                relocator(result);
+                x0 != *result
+            }
         }
     }
 
@@ -248,6 +403,82 @@ pub enum IntrinsicUnaryOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BlockConstInstruction<'s> {
+    LitInt(ConstIntLiteral<'s>),
+    LitNum(ConstNumberLiteral<'s>),
+    LitUInt(ConstUIntLiteral<'s>),
+    LitSInt(ConstSIntLiteral<'s>),
+    LitFloat(ConstFloatLiteral<'s>),
+    ImmUnit,
+    ImmBool(bool),
+    ImmInt(isize),
+    ImmUInt(u32),
+    ImmSInt(i32),
+    IntrinsicFunctionRef(Vec<IntrinsicFunctionSymbol>),
+    IntrinsicTypeConstructorRef(IntrinsicType),
+}
+impl<'s> BlockConstInstruction<'s> {
+    #[inline(always)]
+    pub fn try_instantiate_lossless_const(&self) -> Option<LosslessConst> {
+        match self {
+            Self::LitInt(v) => Some(LosslessConst::Int(v.instantiate())),
+            Self::LitSInt(v) => Some(LosslessConst::SInt(v.instantiate())),
+            Self::LitUInt(v) => Some(LosslessConst::UInt(v.instantiate())),
+            &Self::ImmBool(v) => Some(LosslessConst::Bool(v)),
+            &Self::ImmInt(v) => Some(LosslessConst::Int(v)),
+            &Self::ImmSInt(v) => Some(LosslessConst::SInt(v)),
+            &Self::ImmUInt(v) => Some(LosslessConst::UInt(v)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn ty(&self) -> ConcreteType<'s> {
+        match self {
+            Self::LitInt(_) => ConcreteType::UnknownIntClass,
+            Self::LitNum(_) => ConcreteType::UnknownNumberClass,
+            Self::LitSInt(_) => IntrinsicType::SInt.into(),
+            Self::LitUInt(_) => IntrinsicType::UInt.into(),
+            Self::LitFloat(_) => IntrinsicType::Float.into(),
+            Self::ImmUnit => IntrinsicType::Unit.into(),
+            Self::ImmBool(_) => IntrinsicType::Bool.into(),
+            Self::ImmInt(_) => ConcreteType::UnknownIntClass,
+            Self::ImmSInt(_) => IntrinsicType::SInt.into(),
+            Self::ImmUInt(_) => IntrinsicType::UInt.into(),
+            Self::IntrinsicFunctionRef(overloads) => ConcreteType::OverloadedFunctions(
+                overloads
+                    .iter()
+                    .map(|s| (s.args.clone(), Box::new(s.output.clone())))
+                    .collect(),
+            ),
+            Self::IntrinsicTypeConstructorRef(it) => ConcreteType::IntrinsicTypeConstructor(*it),
+        }
+    }
+
+    #[inline]
+    pub fn dump(&self, writer: &mut (impl std::io::Write + ?Sized)) -> std::io::Result<()> {
+        match self {
+            Self::LitInt(l) => write!(writer, "LitInt {l:?}"),
+            Self::LitNum(l) => write!(writer, "LitNum {l:?}"),
+            Self::LitSInt(l) => write!(writer, "LitSInt {l:?}"),
+            Self::LitUInt(l) => write!(writer, "LitUInt {l:?}"),
+            Self::LitFloat(l) => write!(writer, "LitFloat {l:?}"),
+            Self::ImmUnit => write!(writer, "()"),
+            Self::ImmBool(b) => write!(writer, "{b}"),
+            Self::ImmInt(v) => write!(writer, "Int {v}"),
+            Self::ImmSInt(v) => write!(writer, "SInt {v}"),
+            Self::ImmUInt(v) => write!(writer, "UInt {v}"),
+            Self::IntrinsicFunctionRef(overloads) => {
+                write!(writer, "IntrinsicFunctionRef {overloads:?}")
+            }
+            Self::IntrinsicTypeConstructorRef(it) => {
+                write!(writer, "IntrinsicTypeConstructorRef#{it:?}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlockInstruction<'a, 's> {
     Cast(RegisterRef, ConcreteType<'s>),
     InstantiateIntrinsicTypeClass(RegisterRef, IntrinsicType),
@@ -309,6 +540,29 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
+    pub fn try_into_const_inst(self) -> Result<BlockConstInstruction<'s>, Self> {
+        match self {
+            Self::ConstInt(l) => Ok(BlockConstInstruction::LitInt(l)),
+            Self::ConstNumber(l) => Ok(BlockConstInstruction::LitNum(l)),
+            Self::ConstSInt(l) => Ok(BlockConstInstruction::LitSInt(l)),
+            Self::ConstUInt(l) => Ok(BlockConstInstruction::LitUInt(l)),
+            Self::ConstFloat(l) => Ok(BlockConstInstruction::LitFloat(l)),
+            Self::ConstUnit => Ok(BlockConstInstruction::ImmUnit),
+            Self::ImmBool(v) => Ok(BlockConstInstruction::ImmBool(v)),
+            Self::ImmInt(v) => Ok(BlockConstInstruction::ImmInt(v)),
+            Self::ImmSInt(v) => Ok(BlockConstInstruction::ImmSInt(v)),
+            Self::ImmUInt(v) => Ok(BlockConstInstruction::ImmUInt(v)),
+            Self::IntrinsicFunctionRef(overloads) => {
+                Ok(BlockConstInstruction::IntrinsicFunctionRef(overloads))
+            }
+            Self::IntrinsicTypeConstructorRef(it) => {
+                Ok(BlockConstInstruction::IntrinsicTypeConstructorRef(it))
+            }
+            _ => Err(self),
+        }
+    }
+
+    #[inline(always)]
     pub const fn is_const(&self) -> bool {
         matches!(
             self,
@@ -331,6 +585,23 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
+    pub const fn is_pure(&self) -> bool {
+        matches!(
+            self,
+            Self::IntrinsicBinaryOp(_, _, _)
+                | Self::IntrinsicUnaryOp(_, _)
+                | Self::MemberRef(_, _)
+                | Self::ArrayRef { .. }
+                | Self::TupleRef(_, _)
+                | Self::Cast(_, _)
+                | Self::SwizzleRef(_, _)
+                | Self::Swizzle(_, _)
+                | Self::PureFuncall(_, _)
+                | Self::PureIntrinsicCall(_, _)
+        )
+    }
+
+    #[inline(always)]
     pub fn dup_phi_incoming(&mut self, old: BlockRef, new: BlockRef) {
         if let Self::Phi(ref mut incomings) = self {
             if let Some(&r) = incomings.get(&old) {
@@ -340,15 +611,15 @@ impl<'a, 's> BlockInstruction<'a, 's> {
     }
 
     #[inline(always)]
-    pub fn try_instantiate_const(&self) -> Option<Const> {
+    pub fn try_instantiate_const(&self) -> Option<LosslessConst> {
         match self {
-            Self::ConstInt(v) => Some(Const::Int(v.instantiate())),
-            Self::ConstSInt(v) => Some(Const::SInt(v.instantiate())),
-            Self::ConstUInt(v) => Some(Const::UInt(v.instantiate())),
-            &Self::ImmBool(v) => Some(Const::Bool(v)),
-            &Self::ImmInt(v) => Some(Const::Int(v)),
-            &Self::ImmSInt(v) => Some(Const::SInt(v)),
-            &Self::ImmUInt(v) => Some(Const::UInt(v)),
+            Self::ConstInt(v) => Some(LosslessConst::Int(v.instantiate())),
+            Self::ConstSInt(v) => Some(LosslessConst::SInt(v.instantiate())),
+            Self::ConstUInt(v) => Some(LosslessConst::UInt(v.instantiate())),
+            &Self::ImmBool(v) => Some(LosslessConst::Bool(v)),
+            &Self::ImmInt(v) => Some(LosslessConst::Int(v)),
+            &Self::ImmSInt(v) => Some(LosslessConst::SInt(v)),
+            &Self::ImmUInt(v) => Some(LosslessConst::UInt(v)),
             _ => None,
         }
     }
@@ -376,6 +647,78 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 *r = nr;
             }
         })
+    }
+
+    #[inline(always)]
+    pub fn apply_parallel_register_alias(&mut self, map: &RegisterAliasMap) -> bool {
+        self.relocate_register(|r| {
+            if let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
+    }
+
+    pub fn enumerate_ref_registers(&self, mut reporter: impl FnMut(RegisterRef)) {
+        match self {
+            Self::ConstUnit
+            | Self::ConstInt(_)
+            | Self::ConstNumber(_)
+            | Self::ConstSInt(_)
+            | Self::ConstUInt(_)
+            | Self::ConstFloat(_)
+            | Self::ImmBool(_)
+            | Self::ImmInt(_)
+            | Self::ImmSInt(_)
+            | Self::ImmUInt(_)
+            | Self::ScopeLocalVarRef(_, _)
+            | Self::FunctionInputVarRef(_, _)
+            | Self::UserDefinedFunctionRef(_, _)
+            | Self::IntrinsicFunctionRef(_)
+            | Self::IntrinsicTypeConstructorRef(_)
+            | Self::BuiltinIORef(_)
+            | Self::DescriptorRef { .. }
+            | Self::PushConstantRef(_)
+            | Self::StaticPathRef(_)
+            | Self::WorkgroupSharedMemoryRef(_) => (),
+            &Self::Cast(x, _)
+            | &Self::InstantiateIntrinsicTypeClass(x, _)
+            | &Self::RegisterAlias(x)
+            | &Self::IntrinsicUnaryOp(x, _)
+            | &Self::LoadRef(x)
+            | &Self::PromoteIntToNumber(x)
+            | &Self::Swizzle(x, _)
+            | &Self::SwizzleRef(x, _)
+            | &Self::MemberRef(x, _)
+            | &Self::TupleRef(x, _) => {
+                reporter(x);
+            }
+            &Self::IntrinsicBinaryOp(x, _, y)
+            | &Self::ArrayRef {
+                source: x,
+                index: y,
+            } => {
+                reporter(x);
+                reporter(y);
+            }
+            Self::ConstructIntrinsicComposite(_, ref xs)
+            | Self::ConstructTuple(ref xs)
+            | Self::ConstructStruct(ref xs)
+            | Self::PureIntrinsicCall(_, ref xs)
+            | Self::PureFuncall(_, ref xs) => {
+                for x in xs {
+                    reporter(*x);
+                }
+            }
+            Self::Phi(ref incomings) => {
+                for x in incomings.values() {
+                    reporter(*x);
+                }
+            }
+            &Self::CompositeInsert { value, source, .. } => {
+                reporter(value);
+                reporter(source);
+            }
+        }
     }
 
     pub fn relocate_register(&mut self, mut relocator: impl FnMut(&mut RegisterRef)) -> bool {
@@ -410,55 +753,55 @@ impl<'a, 's> BlockInstruction<'a, 's> {
             | Self::SwizzleRef(ref mut x, _)
             | Self::MemberRef(ref mut x, _)
             | Self::TupleRef(ref mut x, _) => {
-                let x0 = x.0;
+                let x0 = *x;
                 relocator(x);
-                x.0 != x0
+                *x != x0
             }
             Self::IntrinsicBinaryOp(ref mut x, _, ref mut y)
             | Self::ArrayRef {
                 source: ref mut x,
                 index: ref mut y,
             } => {
-                let (x0, y0) = (x.0, y.0);
+                let (x0, y0) = (*x, *y);
                 relocator(x);
                 relocator(y);
-                x.0 != x0 || y.0 != y0
+                *x != x0 || *y != y0
             }
             Self::ConstructIntrinsicComposite(_, ref mut xs)
             | Self::ConstructTuple(ref mut xs)
             | Self::ConstructStruct(ref mut xs)
             | Self::PureIntrinsicCall(_, ref mut xs)
             | Self::PureFuncall(_, ref mut xs) => xs.iter_mut().fold(false, |modified, x| {
-                let x0 = x.0;
+                let x0 = *x;
                 relocator(x);
-                modified || x.0 != x0
+                modified || *x != x0
             }),
             Self::Phi(ref mut incomings) => incomings.values_mut().fold(false, |modified, x| {
-                let x0 = x.0;
+                let x0 = *x;
                 relocator(x);
-                modified || x.0 != x0
+                modified || *x != x0
             }),
             Self::CompositeInsert {
                 ref mut value,
                 ref mut source,
                 ..
             } => {
-                let (x0, y0) = (value.0, source.0);
+                let (x0, y0) = (*value, *source);
                 relocator(value);
                 relocator(source);
-                x0 != value.0 || y0 != source.0
+                x0 != *value || y0 != *source
             }
         }
     }
 
     pub fn dump(&self, w: &mut (impl std::io::Write + ?Sized)) -> std::io::Result<()> {
         match self {
-            Self::Cast(RegisterRef(src), ty) => write!(w, "r{src} as {ty:?}"),
-            Self::InstantiateIntrinsicTypeClass(RegisterRef(src), ty) => {
-                write!(w, "Instantiate(r{src} as {ty:?})")
+            Self::Cast(src, ty) => write!(w, "{src} as {ty:?}"),
+            Self::InstantiateIntrinsicTypeClass(src, ty) => {
+                write!(w, "Instantiate {src} as {ty:?}")
             }
-            Self::PromoteIntToNumber(RegisterRef(value)) => {
-                write!(w, "PromoteIntToNumber(r{value})")
+            Self::PromoteIntToNumber(value) => {
+                write!(w, "PromoteIntToNumber({value})")
             }
             Self::ConstInt(ConstIntLiteral(repr, modifiers)) => {
                 write!(w, "ConstInt({repr:?}, mod={modifiers:?})")
@@ -480,7 +823,7 @@ impl<'a, 's> BlockInstruction<'a, 's> {
             Self::ImmSInt(value) => write!(w, "ImmSInt {value}"),
             Self::ImmUInt(value) => write!(w, "ImmUInt {value}"),
             Self::ConstUnit => write!(w, "()"),
-            Self::LoadRef(RegisterRef(ptr)) => write!(w, "Load r{ptr}"),
+            Self::LoadRef(ptr) => write!(w, "Load {ptr}"),
             Self::ScopeLocalVarRef(scope, var_id) => {
                 write!(w, "ScopeLocalVarRef({var_id}) in {scope:?}")
             }
@@ -492,14 +835,11 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 write!(w, "DescriptorRef set={set}, binding={binding}")
             }
             Self::PushConstantRef(offset) => write!(w, "PushConstantRef offset={offset}"),
-            Self::MemberRef(RegisterRef(source), name) => write!(w, "ref r{source}.({name:?})"),
+            Self::MemberRef(source, name) => write!(w, "ref {source}.({name:?})"),
             Self::WorkgroupSharedMemoryRef(path) => write!(w, "ref[WorkgroupSharedMem] {path:?}"),
             Self::StaticPathRef(path) => write!(w, "ref {path:?}"),
-            Self::ArrayRef {
-                source: RegisterRef(source),
-                index: RegisterRef(index),
-            } => write!(w, "ref r{source}[r{index}]"),
-            Self::TupleRef(RegisterRef(source), index) => write!(w, "ref r{source}.{index}"),
+            Self::ArrayRef { source, index } => write!(w, "ref {source}[{index}]"),
+            Self::TupleRef(source, index) => write!(w, "ref {source}.{index}"),
             Self::IntrinsicFunctionRef(overloads) => write!(
                 w,
                 "IntrinsicFunctionRef<{}>",
@@ -510,22 +850,22 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                     .join(", ")
             ),
             Self::IntrinsicTypeConstructorRef(ty) => {
-                write!(w, "IntrinsicTypeConstructorRef<{ty:?}>")
+                write!(w, "IntrinsicTypeConstructorRef#{ty:?}")
             }
             Self::UserDefinedFunctionRef(scope, name) => {
                 write!(w, "UserDefinedFunctionRef({name:?}) in {scope:?}")
             }
-            Self::SwizzleRef(RegisterRef(source), elements) => write!(
+            Self::SwizzleRef(source, elements) => write!(
                 w,
-                "ref r{source}.{}",
+                "ref {source}.{}",
                 elements
                     .iter()
                     .map(|x| ['x', 'y', 'z', 'w'][*x])
                     .collect::<String>()
             ),
-            Self::Swizzle(RegisterRef(source), elements) => write!(
+            Self::Swizzle(source, elements) => write!(
                 w,
-                "r{source}.{}",
+                "{source}.{}",
                 elements
                     .iter()
                     .map(|x| ['x', 'y', 'z', 'w'][*x])
@@ -536,7 +876,7 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 "phi [{}]",
                 incoming_selectors
                     .iter()
-                    .map(|(BlockRef(from), RegisterRef(r))| format!("{from} -> r{r}"))
+                    .map(|(BlockRef(from), r)| format!("b{from} -> {r}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -544,7 +884,7 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 w,
                 "ConstructIntrinsicComposite#{it:?}({})",
                 args.iter()
-                    .map(|RegisterRef(r)| format!("r{r}"))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -553,7 +893,7 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 "({})",
                 values
                     .iter()
-                    .map(|RegisterRef(r)| format!("r{r}"))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -562,50 +902,73 @@ impl<'a, 's> BlockInstruction<'a, 's> {
                 "{{ {} }}",
                 values
                     .iter()
-                    .map(|RegisterRef(r)| format!("r{r}"))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::IntrinsicBinaryOp(RegisterRef(left), op, RegisterRef(right)) => {
-                write!(w, "{op:?}(r{left}, r{right})")
+            Self::IntrinsicBinaryOp(left, op, right) => {
+                write!(w, "{op:?} {left}, {right}")
             }
-            Self::IntrinsicUnaryOp(RegisterRef(value), op) => write!(w, "{op:?} r{value}"),
-            Self::RegisterAlias(RegisterRef(source)) => write!(w, "r{source}"),
+            Self::IntrinsicUnaryOp(value, op) => write!(w, "{op:?} {value}"),
+            Self::RegisterAlias(source) => write!(w, "{source}"),
             Self::PureIntrinsicCall(identifier, args) => write!(
                 w,
                 "PureIntrinsicCall {identifier}({})",
                 args.iter()
-                    .map(|RegisterRef(r)| format!("r{r}"))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::PureFuncall(RegisterRef(source), args) => write!(
+            Self::PureFuncall(source, args) => write!(
                 w,
-                "PureFuncall r{source}({})",
+                "PureFuncall {source}({})",
                 args.iter()
-                    .map(|RegisterRef(r)| format!("r{r}"))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
             Self::CompositeInsert {
-                value: RegisterRef(value),
-                source: RegisterRef(source),
+                value,
+                source,
                 index,
-            } => write!(w, "CompositeInsert r{source}.{index} <- r{value}"),
+            } => write!(
+                w,
+                "CompositeInsert {source}.{} <- {value}",
+                ["x", "y", "z", "w"][*index]
+            ),
         }
+    }
+
+    #[inline(always)]
+    pub const fn typed(self, ty: ConcreteType<'s>) -> TypedBlockInstruction<'a, 's> {
+        TypedBlockInstruction(self, ty)
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct TypedBlockInstruction<'a, 's>(pub BlockInstruction<'a, 's>, pub ConcreteType<'s>);
+impl<'a, 's> TypedBlockInstruction<'a, 's> {
+    #[inline(always)]
+    pub fn apply_parallel_register_alias(&mut self, map: &RegisterAliasMap) -> bool {
+        self.0.apply_parallel_register_alias(map)
+    }
+
+    #[inline(always)]
+    pub fn apply_register_alias(&mut self, map: &RegisterAliasMap) -> bool {
+        self.0.apply_register_alias(map)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub eval_registers: HashSet<RegisterRef>,
+    pub eval_impure_registers: HashSet<usize>,
     pub flow: BlockFlowInstruction,
 }
 impl Block {
     #[inline(always)]
     pub fn flow_only(flow: BlockFlowInstruction) -> Self {
         Self {
-            eval_registers: HashSet::new(),
+            eval_impure_registers: HashSet::new(),
             flow,
         }
     }
@@ -613,13 +976,11 @@ impl Block {
     #[inline(always)]
     pub fn has_block_dependent_instructions(
         &self,
-        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+        impure_instructions: &ImpureInstructionMap,
     ) -> bool {
-        self.eval_registers.iter().any(|r| {
-            mod_instructions
-                .get(r)
-                .is_some_and(|x| x.is_block_dependent())
-        })
+        self.eval_impure_registers
+            .iter()
+            .any(|r| impure_instructions[r].is_block_dependent())
     }
 
     #[inline(always)]
@@ -640,6 +1001,18 @@ impl Block {
     }
 
     #[inline(always)]
+    pub fn apply_flow_parallel_register_alias(
+        &mut self,
+        map: &HashMap<RegisterRef, RegisterRef>,
+    ) -> bool {
+        self.flow.relocate_register(|r| {
+            if let Some(&nr) = map.get(r) {
+                *r = nr;
+            }
+        })
+    }
+
+    #[inline(always)]
     pub fn relocate_flow_register(
         &mut self,
         relocator: impl FnMut(&mut RegisterRef) + Copy,
@@ -650,15 +1023,15 @@ impl Block {
     #[inline(always)]
     pub fn relocate_register(
         &mut self,
-        mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+        impure_instructions: &mut ImpureInstructionMap,
         relocator: impl FnMut(&mut RegisterRef) + Copy,
     ) -> bool {
         let mut mod_insts = false;
-        for r in self.eval_registers.iter() {
-            let modified = match mod_instructions.get_mut(r) {
-                Some(x) => x.relocate_register(relocator),
-                None => false,
-            };
+        for r in self.eval_impure_registers.iter() {
+            let modified = impure_instructions
+                .get_mut(r)
+                .unwrap()
+                .relocate_register(relocator);
             mod_insts = mod_insts || modified;
         }
         let mod_flow = self.flow.relocate_register(relocator);
@@ -670,14 +1043,15 @@ impl Block {
     #[inline]
     pub fn dup_phi_incoming(
         &mut self,
-        mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'_, '_>>,
+        impure_instructions: &mut ImpureInstructionMap,
         old: BlockRef,
         new: BlockRef,
     ) {
-        for r in self.eval_registers.iter() {
-            if let Some(x) = mod_instructions.get_mut(r) {
-                x.dup_phi_incoming(old, new);
-            }
+        for r in self.eval_impure_registers.iter() {
+            impure_instructions
+                .get_mut(r)
+                .unwrap()
+                .dup_phi_incoming(old, new);
         }
     }
 
@@ -727,11 +1101,11 @@ impl Block {
 pub struct BlockInstructionEmitter<'c, 'a, 's> {
     pub generation_context: &'c mut BlockGenerationContext<'a, 's>,
     pub instruction_emission_context: &'c mut BlockInstructionEmissionContext<'a, 's>,
-    pub block_eval_registers: HashSet<RegisterRef>,
+    pub block_eval_impure_registers: HashSet<usize>,
 }
 impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmitter<'c, 'a, 's> {
     #[inline(always)]
-    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
+    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's> {
         self.instruction_emission_context.register_type(register)
     }
 }
@@ -744,14 +1118,14 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         Self {
             generation_context,
             instruction_emission_context,
-            block_eval_registers: HashSet::new(),
+            block_eval_impure_registers: HashSet::new(),
         }
     }
 
     #[inline(always)]
     pub fn into_block(self, flow: BlockFlowInstruction) -> Block {
         Block {
-            eval_registers: self.block_eval_registers,
+            eval_impure_registers: self.block_eval_impure_registers,
             flow,
         }
     }
@@ -759,37 +1133,30 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     #[inline(always)]
     pub fn create_block(self, flow: BlockFlowInstruction) -> BlockRef {
         let blk = Block {
-            eval_registers: self.block_eval_registers,
+            eval_impure_registers: self.block_eval_impure_registers,
             flow,
         };
 
         self.generation_context.add(blk)
     }
 
-    pub fn into_eval_registers(self) -> HashSet<RegisterRef> {
-        self.block_eval_registers
-    }
-
-    fn add_instruction(&mut self, dest_reg: RegisterRef, inst: BlockInstruction<'a, 's>) {
-        self.instruction_emission_context
-            .instructions
-            .insert(dest_reg, inst);
-        self.block_eval_registers.insert(dest_reg);
+    pub fn into_eval_impure_registers(self) -> HashSet<usize> {
+        self.block_eval_impure_registers
     }
 
     #[inline]
     pub fn loaded(&mut self, ptr: RegisterRef) -> RegisterRef {
-        match ptr.ty(self) {
+        match &*ptr.ty(self) {
             ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => self.load_ref(ptr),
             _ => ptr,
         }
     }
 
     pub fn cast(&mut self, src: RegisterRef, to: ConcreteType<'s>) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(to.clone());
-        self.add_instruction(dest_register, BlockInstruction::Cast(src, to));
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context
+                .add_new_pure_instruction(BlockInstruction::Cast(src, to.clone()).typed(to)),
+        )
     }
 
     pub fn instantiate_intrinsic_type_class(
@@ -797,22 +1164,21 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         src: RegisterRef,
         to: IntrinsicType,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(to.into());
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::InstantiateIntrinsicTypeClass(src, to),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::InstantiateIntrinsicTypeClass(src, to).typed(to.into()),
+        ))
     }
 
     pub fn load_ref(&mut self, ptr: RegisterRef) -> RegisterRef {
         let dest_register = self
             .instruction_emission_context
-            .alloc_register(ptr.ty(self).as_dereferenced().unwrap().clone());
-        self.add_instruction(dest_register, BlockInstruction::LoadRef(ptr));
+            .alloc_impure_register(ptr.ty(self).as_dereferenced().unwrap().clone());
+        self.instruction_emission_context
+            .impure_instructions
+            .insert(dest_register, BlockInstruction::LoadRef(ptr));
+        self.block_eval_impure_registers.insert(dest_register);
 
-        dest_register
+        RegisterRef::Impure(dest_register)
     }
 
     pub fn construct_intrinsic_composite(
@@ -820,21 +1186,18 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         it: IntrinsicType,
         args: Vec<RegisterRef>,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(it.into());
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstructIntrinsicComposite(it, args),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::ConstructIntrinsicComposite(it, args).typed(it.into()),
+        ))
     }
 
     pub fn construct_tuple(&mut self, elements: Vec<RegisterRef>) -> RegisterRef {
         let ty = ConcreteType::Tuple(elements.iter().map(|r| r.ty(self).clone()).collect());
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context
+                .add_new_pure_instruction(BlockInstruction::ConstructTuple(elements).typed(ty)),
+        )
     }
 
     pub fn construct_struct(
@@ -842,19 +1205,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         elements: Vec<RegisterRef>,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(out_type);
-        self.add_instruction(dest_register, BlockInstruction::ConstructStruct(elements));
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_new_pure_instruction(
+                BlockInstruction::ConstructStruct(elements).typed(out_type),
+            ),
+        )
     }
 
     pub fn promote_int_to_number(&mut self, r: RegisterRef) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(ConcreteType::UnknownNumberClass);
-        self.add_instruction(dest_register, BlockInstruction::PromoteIntToNumber(r));
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::PromoteIntToNumber(r).typed(ConcreteType::UnknownNumberClass),
+        ))
     }
 
     pub fn intrinsic_binary_op(
@@ -864,13 +1225,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         right: RegisterRef,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(out_type);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::IntrinsicBinaryOp(left, op, right),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::IntrinsicBinaryOp(left, op, right).typed(out_type),
+        ))
     }
 
     pub fn intrinsic_unary_op(
@@ -879,42 +1236,26 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         op: IntrinsicUnaryOperation,
         out_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(out_type);
-        self.add_instruction(dest_register, BlockInstruction::IntrinsicUnaryOp(value, op));
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::IntrinsicUnaryOp(value, op).typed(out_type),
+        ))
     }
 
     pub fn intrinsic_function_ref(
         &mut self,
         overloads: Vec<IntrinsicFunctionSymbol>,
     ) -> RegisterRef {
-        let dest_register =
+        RegisterRef::Const(
             self.instruction_emission_context
-                .alloc_register(ConcreteType::OverloadedFunctions(
-                    overloads
-                        .iter()
-                        .map(|s| (s.args.clone(), Box::new(s.output.clone())))
-                        .collect(),
-                ));
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::IntrinsicFunctionRef(overloads),
-        );
-
-        dest_register
+                .add_constant(BlockConstInstruction::IntrinsicFunctionRef(overloads)),
+        )
     }
 
     pub fn intrinsic_type_constructor_ref(&mut self, it: IntrinsicType) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(ConcreteType::IntrinsicTypeConstructor(it));
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::IntrinsicTypeConstructorRef(it),
-        );
-
-        dest_register
+        RegisterRef::Const(
+            self.instruction_emission_context
+                .add_constant(BlockConstInstruction::IntrinsicTypeConstructorRef(it)),
+        )
     }
 
     pub fn scope_local_var_ref(
@@ -924,13 +1265,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.local_vars.borrow()[var_id].ty.clone().imm_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id).typed(ty),
+        ))
     }
 
     pub fn scope_local_var_mutable_ref(
@@ -940,13 +1277,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.local_vars.borrow()[var_id].ty.clone().mutable_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::ScopeLocalVarRef(PtrEq(scope), var_id).typed(ty),
+        ))
     }
 
     pub fn function_input_var_ref(
@@ -956,13 +1289,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.function_input_vars[var_id].ty.clone().imm_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id).typed(ty),
+        ))
     }
 
     pub fn function_input_var_mutable_ref(
@@ -972,13 +1301,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let ty = scope.function_input_vars[var_id].ty.clone().mutable_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id),
-        );
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::FunctionInputVarRef(PtrEq(scope), var_id).typed(ty),
+        ))
     }
 
     pub fn user_defined_function_ref(
@@ -998,13 +1323,12 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
             },
         };
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::UserDefinedFunctionRef(PtrEq(scope), SourceRefSliceEq(name)),
-        );
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_new_pure_instruction(
+                BlockInstruction::UserDefinedFunctionRef(PtrEq(scope), SourceRefSliceEq(name))
+                    .typed(ty),
+            ),
+        )
     }
 
     pub fn swizzle(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
@@ -1017,10 +1341,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                 .unwrap(),
         );
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::Swizzle(source, elements));
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context
+                .add_new_pure_instruction(BlockInstruction::Swizzle(source, elements).typed(ty)),
+        )
     }
 
     pub fn swizzle_ref(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
@@ -1036,13 +1360,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         )
         .imm_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::SwizzleRef(source, elements),
-        );
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context
+                .add_new_pure_instruction(BlockInstruction::SwizzleRef(source, elements).typed(ty)),
+        )
     }
 
     pub fn swizzle_mutable_ref(
@@ -1062,13 +1383,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         )
         .mutable_ref();
 
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::SwizzleRef(source, elements),
-        );
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context
+                .add_new_pure_instruction(BlockInstruction::SwizzleRef(source, elements).typed(ty)),
+        )
     }
 
     pub fn member_ref(
@@ -1077,15 +1395,12 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         name: SourceRef<'s>,
         member_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = member_type.imm_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::MemberRef(source, SourceRefSliceEq(name)),
-        );
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_new_pure_instruction(
+                BlockInstruction::MemberRef(source, SourceRefSliceEq(name))
+                    .typed(member_type.imm_ref()),
+            ),
+        )
     }
 
     pub fn member_mutable_ref(
@@ -1094,15 +1409,12 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         name: SourceRef<'s>,
         member_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = member_type.mutable_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::MemberRef(source, SourceRefSliceEq(name)),
-        );
-
-        dest_register
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_new_pure_instruction(
+                BlockInstruction::MemberRef(source, SourceRefSliceEq(name))
+                    .typed(member_type.mutable_ref()),
+            ),
+        )
     }
 
     pub fn array_ref(
@@ -1111,12 +1423,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: RegisterRef,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = element_type.imm_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::ArrayRef { source, index });
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::ArrayRef { source, index }.typed(element_type.imm_ref()),
+        ))
     }
 
     pub fn array_mutable_ref(
@@ -1125,12 +1434,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: RegisterRef,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = element_type.mutable_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::ArrayRef { source, index });
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::ArrayRef { source, index }.typed(element_type.mutable_ref()),
+        ))
     }
 
     pub fn tuple_ref(
@@ -1139,12 +1445,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: usize,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = element_type.imm_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::TupleRef(source, index));
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::TupleRef(source, index).typed(element_type.imm_ref()),
+        ))
     }
 
     pub fn tuple_mutable_ref(
@@ -1153,87 +1456,54 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: usize,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        let ty = element_type.mutable_ref();
-
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::TupleRef(source, index));
-
-        dest_register
+        RegisterRef::Pure(self.instruction_emission_context.add_new_pure_instruction(
+            BlockInstruction::TupleRef(source, index).typed(element_type.mutable_ref()),
+        ))
     }
 
     pub fn const_int(&mut self, repr: SourceRef<'s>) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(ConcreteType::UnknownIntClass);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstInt(ConstIntLiteral(
+        RegisterRef::Const(self.instruction_emission_context.add_constant(
+            BlockConstInstruction::LitInt(ConstIntLiteral(
                 SourceRefSliceEq(repr),
                 ConstModifiers::empty(),
             )),
-        );
-
-        dest_register
+        ))
     }
 
     pub fn const_number(&mut self, repr: SourceRef<'s>) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(ConcreteType::UnknownNumberClass);
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstNumber(ConstNumberLiteral(
+        RegisterRef::Const(self.instruction_emission_context.add_constant(
+            BlockConstInstruction::LitNum(ConstNumberLiteral(
                 SourceRefSliceEq(repr),
                 ConstModifiers::empty(),
             )),
-        );
-
-        dest_register
+        ))
     }
 
     pub fn const_uint(&mut self, repr: SourceRef<'s>) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(IntrinsicType::UInt.into());
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstUInt(ConstUIntLiteral(
+        RegisterRef::Const(self.instruction_emission_context.add_constant(
+            BlockConstInstruction::LitUInt(ConstUIntLiteral(
                 SourceRefSliceEq(repr),
                 ConstModifiers::empty(),
             )),
-        );
-
-        dest_register
+        ))
     }
 
     pub fn const_sint(&mut self, repr: SourceRef<'s>) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(IntrinsicType::SInt.into());
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstSInt(ConstSIntLiteral(
+        RegisterRef::Const(self.instruction_emission_context.add_constant(
+            BlockConstInstruction::LitSInt(ConstSIntLiteral(
                 SourceRefSliceEq(repr),
                 ConstModifiers::empty(),
             )),
-        );
-
-        dest_register
+        ))
     }
 
     pub fn const_float(&mut self, repr: SourceRef<'s>) -> RegisterRef {
-        let dest_register = self
-            .instruction_emission_context
-            .alloc_register(IntrinsicType::Float.into());
-        self.add_instruction(
-            dest_register,
-            BlockInstruction::ConstFloat(ConstFloatLiteral(
+        RegisterRef::Const(self.instruction_emission_context.add_constant(
+            BlockConstInstruction::LitFloat(ConstFloatLiteral(
                 SourceRefSliceEq(repr),
                 ConstModifiers::empty(),
             )),
-        );
-
-        dest_register
+        ))
     }
 
     pub fn phi(
@@ -1241,42 +1511,64 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         incoming_selectors: BTreeMap<BlockRef, RegisterRef>,
         ty: ConcreteType<'s>,
     ) -> RegisterRef {
-        let dest_register = self.instruction_emission_context.alloc_register(ty);
-        self.add_instruction(dest_register, BlockInstruction::Phi(incoming_selectors));
+        let dest_register = self.instruction_emission_context.alloc_impure_register(ty);
+        self.instruction_emission_context
+            .impure_instructions
+            .insert(dest_register, BlockInstruction::Phi(incoming_selectors));
+        self.block_eval_impure_registers.insert(dest_register);
 
-        dest_register
+        RegisterRef::Impure(dest_register)
     }
 }
 
 pub struct BlockInstructionEmissionContext<'a, 's> {
-    pub registers: Vec<ConcreteType<'s>>,
-    pub instructions: HashMap<RegisterRef, BlockInstruction<'a, 's>>,
+    pub constants: Constants<'s>,
+    pub impure_registers: Vec<ConcreteType<'s>>,
+    pub pure_instructions: PureInstructions<'a, 's>,
+    pub impure_instructions: ImpureInstructionMap<'a, 's>,
 }
 impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmissionContext<'a, 's> {
-    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
-        &self.registers[register.0]
+    #[inline(always)]
+    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's> {
+        match register {
+            RegisterRef::Const(n) => ConcreteTypeRef::Computed(self.constants[n].ty()),
+            RegisterRef::Pure(n) => ConcreteTypeRef::Ref(&self.pure_instructions[n].1),
+            RegisterRef::Impure(n) => ConcreteTypeRef::Ref(&self.impure_registers[n]),
+        }
     }
 }
 impl<'a, 's> BlockInstructionEmissionContext<'a, 's> {
     pub fn new() -> Self {
         Self {
-            registers: Vec::new(),
-            instructions: HashMap::new(),
+            constants: Vec::new(),
+            impure_registers: Vec::new(),
+            pure_instructions: Vec::new(),
+            impure_instructions: HashMap::new(),
         }
     }
 
-    pub fn alloc_register(&mut self, ty: ConcreteType<'s>) -> RegisterRef {
-        self.registers.push(ty);
+    #[inline]
+    pub fn add_constant(&mut self, c: BlockConstInstruction<'s>) -> usize {
+        self.constants.push(c);
+        self.constants.len() - 1
+    }
 
-        RegisterRef(self.registers.len() - 1)
+    #[inline]
+    fn add_new_pure_instruction(&mut self, inst: TypedBlockInstruction<'a, 's>) -> usize {
+        self.pure_instructions.push(inst);
+
+        self.pure_instructions.len() - 1
+    }
+
+    #[inline]
+    pub fn alloc_impure_register(&mut self, ty: ConcreteType<'s>) -> usize {
+        self.impure_registers.push(ty);
+        self.impure_registers.len() - 1
     }
 
     #[inline]
     pub fn const_unit(&mut self) -> RegisterRef {
-        let r = self.alloc_register(IntrinsicType::Unit.into());
-        self.instructions.insert(r, BlockInstruction::ConstUnit);
-
-        r
+        RegisterRef::Const(self.add_constant(BlockConstInstruction::ImmUnit))
     }
 }
 
@@ -1312,12 +1604,33 @@ impl<'a, 's> BlockGenerationContext<'a, 's> {
     pub fn dump_blocks(
         &self,
         writer: &mut (impl Write + ?Sized),
-        registers: &[ConcreteType<'s>],
-        mod_instructions: &HashMap<RegisterRef, BlockInstruction>,
+        constants: &Constants<'s>,
+        pure_instructions: &PureInstructions,
+        impure_registers: &[ConcreteType<'s>],
+        impure_instructions: &ImpureInstructionMap,
     ) -> std::io::Result<()> {
         writeln!(writer, "Registers: ")?;
-        dump_registers(writer, registers)?;
-        dump_blocks(writer, &self.blocks, mod_instructions)?;
+        dump_registers(writer, constants, pure_instructions, impure_registers)?;
+        dump_blocks(writer, &self.blocks, impure_instructions)?;
+
+        Ok(())
+    }
+}
+
+#[repr(transparent)]
+struct CommaSeparatedWriter<'a, T: 'a>(pub &'a [T]);
+impl<'a, T: 'a + core::fmt::Display> core::fmt::Display for CommaSeparatedWriter<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut written = false;
+        for e in self.0.iter() {
+            if written {
+                write!(f, ", {e}")?;
+            } else {
+                e.fmt(f)?;
+            }
+
+            written = true;
+        }
 
         Ok(())
     }
@@ -1325,9 +1638,22 @@ impl<'a, 's> BlockGenerationContext<'a, 's> {
 
 pub fn dump_registers(
     writer: &mut (impl std::io::Write + ?Sized),
-    registers: &[ConcreteType],
+    constants: &Constants,
+    pure_instructions: &PureInstructions,
+    impure_registers: &[ConcreteType],
 ) -> std::io::Result<()> {
-    for (n, r) in registers.iter().enumerate() {
+    for (n, x) in constants.iter().enumerate() {
+        let ty = x.ty();
+        write!(writer, "  c{n}: {ty:?} = ")?;
+        x.dump(writer)?;
+        writeln!(writer)?;
+    }
+    for (n, x) in pure_instructions.iter().enumerate() {
+        write!(writer, "  p{n}: {:?} = ", x.1)?;
+        x.0.dump(writer)?;
+        writeln!(writer)?;
+    }
+    for (n, r) in impure_registers.iter().enumerate() {
         writeln!(writer, "  r{n}: {r:?}")?;
     }
 
@@ -1337,20 +1663,18 @@ pub fn dump_registers(
 pub fn dump_blocks(
     writer: &mut (impl std::io::Write + ?Sized),
     blocks: &[Block],
-    mod_instructions: &HashMap<RegisterRef, BlockInstruction>,
+    impure_instructions: &ImpureInstructionMap,
 ) -> std::io::Result<()> {
     for (n, b) in blocks.iter().enumerate() {
         writeln!(writer, "b{n}: {{")?;
 
-        if !b.eval_registers.is_empty() {
-            let mut sorted = b.eval_registers.iter().collect::<Vec<_>>();
-            sorted.sort_by_key(|&RegisterRef(r)| r);
-            for r in sorted {
-                if let Some(x) = mod_instructions.get(&r) {
-                    write!(writer, "  r{} = ", r.0)?;
-                    x.dump(writer)?;
-                    writer.write(b"\n")?;
-                }
+        let mut sorted_evals = b.eval_impure_registers.iter().collect::<Vec<_>>();
+        sorted_evals.sort();
+        if !sorted_evals.is_empty() {
+            for r in sorted_evals {
+                write!(writer, "  r{r} = ")?;
+                impure_instructions[r].dump(writer)?;
+                writer.write(b"\n")?;
             }
 
             writer.write(b"\n")?;
@@ -1359,69 +1683,73 @@ pub fn dump_blocks(
         match b.flow {
             BlockFlowInstruction::Goto(BlockRef(x)) => writeln!(writer, "  goto -> b{x}")?,
             BlockFlowInstruction::StoreRef {
-                ptr: RegisterRef(ptr),
-                value: RegisterRef(value),
+                ptr,
+                value,
                 after: Some(BlockRef(after)),
-            } => writeln!(writer, "  *r{ptr} = r{value} -> b{after}")?,
+            } => writeln!(writer, "  *{ptr} = {value} -> b{after}")?,
             BlockFlowInstruction::StoreRef {
-                ptr: RegisterRef(ptr),
-                value: RegisterRef(value),
+                ptr,
+                value,
                 after: None,
-            } => writeln!(writer, "  *r{ptr} = r{value} -> ???")?,
+            } => writeln!(writer, "  *{ptr} = {value} -> ???")?,
             BlockFlowInstruction::Funcall {
-                callee: RegisterRef(callee),
+                callee,
                 ref args,
-                result: RegisterRef(result),
+                result,
                 after_return: Some(BlockRef(after_return)),
             } => writeln!(
                 writer,
-                "  r{result} = (r{callee})({}) -> b{after_return}",
-                args.iter()
-                    .map(|r| format!("r{}", r.0))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "  {result} = ({callee})({}) -> b{after_return}",
+                CommaSeparatedWriter(args)
             )?,
             BlockFlowInstruction::Funcall {
-                callee: RegisterRef(callee),
+                callee,
                 ref args,
-                result: RegisterRef(result),
+                result,
                 after_return: None,
             } => writeln!(
                 writer,
-                "  r{result} = (r{callee})({}) -> ???",
-                args.iter()
-                    .map(|r| format!("r{}", r.0))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "  {result} = ({callee})({}) -> ???",
+                CommaSeparatedWriter(args)
             )?,
-            BlockFlowInstruction::IntrinsicImpureFuncall { identifier, ref args, result: RegisterRef(result), after_return: Some(BlockRef(after_return)) } => writeln!(
+            BlockFlowInstruction::IntrinsicImpureFuncall {
+                identifier,
+                ref args,
+                result,
+                after_return: Some(BlockRef(after_return)),
+            } => writeln!(
                 writer,
-                "  r{result} = IntrinsicImpureFuncall {identifier}({}) -> b{after_return}",
-                args.iter().map(|r| format!("r{}", r.0)).collect::<Vec<_>>().join(", ")
+                "  {result} = IntrinsicImpureFuncall {identifier}({}) -> b{after_return}",
+                CommaSeparatedWriter(args)
             )?,
-            BlockFlowInstruction::IntrinsicImpureFuncall { identifier, ref args, result: RegisterRef(result), after_return: None } => writeln!(
+            BlockFlowInstruction::IntrinsicImpureFuncall {
+                identifier,
+                ref args,
+                result,
+                after_return: None,
+            } => writeln!(
                 writer,
-                "  r{result} = IntrinsicImpureFuncall {identifier}({}) -> ???",
-                args.iter().map(|r| format!("r{}", r.0)).collect::<Vec<_>>().join(", ")
+                "  {result} = IntrinsicImpureFuncall {identifier}({}) -> ???",
+                CommaSeparatedWriter(args)
             )?,
             BlockFlowInstruction::Conditional {
-                source: RegisterRef(source),
+                source,
                 r#true: BlockRef(t),
                 r#false: BlockRef(e),
                 merge: BlockRef(merge),
             } => writeln!(
                 writer,
-                "  branch r{source} ? -> b{t} : -> b{e} merge at b{merge}"
+                "  branch {source} ? -> b{t} : -> b{e} merge at b{merge}"
             )?,
-            BlockFlowInstruction::Return(RegisterRef(r)) => writeln!(writer, "  return r{r}")?,
+            BlockFlowInstruction::Return(r) => writeln!(writer, "  return {r}")?,
             BlockFlowInstruction::ConditionalLoop {
-                condition: RegisterRef(condition),
+                condition,
                 r#break: BlockRef(brk),
                 r#continue: BlockRef(cont),
                 body: BlockRef(body),
             } => writeln!(
                 writer,
-                "  loop while r{condition} ... break -> b{brk}, continue -> b{cont}, body -> b{body}"
+                "  loop while {condition} ... break -> b{brk}, continue -> b{cont}, body -> b{body}"
             )?,
             BlockFlowInstruction::Break => writeln!(writer, "  break")?,
             BlockFlowInstruction::Continue => writeln!(writer, "  continue")?,
@@ -1489,7 +1817,7 @@ pub fn transform_statement<'a, 's>(
                 "+=" | "-=" | "*=" | "/=" | "%=" | "^^=" | "&=" | "|=" | "^=" | "<<=" | ">>="
                 | "&&=" | "||=" => {
                     let left_expr_loaded =
-                        match left_ref_expr.result.ty(inst.instruction_emission_context) {
+                        match &*left_ref_expr.result.ty(inst.instruction_emission_context) {
                             ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
                                 inst.load_ref(left_ref_expr.result)
                             }
@@ -1509,9 +1837,12 @@ pub fn transform_statement<'a, 's>(
                 }
                 _ => unreachable!("unknown opeq token"),
             };
-            let right_value = match left_ref_expr.result.ty(inst.instruction_emission_context) {
+            let right_value = match &*left_ref_expr.result.ty(inst.instruction_emission_context) {
                 ConcreteType::MutableRef(inner) => {
-                    match (right_value.ty(inst.instruction_emission_context), &**inner) {
+                    match (
+                        &*right_value.ty(inst.instruction_emission_context),
+                        &**inner,
+                    ) {
                         (a, b) if a == b => right_value,
                         (
                             ConcreteType::UnknownIntClass,
