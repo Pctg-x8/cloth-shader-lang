@@ -44,6 +44,20 @@ impl<'s> UserDefinedFunctionSymbol<'s> {
         self.occurence.slice
     }
 
+    #[inline(always)]
+    pub fn concrete_type(&self) -> ConcreteType<'s> {
+        ConcreteType::Function {
+            args: self.inputs.iter().map(|(_, _, _, t)| t.clone()).collect(),
+            output: match &self.output[..] {
+                &[] => None,
+                &[(_, ref t)] => Some(Box::new(t.clone())),
+                xs => Some(Box::new(ConcreteType::Tuple(
+                    xs.iter().map(|(_, t)| t.clone()).collect(),
+                ))),
+            },
+        }
+    }
+
     pub fn flatten_output<'a>(
         &self,
         function_scope: &'a SymbolScope<'a, 's>,

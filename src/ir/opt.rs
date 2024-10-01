@@ -1,9 +1,6 @@
 mod r#const;
 
-use std::{
-    collections::{HashMap, HashSet},
-    f32::consts::E,
-};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     concrete_type::ConcreteType, ir::block::BlockFlowInstruction, scope::SymbolScope, utils::PtrEq,
@@ -12,8 +9,8 @@ use crate::{
 pub use self::r#const::*;
 
 use super::block::{
-    Block, BlockInstruction, BlockRef, Constants, ImpureInstructionMap, PureInstructions,
-    RegisterAliasMap, RegisterRef,
+    Block, BlockConstInstruction, BlockInstruction, BlockPureInstruction, BlockRef, Constants,
+    ImpureInstructionMap, PureInstructions, RegisterAliasMap, RegisterRef,
 };
 
 #[inline]
@@ -77,9 +74,7 @@ pub fn apply_register_alias(
 }
 
 /// 同じPure命令を若い番号のregisterにまとめる
-pub fn unify_pure_instructions<'a, 's>(
-    pure_instructions: &PureInstructions<'a, 's>,
-) -> RegisterAliasMap {
+pub fn unify_pure_instructions<'s>(pure_instructions: &PureInstructions<'s>) -> RegisterAliasMap {
     let mut inst_to_register_map = HashMap::new();
     let mut register_alias_map = HashMap::new();
     for (r, v) in pure_instructions.iter().enumerate() {
@@ -113,7 +108,7 @@ pub fn strip_unreferenced_pure_instructions(
     let mut unreferenced = (0..pure_instructions.len()).collect::<HashSet<_>>();
 
     for x in pure_instructions.iter() {
-        x.0.enumerate_ref_registers(|r| {
+        x.inst.enumerate_ref_registers(|r| {
             if let RegisterRef::Pure(n) = r {
                 unreferenced.remove(&n);
             }
@@ -157,14 +152,14 @@ pub fn strip_unreferenced_pure_instructions(
 /// 使われていないImpure命令とレジスタを削除
 pub fn strip_unreferenced_impure_instructions<'a, 's>(
     blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
+    impure_instructions: &mut ImpureInstructionMap,
     impure_registers: &mut Vec<ConcreteType<'s>>,
-    pure_instructions: &PureInstructions<'a, 's>,
+    pure_instructions: &PureInstructions<'s>,
 ) -> (RegisterAliasMap, bool) {
     let mut unreferenced = (0..impure_registers.len()).collect::<HashSet<_>>();
 
     for x in pure_instructions.iter() {
-        x.0.enumerate_ref_registers(|r| {
+        x.inst.enumerate_ref_registers(|r| {
             if let RegisterRef::Impure(n) = r {
                 unreferenced.remove(&n);
             }
@@ -378,23 +373,23 @@ pub enum LocalMemoryIdentifier<'a, 's> {
 
 pub fn collect_block_local_memory_stores<'a, 's>(
     blocks: &[Block],
-    impure_instructions: &ImpureInstructionMap<'a, 's>,
-    pure_instructions: &PureInstructions<'a, 's>,
+    impure_instructions: &ImpureInstructionMap,
+    pure_instructions: &PureInstructions<'s>,
+    constants: &Constants<'a, 's>,
 ) -> HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)> {
     let mut collect = HashMap::new();
 
     for (n, b) in blocks.iter().enumerate() {
         match b.flow {
-            BlockFlowInstruction::Goto(_) => (),
             BlockFlowInstruction::StoreRef {
-                ptr: RegisterRef::Pure(r),
+                ptr: RegisterRef::Const(r),
                 value,
                 ..
-            } => match pure_instructions[r].0 {
-                BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+            } => match constants[r].inst {
+                BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                     collect.insert(BlockRef(n), (LocalMemoryIdentifier::Var(scope, vid), value));
                 }
-                BlockInstruction::FunctionInputVarRef(scope, id) => {
+                BlockConstInstruction::FunctionInputVarRef(scope, id) => {
                     collect.insert(
                         BlockRef(n),
                         (LocalMemoryIdentifier::FunArg(scope, id), value),
@@ -402,15 +397,7 @@ pub fn collect_block_local_memory_stores<'a, 's>(
                 }
                 _ => (),
             },
-            BlockFlowInstruction::StoreRef { .. } => (),
-            BlockFlowInstruction::Funcall { .. } => (),
-            BlockFlowInstruction::IntrinsicImpureFuncall { .. } => (),
-            BlockFlowInstruction::Return(_) => (),
-            BlockFlowInstruction::Conditional { .. } => (),
-            BlockFlowInstruction::ConditionalLoop { .. } => (),
-            BlockFlowInstruction::Break => (),
-            BlockFlowInstruction::Continue => (),
-            BlockFlowInstruction::Undetermined => (),
+            _ => (),
         }
     }
 
@@ -424,9 +411,9 @@ pub fn collect_block_local_memory_stores<'a, 's>(
 pub fn propagate_local_memory_stores<'a, 's>(
     blocks: &mut [Block],
     impure_registers: &mut Vec<ConcreteType<'s>>,
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-    pure_instructions: &PureInstructions<'a, 's>,
-    constants: &Constants<'s>,
+    impure_instructions: &mut ImpureInstructionMap,
+    pure_instructions: &PureInstructions<'s>,
+    constants: &Constants<'a, 's>,
     block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
 ) -> HashMap<BlockRef, HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>> {
     struct BlockMetadata<'a, 's> {
@@ -436,9 +423,9 @@ pub fn propagate_local_memory_stores<'a, 's>(
     fn process<'a, 's>(
         blocks: &mut [Block],
         impure_registers: &mut Vec<ConcreteType<'s>>,
-        impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-        pure_instructions: &PureInstructions<'a, 's>,
-        constants: &Constants<'s>,
+        impure_instructions: &mut ImpureInstructionMap,
+        pure_instructions: &PureInstructions<'s>,
+        constants: &Constants<'a, 's>,
         block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
         processing: BlockRef,
         incoming: BlockRef,
@@ -464,8 +451,8 @@ pub fn propagate_local_memory_stores<'a, 's>(
 
                 for (k, v) in incoming_stores {
                     let ty = match v {
-                        RegisterRef::Const(n) => constants[n].ty(),
-                        RegisterRef::Pure(n) => pure_instructions[n].1.clone(),
+                        RegisterRef::Const(n) => constants[n].ty.clone(),
+                        RegisterRef::Pure(n) => pure_instructions[n].ty.clone(),
                         RegisterRef::Impure(n) => impure_registers[n].clone(),
                     };
 
@@ -508,8 +495,8 @@ pub fn propagate_local_memory_stores<'a, 's>(
 
                 for (k, v) in incoming_stores {
                     let ty = match v {
-                        RegisterRef::Const(n) => constants[n].ty(),
-                        RegisterRef::Pure(n) => pure_instructions[n].1.clone(),
+                        RegisterRef::Const(n) => constants[n].ty.clone(),
+                        RegisterRef::Pure(n) => pure_instructions[n].ty.clone(),
                         RegisterRef::Impure(n) => impure_registers[n].clone(),
                     };
 
@@ -888,16 +875,17 @@ pub fn replace_local_memory_load<'a, 's>(
         BlockRef,
         HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>,
     >,
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-    pure_instructions: &PureInstructions<'a, 's>,
+    impure_instructions: &mut ImpureInstructionMap,
+    pure_instructions: &PureInstructions<'s>,
+    constants: &Constants<'a, 's>,
 ) {
     for (bx, b) in blocks.iter().enumerate() {
         let local_memory_register_map = &per_block_local_memory_register_map[&BlockRef(bx)];
 
         for x in b.eval_impure_registers.iter() {
             match impure_instructions[x] {
-                BlockInstruction::LoadRef(RegisterRef::Pure(n)) => match pure_instructions[n].0 {
-                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match constants[n].inst {
+                    BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         if let Some(&r) =
                             local_memory_register_map.get(&LocalMemoryIdentifier::Var(scope, vid))
                         {
@@ -907,13 +895,14 @@ pub fn replace_local_memory_load<'a, 's>(
                                     impure_instructions.insert(*x, impure_instructions[&n].clone());
                                 }
                                 _ => {
-                                    impure_instructions
-                                        .insert(*x, BlockInstruction::RegisterAlias(r));
+                                    todo!("not impure register or evaluated at external block");
+                                    // impure_instructions
+                                    //     .insert(*x, BlockPureInstruction::RegisterAlias(r));
                                 }
                             }
                         }
                     }
-                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                    BlockConstInstruction::FunctionInputVarRef(scope, id) => {
                         if let Some(&r) =
                             local_memory_register_map.get(&LocalMemoryIdentifier::FunArg(scope, id))
                         {
@@ -923,8 +912,9 @@ pub fn replace_local_memory_load<'a, 's>(
                                     impure_instructions.insert(*x, impure_instructions[&n].clone());
                                 }
                                 _ => {
-                                    impure_instructions
-                                        .insert(*x, BlockInstruction::RegisterAlias(r));
+                                    todo!("not impure register or evaluated at external block");
+                                    // impure_instructions
+                                    //     .insert(*x, BlockPureInstruction::RegisterAlias(r));
                                 }
                             }
                         }
@@ -942,18 +932,18 @@ pub fn replace_local_memory_load<'a, 's>(
 /// 本当はRead after WriteじゃないStore命令（つまりStore -> Storeが連続しているもの）も消したいが、フローを含めて正しくRead after Writeを検出するのが難しそうなので一旦諦める
 pub fn strip_never_load_local_memory_stores<'a, 's>(
     blocks: &mut [Block],
-    impure_instructions: &ImpureInstructionMap<'a, 's>,
-    pure_instructions: &PureInstructions<'a, 's>,
+    impure_instructions: &ImpureInstructionMap,
+    constants: &Constants<'a, 's>,
 ) -> bool {
     let mut loaded_local_memories = HashSet::new();
     for b in blocks.iter() {
         for x in b.eval_impure_registers.iter() {
             match impure_instructions[x] {
-                BlockInstruction::LoadRef(RegisterRef::Pure(n)) => match pure_instructions[n].0 {
-                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match constants[n].inst {
+                    BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         loaded_local_memories.insert(LocalMemoryIdentifier::Var(scope, vid));
                     }
-                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                    BlockConstInstruction::FunctionInputVarRef(scope, id) => {
                         loaded_local_memories.insert(LocalMemoryIdentifier::FunArg(scope, id));
                     }
                     _ => (),
@@ -967,15 +957,15 @@ pub fn strip_never_load_local_memory_stores<'a, 's>(
     for b in blocks.iter_mut() {
         match b.flow {
             BlockFlowInstruction::StoreRef {
-                ptr: RegisterRef::Pure(n),
+                ptr: RegisterRef::Const(n),
                 after,
                 ..
             } => {
-                let loaded = match pure_instructions[n].0 {
-                    BlockInstruction::ScopeLocalVarRef(scope, vid) => {
+                let loaded = match constants[n].inst {
+                    BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         loaded_local_memories.contains(&LocalMemoryIdentifier::Var(scope, vid))
                     }
-                    BlockInstruction::FunctionInputVarRef(scope, id) => {
+                    BlockConstInstruction::FunctionInputVarRef(scope, id) => {
                         loaded_local_memories.contains(&LocalMemoryIdentifier::FunArg(scope, id))
                     }
                     // 上記以外は一旦保守的にLoadあるものとして判定
@@ -999,11 +989,11 @@ pub fn strip_never_load_local_memory_stores<'a, 's>(
 }
 
 /// 解決先レジスタがすべて同じなphi命令をエイリアスに置き換える
-pub fn deconstruct_effectless_phi<'a, 's>(
+pub fn deconstruct_effectless_phi<'s>(
     blocks: &mut [Block],
     impure_registers: &[ConcreteType<'s>],
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-    pure_instructions: &mut PureInstructions<'a, 's>,
+    impure_instructions: &mut ImpureInstructionMap,
+    pure_instructions: &mut PureInstructions<'s>,
 ) -> RegisterAliasMap {
     let mut register_alias_map = HashMap::new();
 
@@ -1025,7 +1015,7 @@ pub fn deconstruct_effectless_phi<'a, 's>(
                 if let &[r1] = &unique_registers[..] {
                     // 唯一にunifyできた
                     pure_instructions.push(
-                        BlockInstruction::RegisterAlias(r1).typed(impure_registers[r].clone()),
+                        BlockPureInstruction::RegisterAlias(r1).typed(impure_registers[r].clone()),
                     );
                     register_alias_map.insert(
                         RegisterRef::Impure(r),
@@ -1047,13 +1037,13 @@ pub fn deconstruct_effectless_phi<'a, 's>(
     register_alias_map
 }
 
-/// エントロピーが小さい方（Impure>Pure>Constで、レジスタ番号が小さい方）へのレジスタエイリアスを計算する
+/// レジスタエイリアス命令を抽出する
 pub fn collect_register_aliases(pure_instructions: &PureInstructions) -> RegisterAliasMap {
     pure_instructions
         .iter()
         .enumerate()
-        .filter_map(|(from, x)| match x.0 {
-            BlockInstruction::RegisterAlias(to) => Some((RegisterRef::Pure(from), to)),
+        .filter_map(|(from, x)| match x.inst {
+            BlockPureInstruction::RegisterAlias(to) => Some((RegisterRef::Pure(from), to)),
             _ => None,
         })
         .collect()

@@ -8,7 +8,7 @@ use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
-        BlockGenerationContext, BlockInstruction, BlockInstructionEmissionContext, BlockRef,
+        BlockGenerationContext, BlockInstructionEmissionContext, BlockPureInstruction, BlockRef,
         Constants, ImpureInstructionMap, PureInstructions, RegisterRef,
     },
     expr::simplify_expression,
@@ -483,6 +483,7 @@ fn main() {
                     &block_generation_context.blocks,
                     &block_instruction_emission_context.impure_instructions,
                     &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.constants,
                 );
                 let per_block_local_mem_current_register_map = propagate_local_memory_stores(
                     &mut block_generation_context.blocks,
@@ -517,11 +518,12 @@ fn main() {
                         match v {
                             &RegisterRef::Const(n) => block_instruction_emission_context.constants
                                 [n]
+                                .inst
                                 .dump(&mut o)
                                 .unwrap(),
                             &RegisterRef::Pure(n) => block_instruction_emission_context
                                 .pure_instructions[n]
-                                .0
+                                .inst
                                 .dump(&mut o)
                                 .unwrap(),
                             &RegisterRef::Impure(n) => block_instruction_emission_context
@@ -539,6 +541,7 @@ fn main() {
                     &per_block_local_mem_current_register_map,
                     &mut block_instruction_emission_context.impure_instructions,
                     &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.constants,
                 );
                 perform_log(
                     &f.fname_token,
@@ -555,7 +558,7 @@ fn main() {
                 let modified = strip_never_load_local_memory_stores(
                     &mut block_generation_context.blocks,
                     &block_instruction_emission_context.impure_instructions,
-                    &block_instruction_emission_context.pure_instructions,
+                    &block_instruction_emission_context.constants,
                 );
                 perform_log(
                     &f.fname_token,

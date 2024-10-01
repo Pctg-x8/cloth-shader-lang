@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use block::{
-    Block, BlockConstInstruction, BlockInstruction, ImpureInstructionMap, PureInstructions,
-    RegisterRef,
+    Block, BlockConstInstruction, BlockPureInstruction, Constants, ImpureInstructionMap,
+    PureInstructions, RegisterRef,
 };
 use expr::ConstModifiers;
 
@@ -162,8 +162,8 @@ impl<'s> ConstFloatLiteral<'s> {
 pub struct FunctionBody<'a, 's> {
     pub symbol_scope: &'a SymbolScope<'a, 's>,
     pub impure_registers: Vec<ConcreteType<'s>>,
-    pub constants: Vec<BlockConstInstruction<'s>>,
-    pub pure_instructions: PureInstructions<'a, 's>,
-    pub impure_instructions: ImpureInstructionMap<'a, 's>,
+    pub constants: Constants<'a, 's>,
+    pub pure_instructions: PureInstructions<'s>,
+    pub impure_instructions: ImpureInstructionMap,
     pub blocks: Vec<Block>,
 }

@@ -505,6 +505,10 @@ impl<'a, 's> SymbolScope<'a, 's> {
             self.parent.and_then(Self::nearest_function_scope)
         }
     }
+
+    pub fn function_input_type(&self, id: usize) -> Option<&ConcreteType<'s>> {
+        self.function_input_vars.get(id).map(|x| &x.ty)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
