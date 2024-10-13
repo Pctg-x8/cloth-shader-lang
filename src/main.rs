@@ -602,6 +602,50 @@ fn main() {
                     }
                 }
 
+                // cleanup
+                loop {
+                    let modified = strip_unreferenced_impure_instructions(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedImpureInst(Final)",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+                loop {
+                    let modified = strip_unreferenced_pure_instructions(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedPureInst(Final)",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+                loop {
+                    let modified = strip_unreferenced_const(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedConst(Final)",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+
                 // let block_incomings = collect_block_incomings(&block_generation_context.blocks);
                 // let block_local_memory_stores = collect_block_local_memory_stores(
                 //     &block_generation_context.blocks,
