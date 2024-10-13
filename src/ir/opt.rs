@@ -1130,6 +1130,122 @@ pub fn resolve_intrinsic_funcalls(prg: &mut BlockifiedProgram) -> bool {
     modified
 }
 
+/// Load (SwizzleRef)を元refのLoad + Swizzleに分解する
+pub fn unref_swizzle_ref_loads<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> bool {
+    let mut register_alias_map = HashMap::new();
+
+    'flp: for bx in 0..prg.blocks.len() {
+        let (r, src, indices, r_ty) = 'find: {
+            for r in prg.blocks[bx].eval_impure_registers.iter() {
+                match prg.impure_instructions.get(r) {
+                    Some(&BlockInstruction::LoadRef(RegisterRef::Pure(rload))) => {
+                        match prg.pure_instructions[rload].inst {
+                            BlockPureInstruction::SwizzleRef(src, ref indices) => {
+                                break 'find (
+                                    *r,
+                                    src,
+                                    indices.clone(),
+                                    prg.impure_registers[*r].clone(),
+                                );
+                            }
+                            _ => (),
+                        }
+                    }
+                    _ => (),
+                }
+            }
+
+            continue 'flp;
+        };
+
+        let src_value_ty = match src {
+            RegisterRef::Const(src) => prg.constants[src]
+                .ty
+                .as_dereferenced()
+                .expect("cannot dereference source of SwizzleRef")
+                .clone(),
+            RegisterRef::Pure(src) => prg.pure_instructions[src]
+                .ty
+                .as_dereferenced()
+                .expect("cannot dereference source of SwizzleRef")
+                .clone(),
+            RegisterRef::Impure(_) => unreachable!("SwizzleRef applied for impure source?"),
+        };
+        let src_value_reg =
+            prg.add_impure_instruction(BlockInstruction::LoadRef(src).typed(src_value_ty));
+        let swizzled_reg = prg.add_pure_instruction(
+            BlockPureInstruction::Swizzle(src_value_reg, indices.clone()).typed(r_ty),
+        );
+
+        prg.blocks[bx]
+            .eval_impure_registers
+            .insert(src_value_reg.as_id());
+        prg.blocks[bx].eval_impure_registers.remove(&r);
+        register_alias_map.insert(RegisterRef::Impure(r), swizzled_reg);
+    }
+
+    prg.apply_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
+}
+
+/// SwizzleRefへのStoreをSwizzleRefを使わない形に変形する
+pub fn transform_swizzle_component_store(prg: &mut BlockifiedProgram) -> bool {
+    let mut modified = false;
+
+    for bx in 0..prg.blocks.len() {
+        match prg.blocks[bx].flow {
+            BlockFlowInstruction::StoreRef {
+                ptr: RegisterRef::Pure(ptr),
+                value,
+                after,
+            } => {
+                let (source, index) =
+                    match prg.pure_instructions[ptr].inst {
+                        BlockPureInstruction::SwizzleRef(
+                            RegisterRef::Const(source),
+                            ref indices,
+                        ) if indices.len() == 1 => (RegisterRef::Const(source), indices[0]),
+                        BlockPureInstruction::SwizzleRef(
+                            RegisterRef::Pure(source),
+                            ref indices,
+                        ) if indices.len() == 1 => (RegisterRef::Pure(source), indices[0]),
+                        _ => {
+                            continue;
+                        }
+                    };
+
+                let source_value_ty = source
+                    .ty(prg)
+                    .as_dereferenced()
+                    .expect("cannot dereference swizzleRef source?")
+                    .clone();
+                let src_value_reg = prg.add_evaluated_impure_instruction(
+                    BlockInstruction::LoadRef(source).typed(source_value_ty.clone()),
+                    BlockRef(bx),
+                );
+                let inserted_value_reg = prg.add_pure_instruction(
+                    BlockPureInstruction::CompositeInsert {
+                        value,
+                        source: src_value_reg,
+                        index,
+                    }
+                    .typed(source_value_ty),
+                );
+
+                prg.blocks[bx].flow = BlockFlowInstruction::StoreRef {
+                    ptr: source,
+                    value: inserted_value_reg,
+                    after,
+                };
+                modified = true;
+            }
+            _ => (),
+        }
+    }
+
+    modified
+}
+
 /*
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -2941,72 +3057,6 @@ pub fn apply_local_var_states<'a, 's>(
     modified
 }
 
-pub fn transform_swizzle_component_store<'a, 's>(
-    blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-    pure_instructions: &mut PureInstructionMap<'a, 's>,
-    registers: &mut Vec<ConcreteType<'s>>,
-    pure_registers: &mut Vec<ConcreteType<'s>>,
-) -> bool {
-    let mut modified = false;
-
-    for b in blocks {
-        match b.flow {
-            BlockFlowInstruction::StoreRef {
-                ptr: RegisterRef::Pure(ptr),
-                value,
-                after,
-            } => {
-                // TODO: 一旦同ブロック内のアサインだけで判定する（ほかブロックまで含めるとブロックフローとか考えないといけないので大変）
-                let Some((source, index)) = (match pure_instructions[&ptr] {
-                    BlockInstruction::SwizzleRef(RegisterRef::Pure(source), ref indices)
-                        if indices.len() == 1 =>
-                    {
-                        Some((source, indices[0]))
-                    }
-                    _ => None,
-                }) else {
-                    continue;
-                };
-
-                let source_value_ty = pure_registers[source]
-                    .as_dereferenced()
-                    .expect("cannot dereference swizzleRef source?")
-                    .clone();
-                registers.push(source_value_ty.clone());
-                let source_value_register = registers.len() - 1;
-                impure_instructions.insert(
-                    source_value_register,
-                    BlockInstruction::LoadRef(RegisterRef::Pure(source)),
-                );
-                b.eval_impure_registers
-                    .insert(RegisterRef::Impure(source_value_register));
-                pure_registers.push(source_value_ty.clone());
-                let source_updated_register = pure_registers.len() - 1;
-                pure_instructions.insert(
-                    source_updated_register,
-                    BlockInstruction::CompositeInsert {
-                        value,
-                        source: RegisterRef::Impure(source_value_register),
-                        index,
-                    },
-                );
-
-                // TODO: ここでptr変えたらローカル変数のtrackもやり直しなのでなんか考える必要がある
-                b.flow = BlockFlowInstruction::StoreRef {
-                    ptr: RegisterRef::Pure(source),
-                    value: RegisterRef::Pure(source_updated_register),
-                    after,
-                };
-                modified = true;
-            }
-            _ => (),
-        }
-    }
-
-    modified
-}
-
 pub fn track_scope_local_var_aliases<'a, 's>(
     blocks: &[Block],
     mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
@@ -3228,63 +3278,6 @@ pub fn strip_write_only_local_memory<'a, 's>(
     }
 
     modified
-}
-
-/// Load + SwizzleRefをSwizzle + 元refのLoadに分解する
-pub fn unref_swizzle_ref_loads<'a, 's>(
-    blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap<'a, 's>,
-    pure_instructions: &mut PureInstructionMap<'a, 's>,
-    constants: &Constants<'s>,
-    impure_registers: &mut Vec<ConcreteType<'s>>,
-    pure_registers: &mut Vec<ConcreteType<'s>>,
-) -> RegisterAliasMap {
-    let mut register_alias_map = HashMap::new();
-
-    'flp: for b in blocks.iter_mut() {
-        let (r, src, indices) = 'find: {
-            for r in b.eval_impure_registers.iter() {
-                match impure_instructions.get(r) {
-                    Some(BlockInstruction::LoadRef(RegisterRef::Pure(rload))) => {
-                        match pure_instructions[&rload] {
-                            BlockInstruction::SwizzleRef(src, ref indices) => {
-                                break 'find (*r, src, indices.clone());
-                            }
-                            _ => (),
-                        }
-                    }
-                    _ => (),
-                }
-            }
-
-            continue 'flp;
-        };
-
-        impure_registers.push(match src {
-            RegisterRef::Const(src) => constants[src]
-                .ty()
-                .as_dereferenced()
-                .expect("cannot dereference source of SwizzleRef")
-                .clone(),
-            RegisterRef::Pure(src) => pure_registers[src]
-                .as_dereferenced()
-                .expect("cannot dereference source of SwizzleRef")
-                .clone(),
-            RegisterRef::Impure(_) => unreachable!("SwizzleRef applied for impure source?"),
-        });
-        let src_value_reg = impure_registers.len() - 1;
-        impure_instructions.insert(src_value_reg, BlockInstruction::LoadRef(src));
-        pure_instructions.insert(
-            r,
-            BlockInstruction::Swizzle(RegisterRef::Impure(src_value_reg), indices.clone()),
-        );
-
-        b.eval_impure_registers.insert(src_value_reg);
-        b.eval_impure_registers.remove(&r);
-        register_alias_map.insert(RegisterRef::Impure(r), RegisterRef::Pure(r));
-    }
-
-    register_alias_map
 }
 
 fn flatten_composite_outputs_rec<'a, 's>(

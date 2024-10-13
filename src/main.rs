@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::Parser;
+use codegen::entrypoint::ShaderEntryPointDescription;
 use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
 use ir::{
     block::{
@@ -18,7 +19,8 @@ use ir::{
         propagate_local_memory_stores, rechain_blocks, replace_local_memory_load,
         resolve_intrinsic_funcalls, strip_never_load_local_memory_stores, strip_unreferenced_const,
         strip_unreferenced_impure_instructions, strip_unreferenced_pure_instructions,
-        unify_constants, unify_pure_instructions, unify_same_block_load_instructions,
+        transform_swizzle_component_store, unify_constants, unify_pure_instructions,
+        unify_same_block_load_instructions, unref_swizzle_ref_loads,
     },
     FunctionBody,
 };
@@ -382,6 +384,62 @@ fn main() {
                     );
                 }
 
+                // swizzle ref normalization
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    let modified = unref_swizzle_ref_loads(&mut prg);
+                    needs_reopt = needs_reopt || modified;
+                    perform_log(
+                        &f.fname_token,
+                        "UnrefSwizzleRefLoads",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    let modified = transform_swizzle_component_store(&mut prg);
+                    needs_reopt = needs_reopt || modified;
+                    perform_log(
+                        &f.fname_token,
+                        "TransformSwizzleComponentStore",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    loop {
+                        let modified = strip_unreferenced_pure_instructions(&mut prg);
+                        perform_log(
+                            &f.fname_token,
+                            "StripUnreferencedPureInst",
+                            modified,
+                            &mut last_ir_document,
+                            &prg,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+
+                    loop {
+                        let modified = strip_unreferenced_impure_instructions(&mut prg);
+                        perform_log(
+                            &f.fname_token,
+                            "StripUnreferencedImpureInst",
+                            modified,
+                            &mut last_ir_document,
+                            &prg,
+                        );
+
+                        if !modified {
+                            break;
+                        }
+                    }
+                }
+
                 let block_local_memory_stores = collect_block_local_memory_stores(&prg);
                 let per_block_local_mem_current_register_map =
                     propagate_local_memory_stores(&mut prg, &block_local_memory_stores);
@@ -478,36 +536,6 @@ fn main() {
                     &mut last_ir_document,
                     &prg,
                 );
-
-                loop {
-                    let modified = strip_unreferenced_pure_instructions(&mut prg);
-                    perform_log(
-                        &f.fname_token,
-                        "StripUnreferencedPureInst",
-                        modified,
-                        &mut last_ir_document,
-                        &prg,
-                    );
-
-                    if !modified {
-                        break;
-                    }
-                }
-
-                loop {
-                    let modified = strip_unreferenced_impure_instructions(&mut prg);
-                    perform_log(
-                        &f.fname_token,
-                        "StripUnreferencedImpureInst",
-                        modified,
-                        &mut last_ir_document,
-                        &prg,
-                    );
-
-                    if !modified {
-                        break;
-                    }
-                }
 
                 println!("PreMergeSimpleGotoBlocks({}):", f.fname_token.slice);
                 let mut o = std::io::stdout().lock();
@@ -1130,47 +1158,46 @@ fn main() {
         }
     }
 
-    // let entry_points = top_scope
-    //     .iter_user_defined_function_symbols()
-    //     .filter_map(|f| {
-    //         if !f.attribute.module_entry_point {
-    //             return None;
-    //         }
+    let entry_points = top_scope
+        .iter_user_defined_function_symbols()
+        .filter_map(|f| {
+            if !f.attribute.module_entry_point {
+                return None;
+            }
 
-    //         // Some(ShaderEntryPointDescription::extract(f, &top_scope))
-    //         None
-    //     })
-    //     .collect::<Vec<_>>();
+            Some(ShaderEntryPointDescription::extract(f, &top_scope))
+        })
+        .collect::<Vec<_>>();
 
-    // struct OptimizedShaderEntryPoint<'s> {
-    //     pub info: ShaderEntryPointDescription<'s>,
-    //     pub ir2: ir2::Function<'s>,
-    // }
+    struct OptimizedShaderEntryPoint<'s> {
+        pub info: ShaderEntryPointDescription<'s>,
+        // pub ir2: ir2::Function<'s>,
+    }
 
-    // let optimized_entry_points = entry_points
-    //     .into_iter()
-    //     .map(|ep| {
-    //         let sym = top_scope.user_defined_function_symbol(ep.name).unwrap();
-    //         let body = top_scope
-    //             .user_defined_function_body(ep.name)
-    //             .expect("cannot emit entry point without body");
-    //         optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
-    //         let ir2 = ir2::reconstruct(
-    //             &body.borrow().blocks,
-    //             &body.borrow().instructions,
-    //             &body.borrow().registers,
-    //             &body.borrow().constants,
-    //         );
+    let optimized_entry_points = entry_points
+        .into_iter()
+        .map(|ep| {
+            let sym = top_scope.user_defined_function_symbol(ep.name).unwrap();
+            let body = top_scope
+                .user_defined_function_body(ep.name)
+                .expect("cannot emit entry point without body");
+            optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
+            // let ir2 = ir2::reconstruct(
+            //     &body.borrow().blocks,
+            //     &body.borrow().instructions,
+            //     &body.borrow().registers,
+            //     &body.borrow().constants,
+            // );
 
-    //         println!("IR2({}):", ep.name);
-    //         let mut o = std::io::stdout().lock();
-    //         ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
-    //         o.flush().unwrap();
-    //         drop(o);
+            // println!("IR2({}):", ep.name);
+            // let mut o = std::io::stdout().lock();
+            // ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
+            // o.flush().unwrap();
+            // drop(o);
 
-    //         OptimizedShaderEntryPoint { info: ep, ir2 }
-    //     })
-    //     .collect::<Vec<_>>();
+            OptimizedShaderEntryPoint { info: ep }
+        })
+        .collect::<Vec<_>>();
 
     // let mut spv_context = SpvModuleEmissionContext::new();
     // spv_context
@@ -1297,6 +1324,44 @@ fn build_ir_document(prg: &BlockifiedProgram) -> String {
     unsafe { String::from_utf8_unchecked(sink) }
 }
 
+fn optimize<'a, 's>(
+    ep: &ShaderEntryPointDescription,
+    f: &UserDefinedFunctionSymbol<'s>,
+    body: &mut FunctionBody<'a, 's>,
+    scope_arena: &'a Arena<SymbolScope<'a, 's>>,
+) {
+    let mut last_ir_document = build_ir_document(&body.program);
+    fn perform_log(
+        f: &UserDefinedFunctionSymbol,
+        step_name: &str,
+        modified: bool,
+        last_irdoc: &mut String,
+        body: &FunctionBody,
+    ) {
+        print_step_header(&f.name(), step_name, modified);
+
+        if modified {
+            let new_irdoc = build_ir_document(&body.program);
+
+            let mut o = std::io::stdout().lock();
+            let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
+            for c in diff.iter_all_changes() {
+                let sign = match c.tag() {
+                    similar::ChangeTag::Equal => " ",
+                    similar::ChangeTag::Insert => "+",
+                    similar::ChangeTag::Delete => "-",
+                };
+
+                write!(o, "{sign} {c}").unwrap();
+            }
+            o.flush().unwrap();
+            drop(o);
+
+            *last_irdoc = new_irdoc;
+        }
+    }
+}
+
 // fn optimize<'a, 's>(
 //     ep: &ShaderEntryPointDescription,
 //     f: &UserDefinedFunctionSymbol<'s>,
@@ -1315,47 +1380,6 @@ fn build_ir_document(prg: &BlockifiedProgram) -> String {
 //                 .map(|v| (&v.original_refpath, &v.decorations)),
 //         )
 //         .collect::<HashMap<_, _>>();
-
-//     let mut last_ir_document = build_ir_document(
-//         &body.registers,
-//         &body.constants,
-//         &body.blocks,
-//         &body.instructions,
-//     );
-//     fn perform_log(
-//         f: &UserDefinedFunctionSymbol,
-//         step_name: &str,
-//         modified: bool,
-//         last_irdoc: &mut String,
-//         body: &FunctionBody,
-//     ) {
-//         print_step_header(&f.name(), step_name, modified);
-
-//         if modified {
-//             let new_irdoc = build_ir_document(
-//                 &body.registers,
-//                 &body.constants,
-//                 &body.blocks,
-//                 &body.instructions,
-//             );
-
-//             let mut o = std::io::stdout().lock();
-//             let diff = similar::TextDiff::from_lines(last_irdoc, &new_irdoc);
-//             for c in diff.iter_all_changes() {
-//                 let sign = match c.tag() {
-//                     similar::ChangeTag::Equal => " ",
-//                     similar::ChangeTag::Insert => "+",
-//                     similar::ChangeTag::Delete => "-",
-//                 };
-
-//                 write!(o, "{sign} {c}").unwrap();
-//             }
-//             o.flush().unwrap();
-//             drop(o);
-
-//             *last_irdoc = new_irdoc;
-//         }
-//     }
 
 //     loop {
 //         let modified = inline_function2(

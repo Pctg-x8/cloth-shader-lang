@@ -1,11 +1,6 @@
-use std::collections::HashMap;
+use block::BlockifiedProgram;
 
-use block::{
-    Block, BlockConstInstruction, BlockPureInstruction, BlockifiedProgram, Constants,
-    ImpureInstructionMap, PureInstructions, RegisterRef,
-};
-
-use crate::{concrete_type::ConcreteType, scope::SymbolScope, source_ref::SourceRefSliceEq};
+use crate::{scope::SymbolScope, source_ref::SourceRefSliceEq};
 
 pub mod block;
 pub mod expr;

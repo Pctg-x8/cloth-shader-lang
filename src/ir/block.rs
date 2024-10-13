@@ -90,6 +90,13 @@ impl RegisterRef {
             (Self::Impure(a), Self::Impure(b)) => a.cmp(b),
         }
     }
+
+    #[inline]
+    pub const fn as_id(self) -> usize {
+        match self {
+            Self::Const(x) | Self::Pure(x) | Self::Impure(x) => x,
+        }
+    }
 }
 impl core::fmt::Display for RegisterRef {
     #[inline]
@@ -1848,6 +1855,40 @@ impl<'a, 's> BlockifiedProgram<'a, 's> {
         dump_blocks(writer, &self.blocks, &self.impure_instructions)?;
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn add_evaluated_impure_instruction(
+        &mut self,
+        impure_instruction: TypedBlockInstruction<'s>,
+        eval_at: BlockRef,
+    ) -> RegisterRef {
+        let r = self.add_impure_instruction(impure_instruction);
+        self.blocks[eval_at.0]
+            .eval_impure_registers
+            .insert(r.as_id());
+
+        r
+    }
+
+    pub fn add_impure_instruction(
+        &mut self,
+        impure_instruction: TypedBlockInstruction<'s>,
+    ) -> RegisterRef {
+        self.impure_registers.push(impure_instruction.ty);
+        self.impure_instructions
+            .insert(self.impure_registers.len() - 1, impure_instruction.inst);
+
+        RegisterRef::Impure(self.impure_registers.len() - 1)
+    }
+
+    pub fn add_pure_instruction(
+        &mut self,
+        pure_instruction: TypedBlockPureInstruction<'s>,
+    ) -> RegisterRef {
+        self.pure_instructions.push(pure_instruction);
+
+        RegisterRef::Pure(self.pure_instructions.len() - 1)
     }
 
     pub fn apply_parallel_register_alias(&mut self, alias_map: &RegisterAliasMap) {
