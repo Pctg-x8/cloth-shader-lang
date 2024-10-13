@@ -4,31 +4,30 @@ use crate::{
     concrete_type::{ConcreteType, IntrinsicType},
     ir::{
         block::{
-            Block, BlockConstInstruction, BlockPureInstruction, Constants, ImpureInstructionMap,
-            IntrinsicBinaryOperation, PureInstructions, RegisterAliasMap, RegisterRef,
+            Block, BlockConstInstruction, BlockPureInstruction, BlockifiedProgram, Constants,
+            ImpureInstructionMap, IntrinsicBinaryOperation, PureInstructions, RegisterAliasMap,
+            RegisterRef,
         },
         ConstFloatLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral, LosslessConst,
     },
 };
 
 /// 定数のInstantiateIntrinsicTypeClassを演算して定数化する
-pub fn promote_instantiate_const<'a, 's>(
-    pure_instructions: &mut PureInstructions<'s>,
-    constants: &mut Constants<'a, 's>,
-) -> RegisterAliasMap {
+pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> RegisterAliasMap {
     let mut register_alias_map = HashMap::new();
     let mut pure_instruction_register_shifts = 0;
 
+    let new_pure_instruction_count = prg.pure_instructions.len();
     for (n, x) in core::mem::replace(
-        pure_instructions,
-        Vec::with_capacity(pure_instructions.len()),
+        &mut prg.pure_instructions,
+        Vec::with_capacity(new_pure_instruction_count),
     )
     .into_iter()
     .enumerate()
     {
         let promoted = match x.inst {
             BlockPureInstruction::InstantiateIntrinsicTypeClass(RegisterRef::Const(src), ty) => {
-                match constants[src].inst {
+                match prg.constants[src].inst {
                     BlockConstInstruction::LitInt(ref l) => match ty {
                         IntrinsicType::UInt => Some(
                             BlockConstInstruction::LitUInt(ConstUIntLiteral(l.0.clone(), l.1))
@@ -70,7 +69,7 @@ pub fn promote_instantiate_const<'a, 's>(
                 }
             }
             BlockPureInstruction::PromoteIntToNumber(RegisterRef::Const(value)) => {
-                match constants[value].inst {
+                match prg.constants[value].inst {
                     BlockConstInstruction::LitInt(ref l) => Some(
                         BlockConstInstruction::LitNum(ConstNumberLiteral(l.0.clone(), l.1))
                             .typed(ConcreteType::UnknownNumberClass),
@@ -83,15 +82,15 @@ pub fn promote_instantiate_const<'a, 's>(
 
         if let Some(c) = promoted {
             // 定数化した
-            constants.push(c);
+            prg.constants.push(c);
             register_alias_map.insert(
                 RegisterRef::Pure(n),
-                RegisterRef::Const(constants.len() - 1),
+                RegisterRef::Const(prg.constants.len() - 1),
             );
             pure_instruction_register_shifts += 1;
         } else {
             // Pure命令のまま
-            pure_instructions.push(x);
+            prg.pure_instructions.push(x);
             if pure_instruction_register_shifts > 0 {
                 // レジスタシフトが発生している状況
                 register_alias_map.insert(
@@ -105,16 +104,14 @@ pub fn promote_instantiate_const<'a, 's>(
     register_alias_map
 }
 
-pub fn fold_const_ops<'a, 's>(
-    pure_instructions: &mut PureInstructions,
-    constants: &mut Constants,
-) -> RegisterAliasMap {
+pub fn fold_const_ops<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> RegisterAliasMap {
     let mut register_alias_map = HashMap::new();
     let mut pure_register_shifts = 0;
 
+    let new_pure_instruction_count = prg.pure_instructions.len();
     for (n, x) in core::mem::replace(
-        pure_instructions,
-        Vec::with_capacity(pure_instructions.len()),
+        &mut prg.pure_instructions,
+        Vec::with_capacity(new_pure_instruction_count),
     )
     .into_iter()
     .enumerate()
@@ -125,9 +122,9 @@ pub fn fold_const_ops<'a, 's>(
                 op,
                 RegisterRef::Const(right),
             ) => {
-                let Some(left) = constants[left].inst.try_instantiate_lossless_const() else {
+                let Some(left) = prg.constants[left].inst.try_instantiate_lossless_const() else {
                     // 左辺が演算可能な定数じゃない
-                    pure_instructions.push(x);
+                    prg.pure_instructions.push(x);
                     if pure_register_shifts > 0 {
                         // レジスタシフトが発生している状況
                         register_alias_map.insert(
@@ -137,9 +134,9 @@ pub fn fold_const_ops<'a, 's>(
                     }
                     continue;
                 };
-                let Some(right) = constants[right].inst.try_instantiate_lossless_const() else {
+                let Some(right) = prg.constants[right].inst.try_instantiate_lossless_const() else {
                     // 右辺が演算可能な定数じゃない
-                    pure_instructions.push(x);
+                    prg.pure_instructions.push(x);
                     if pure_register_shifts > 0 {
                         // レジスタシフトが発生している状況
                         register_alias_map.insert(
@@ -425,14 +422,14 @@ pub fn fold_const_ops<'a, 's>(
                 };
 
                 if let Some(c) = reduced {
-                    constants.push(c);
+                    prg.constants.push(c);
                     register_alias_map.insert(
                         RegisterRef::Pure(n),
-                        RegisterRef::Const(constants.len() - 1),
+                        RegisterRef::Const(prg.constants.len() - 1),
                     );
                     pure_register_shifts += 1;
                 } else {
-                    pure_instructions.push(x);
+                    prg.pure_instructions.push(x);
                     if pure_register_shifts > 0 {
                         // レジスタシフトが発生している状況
                         register_alias_map.insert(
@@ -443,7 +440,7 @@ pub fn fold_const_ops<'a, 's>(
                 }
             }
             _ => {
-                pure_instructions.push(x);
+                prg.pure_instructions.push(x);
                 if pure_register_shifts > 0 {
                     // レジスタシフトが発生している状況
                     register_alias_map.insert(
@@ -459,10 +456,10 @@ pub fn fold_const_ops<'a, 's>(
 }
 
 /// 同じconstant命令を若い番号のregisterにまとめる
-pub fn unify_constants<'a, 's>(constants: &Constants<'a, 's>) -> RegisterAliasMap {
+pub fn unify_constants<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> RegisterAliasMap {
     let mut const_to_register_map = HashMap::new();
     let mut register_alias_map = HashMap::new();
-    for (r, v) in constants.iter().enumerate() {
+    for (r, v) in prg.constants.iter().enumerate() {
         match const_to_register_map.entry(v) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(r);
@@ -485,29 +482,24 @@ pub fn unify_constants<'a, 's>(constants: &Constants<'a, 's>) -> RegisterAliasMa
 }
 
 /// 使われていないConstレジスタを削除
-pub fn strip_unreferenced_const(
-    constants: &mut Constants,
-    pure_instructions: &PureInstructions,
-    impure_instructions: &ImpureInstructionMap,
-    blocks: &[Block],
-) -> RegisterAliasMap {
-    let mut unreferenced_constants = (0..constants.len()).collect::<HashSet<_>>();
+pub fn strip_unreferenced_const(prg: &mut BlockifiedProgram) -> bool {
+    let mut unreferenced_constants = (0..prg.constants.len()).collect::<HashSet<_>>();
 
-    for x in pure_instructions {
+    for x in prg.pure_instructions.iter() {
         x.inst.enumerate_ref_registers(|r| {
             if let RegisterRef::Const(n) = r {
                 unreferenced_constants.remove(&n);
             }
         });
     }
-    for x in impure_instructions.values() {
+    for x in prg.impure_instructions.values() {
         x.enumerate_ref_registers(|r| {
             if let RegisterRef::Const(n) = r {
                 unreferenced_constants.remove(&n);
             }
         });
     }
-    for b in blocks {
+    for b in prg.blocks.iter() {
         b.flow.enumerate_ref_registers(|r| {
             if let RegisterRef::Const(n) = r {
                 unreferenced_constants.remove(&n);
@@ -521,16 +513,17 @@ pub fn strip_unreferenced_const(
     let mut register_alias_map = HashMap::new();
     for n in unreferenced_constants {
         register_alias_map.insert(
-            RegisterRef::Const(constants.len() - 1),
+            RegisterRef::Const(prg.constants.len() - 1),
             RegisterRef::Const(n),
         );
         println!(
             "[StripConstant] swap remove {} -> {}",
-            constants.len() - 1,
+            prg.constants.len() - 1,
             n
         );
-        constants.swap_remove(n);
+        prg.constants.swap_remove(n);
     }
 
-    register_alias_map
+    prg.apply_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
 }

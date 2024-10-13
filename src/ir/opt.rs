@@ -9,75 +9,16 @@ use crate::{
 pub use self::r#const::*;
 
 use super::block::{
-    Block, BlockConstInstruction, BlockInstruction, BlockPureInstruction, BlockRef, Constants,
-    ImpureInstructionMap, PureInstructions, RegisterAliasMap, RegisterRef,
+    Block, BlockConstInstruction, BlockInstruction, BlockPureInstruction, BlockRef,
+    BlockifiedProgram, Constants, ImpureInstructionMap, PureInstructions, RegisterAliasMap,
+    RegisterRef,
 };
 
-#[inline]
-pub fn apply_parallel_register_alias(
-    blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap,
-    pure_instructions: &mut PureInstructions,
-    alias_map: &RegisterAliasMap,
-) {
-    if alias_map.is_empty() {
-        // レジスタエイリアスなし
-        return;
-    }
-
-    println!("[Register Alias(Parallel)]");
-    let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
-    sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
-    for (from, to) in sorted_alias {
-        println!("  {from:?} -> {to:?}");
-    }
-
-    for x in impure_instructions.values_mut() {
-        x.apply_parallel_register_alias(alias_map);
-    }
-    for x in pure_instructions.iter_mut() {
-        x.apply_parallel_register_alias(alias_map);
-    }
-    for b in blocks.iter_mut() {
-        b.apply_flow_parallel_register_alias(alias_map);
-    }
-}
-
-#[inline]
-pub fn apply_register_alias(
-    blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap,
-    pure_instructions: &mut PureInstructions,
-    alias_map: &RegisterAliasMap,
-) {
-    if alias_map.is_empty() {
-        // レジスタエイリアスなし
-        return;
-    }
-
-    println!("[Register Alias(ResolveChained)]");
-    let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
-    sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
-    for (from, to) in sorted_alias {
-        println!("  {from:?} -> {to:?}");
-    }
-
-    for x in impure_instructions.values_mut() {
-        x.apply_register_alias(alias_map);
-    }
-    for x in pure_instructions.iter_mut() {
-        x.apply_register_alias(alias_map);
-    }
-    for b in blocks.iter_mut() {
-        b.apply_flow_register_alias(alias_map);
-    }
-}
-
 /// 同じPure命令を若い番号のregisterにまとめる
-pub fn unify_pure_instructions<'s>(pure_instructions: &PureInstructions<'s>) -> RegisterAliasMap {
+pub fn unify_pure_instructions(prg: &BlockifiedProgram) -> RegisterAliasMap {
     let mut inst_to_register_map = HashMap::new();
     let mut register_alias_map = HashMap::new();
-    for (r, v) in pure_instructions.iter().enumerate() {
+    for (r, v) in prg.pure_instructions.iter().enumerate() {
         match inst_to_register_map.entry(v) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(r);
@@ -99,94 +40,75 @@ pub fn unify_pure_instructions<'s>(pure_instructions: &PureInstructions<'s>) -> 
     register_alias_map
 }
 
-/// 使われていないPureレジスタを削除
-pub fn strip_unreferenced_pure_instructions(
-    pure_instructions: &mut PureInstructions,
-    impure_instructions: &ImpureInstructionMap,
-    blocks: &[Block],
-) -> RegisterAliasMap {
-    let mut unreferenced = (0..pure_instructions.len()).collect::<HashSet<_>>();
-
-    for x in pure_instructions.iter() {
-        x.inst.enumerate_ref_registers(|r| {
-            if let RegisterRef::Pure(n) = r {
-                unreferenced.remove(&n);
-            }
-        });
-    }
-    for x in impure_instructions.values() {
-        x.enumerate_ref_registers(|r| {
-            if let RegisterRef::Pure(n) = r {
-                unreferenced.remove(&n);
-            }
-        });
-    }
-    for b in blocks {
-        b.flow.enumerate_ref_registers(|r| {
-            if let RegisterRef::Pure(n) = r {
-                unreferenced.remove(&n);
-            }
-        })
-    }
-
-    let mut unreferenced = unreferenced.into_iter().collect::<Vec<_>>();
-    unreferenced.sort_by(|a, b| b.cmp(a));
-    println!("[StripPureInst] Targets: {unreferenced:?}");
+/// 同じブロックにあるLoad命令を若い番号のレジスタにまとめる
+pub fn unify_same_block_load_instructions(prg: &BlockifiedProgram) -> RegisterAliasMap {
     let mut register_alias_map = HashMap::new();
-    for n in unreferenced {
-        register_alias_map.insert(
-            RegisterRef::Pure(pure_instructions.len() - 1),
-            RegisterRef::Pure(n),
-        );
-        println!(
-            "[StripPureInst] swap remove {} -> {}",
-            pure_instructions.len() - 1,
-            n
-        );
-        pure_instructions.swap_remove(n);
+
+    for b in prg.blocks.iter() {
+        let mut load_to_register_map = HashMap::new();
+
+        for r in b.eval_impure_registers.iter().copied() {
+            match prg.impure_instructions[&r] {
+                BlockInstruction::LoadRef(lr) => {
+                    match load_to_register_map.entry(lr) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(r);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let last_occurence = *e.get();
+                            if last_occurence > r {
+                                // 若い番号を優先する
+                                let mapped = e.insert(r);
+                                register_alias_map
+                                    .insert(RegisterRef::Impure(mapped), RegisterRef::Impure(r));
+                            } else {
+                                register_alias_map.insert(
+                                    RegisterRef::Impure(r),
+                                    RegisterRef::Impure(last_occurence),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
     }
 
     register_alias_map
 }
 
+/// 使われていないPureレジスタを削除
+pub fn strip_unreferenced_pure_instructions(prg: &mut BlockifiedProgram) -> bool {
+    let mut unreferenced = prg
+        .collect_unreferenced_pure_registers()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unreferenced.sort_by(|a, b| b.cmp(a));
+    println!("[StripPureInst] Targets: {unreferenced:?}");
+    let mut register_alias_map = HashMap::new();
+    for n in unreferenced {
+        register_alias_map.insert(
+            RegisterRef::Pure(prg.pure_instructions.len() - 1),
+            RegisterRef::Pure(n),
+        );
+        println!(
+            "[StripPureInst] swap remove {} -> {}",
+            prg.pure_instructions.len() - 1,
+            n
+        );
+        prg.pure_instructions.swap_remove(n);
+    }
+
+    prg.apply_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
+}
+
 /// 使われていないImpure命令とレジスタを削除
-pub fn strip_unreferenced_impure_instructions<'a, 's>(
-    blocks: &mut [Block],
-    impure_instructions: &mut ImpureInstructionMap,
-    impure_registers: &mut Vec<ConcreteType<'s>>,
-    pure_instructions: &PureInstructions<'s>,
-) -> (RegisterAliasMap, bool) {
-    let mut unreferenced = (0..impure_registers.len()).collect::<HashSet<_>>();
+pub fn strip_unreferenced_impure_instructions(prg: &mut BlockifiedProgram) -> bool {
+    let unreferenced = prg.collect_unreferenced_impure_registers();
 
-    for x in pure_instructions.iter() {
-        x.inst.enumerate_ref_registers(|r| {
-            if let RegisterRef::Impure(n) = r {
-                unreferenced.remove(&n);
-            }
-        });
-    }
-    for x in impure_instructions.values() {
-        x.enumerate_ref_registers(|r| {
-            if let RegisterRef::Impure(n) = r {
-                unreferenced.remove(&n);
-            }
-        });
-    }
-    for b in blocks.iter() {
-        b.flow.enumerate_ref_registers(|r| {
-            if let RegisterRef::Impure(n) = r {
-                unreferenced.remove(&n);
-            }
-        });
-        // Note: Flowのdestはかならずあるものとする（Impureな関数呼び出しはstripしてはいけない）
-        b.flow.enumerate_dest_register(|r| {
-            if let RegisterRef::Impure(n) = r {
-                unreferenced.remove(&n);
-            }
-        })
-    }
-
-    for b in blocks.iter_mut() {
+    for b in prg.blocks.iter_mut() {
         b.eval_impure_registers
             .retain(|n| !unreferenced.contains(n));
     }
@@ -197,18 +119,18 @@ pub fn strip_unreferenced_impure_instructions<'a, 's>(
     let mut register_alias_map = HashMap::new();
     let mut modified = false;
     for n in unreferenced {
-        let last_register = impure_registers.len() - 1;
+        let last_register = prg.impure_registers.len() - 1;
         if last_register != n {
             // 最後のレジスタではない（入れ替えが発生する）
             register_alias_map.insert(RegisterRef::Impure(last_register), RegisterRef::Impure(n));
             println!("[StripImpureInst] swap remove {last_register} -> {n}");
-            if let Some(last_inst) = impure_instructions.remove(&last_register) {
+            if let Some(last_inst) = prg.impure_instructions.remove(&last_register) {
                 // Note: ない場合がある（BlockFlowInstructionのdestレジスタなど）
-                impure_instructions.insert(n, last_inst);
+                prg.impure_instructions.insert(n, last_inst);
             }
-            impure_registers.swap_remove(n);
+            prg.impure_registers.swap_remove(n);
 
-            for b in blocks.iter_mut() {
+            for b in prg.blocks.iter_mut() {
                 if b.eval_impure_registers.remove(&last_register) {
                     b.eval_impure_registers.insert(n);
                 }
@@ -220,14 +142,15 @@ pub fn strip_unreferenced_impure_instructions<'a, 's>(
             }
         } else {
             println!("[StripImpureInst] last remove {n}");
-            impure_instructions.remove(&n);
-            impure_registers.pop();
+            prg.impure_instructions.remove(&n);
+            prg.impure_registers.pop();
         }
 
         modified = true;
     }
 
-    (register_alias_map, modified)
+    prg.apply_register_alias(&register_alias_map);
+    modified
 }
 
 pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<BlockRef>> {
@@ -372,20 +295,17 @@ pub enum LocalMemoryIdentifier<'a, 's> {
 }
 
 pub fn collect_block_local_memory_stores<'a, 's>(
-    blocks: &[Block],
-    impure_instructions: &ImpureInstructionMap,
-    pure_instructions: &PureInstructions<'s>,
-    constants: &Constants<'a, 's>,
+    prg: &BlockifiedProgram<'a, 's>,
 ) -> HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)> {
     let mut collect = HashMap::new();
 
-    for (n, b) in blocks.iter().enumerate() {
+    for (n, b) in prg.blocks.iter().enumerate() {
         match b.flow {
             BlockFlowInstruction::StoreRef {
                 ptr: RegisterRef::Const(r),
                 value,
                 ..
-            } => match constants[r].inst {
+            } => match prg.constants[r].inst {
                 BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                     collect.insert(BlockRef(n), (LocalMemoryIdentifier::Var(scope, vid), value));
                 }
@@ -409,11 +329,7 @@ pub fn collect_block_local_memory_stores<'a, 's>(
 /// 無駄なphiは後工程で消すので、ここでは一旦何も考えずに個々のブロックですべてのローカルメモリに対してphi命令を生成して唯一のレジスタを割り当てます
 /// （ローカルメモリに紐づくレジスタが途中で変わると後のブロック全てで変える必要があり大変面倒なため）
 pub fn propagate_local_memory_stores<'a, 's>(
-    blocks: &mut [Block],
-    impure_registers: &mut Vec<ConcreteType<'s>>,
-    impure_instructions: &mut ImpureInstructionMap,
-    pure_instructions: &PureInstructions<'s>,
-    constants: &Constants<'a, 's>,
+    prg: &mut BlockifiedProgram<'a, 's>,
     block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
 ) -> HashMap<BlockRef, HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>> {
     struct BlockMetadata<'a, 's> {
@@ -421,11 +337,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
     }
 
     fn process<'a, 's>(
-        blocks: &mut [Block],
-        impure_registers: &mut Vec<ConcreteType<'s>>,
-        impure_instructions: &mut ImpureInstructionMap,
-        pure_instructions: &PureInstructions<'s>,
-        constants: &Constants<'a, 's>,
+        prg: &mut BlockifiedProgram<'a, 's>,
         block_local_memory_stores: &HashMap<BlockRef, (LocalMemoryIdentifier<'a, 's>, RegisterRef)>,
         processing: BlockRef,
         incoming: BlockRef,
@@ -450,22 +362,18 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 let bm = e.get_mut();
 
                 for (k, v) in incoming_stores {
-                    let ty = match v {
-                        RegisterRef::Const(n) => constants[n].ty.clone(),
-                        RegisterRef::Pure(n) => pure_instructions[n].ty.clone(),
-                        RegisterRef::Impure(n) => impure_registers[n].clone(),
-                    };
+                    let ty = v.ty(prg).clone();
 
                     match bm.local_mem_aliased_registers.entry(k.clone()) {
                         std::collections::hash_map::Entry::Vacant(e) => {
                             // 新しいLocalMemStore
-                            impure_registers.push(ty);
-                            let vreg = impure_registers.len() - 1;
-                            impure_instructions.insert(
+                            prg.impure_registers.push(ty);
+                            let vreg = prg.impure_registers.len() - 1;
+                            prg.impure_instructions.insert(
                                 vreg,
                                 BlockInstruction::Phi([(incoming, v)].into_iter().collect()),
                             );
-                            blocks[processing.0].eval_impure_registers.insert(vreg);
+                            prg.blocks[processing.0].eval_impure_registers.insert(vreg);
                             e.insert(RegisterRef::Impure(vreg));
                         }
                         std::collections::hash_map::Entry::Occupied(e) => {
@@ -473,9 +381,9 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             let RegisterRef::Impure(vreg) = e.get() else {
                                 unreachable!("not imported entry");
                             };
-                            assert_eq!(impure_registers[*vreg], ty);
+                            assert_eq!(prg.impure_registers[*vreg], ty);
                             let BlockInstruction::Phi(ref mut incomings) =
-                                impure_instructions.get_mut(&vreg).unwrap()
+                                prg.impure_instructions.get_mut(&vreg).unwrap()
                             else {
                                 unreachable!("not a phi entry");
                             };
@@ -494,22 +402,18 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 });
 
                 for (k, v) in incoming_stores {
-                    let ty = match v {
-                        RegisterRef::Const(n) => constants[n].ty.clone(),
-                        RegisterRef::Pure(n) => pure_instructions[n].ty.clone(),
-                        RegisterRef::Impure(n) => impure_registers[n].clone(),
-                    };
+                    let ty = v.ty(prg).clone();
 
                     match bm.local_mem_aliased_registers.entry(k.clone()) {
                         std::collections::hash_map::Entry::Vacant(e) => {
                             // 新しいLocalMemStore
-                            impure_registers.push(ty);
-                            let vreg = impure_registers.len() - 1;
-                            impure_instructions.insert(
+                            prg.impure_registers.push(ty);
+                            let vreg = prg.impure_registers.len() - 1;
+                            prg.impure_instructions.insert(
                                 vreg,
                                 BlockInstruction::Phi([(incoming, v)].into_iter().collect()),
                             );
-                            blocks[processing.0].eval_impure_registers.insert(vreg);
+                            prg.blocks[processing.0].eval_impure_registers.insert(vreg);
                             e.insert(RegisterRef::Impure(vreg));
                         }
                         std::collections::hash_map::Entry::Occupied(e) => {
@@ -517,9 +421,9 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             let RegisterRef::Impure(vreg) = e.get() else {
                                 unreachable!("not imported entry");
                             };
-                            assert_eq!(impure_registers[*vreg], ty);
+                            assert_eq!(prg.impure_registers[*vreg], ty);
                             let BlockInstruction::Phi(ref mut incomings) =
-                                impure_instructions.get_mut(&vreg).unwrap()
+                                prg.impure_instructions.get_mut(&vreg).unwrap()
                             else {
                                 unreachable!("not a phi entry");
                             };
@@ -529,13 +433,9 @@ pub fn propagate_local_memory_stores<'a, 's>(
                     }
                 }
 
-                match blocks[processing.0].flow {
+                match prg.blocks[processing.0].flow {
                     BlockFlowInstruction::Goto(next) => process(
-                        blocks,
-                        impure_registers,
-                        impure_instructions,
-                        pure_instructions,
-                        constants,
+                        prg,
                         block_local_memory_stores,
                         next,
                         processing,
@@ -545,11 +445,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                     BlockFlowInstruction::StoreRef {
                         after: Some(next), ..
                     } => process(
-                        blocks,
-                        impure_registers,
-                        impure_instructions,
-                        pure_instructions,
-                        constants,
+                        prg,
                         block_local_memory_stores,
                         next,
                         processing,
@@ -561,11 +457,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         after_return: Some(after_return),
                         ..
                     } => process(
-                        blocks,
-                        impure_registers,
-                        impure_instructions,
-                        pure_instructions,
-                        constants,
+                        prg,
                         block_local_memory_stores,
                         after_return,
                         processing,
@@ -579,11 +471,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         after_return: Some(after_return),
                         ..
                     } => process(
-                        blocks,
-                        impure_registers,
-                        impure_instructions,
-                        pure_instructions,
-                        constants,
+                        prg,
                         block_local_memory_stores,
                         after_return,
                         processing,
@@ -597,11 +485,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         r#true, r#false, ..
                     } => {
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             r#true,
                             processing,
@@ -609,11 +493,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             loop_stack,
                         );
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             r#false,
                             processing,
@@ -629,11 +509,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                     } => {
                         loop_stack.push((r#continue, r#break));
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             body,
                             processing,
@@ -642,11 +518,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         );
                         loop_stack.pop();
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             r#break,
                             processing,
@@ -658,11 +530,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         let &(c, _) = loop_stack.last().expect("continue not in a loop");
                         let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             c,
                             processing,
@@ -674,11 +542,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         let &(_, b) = loop_stack.last().expect("break not in a loop");
                         let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
                         process(
-                            blocks,
-                            impure_registers,
-                            impure_instructions,
-                            pure_instructions,
-                            constants,
+                            prg,
                             block_local_memory_stores,
                             b,
                             processing,
@@ -703,13 +567,9 @@ pub fn propagate_local_memory_stores<'a, 's>(
         },
     );
 
-    match blocks[0].flow {
+    match prg.blocks[0].flow {
         BlockFlowInstruction::Goto(next) => process(
-            blocks,
-            impure_registers,
-            impure_instructions,
-            pure_instructions,
-            constants,
+            prg,
             block_local_memory_stores,
             next,
             BlockRef(0),
@@ -719,11 +579,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
         BlockFlowInstruction::StoreRef {
             after: Some(next), ..
         } => process(
-            blocks,
-            impure_registers,
-            impure_instructions,
-            pure_instructions,
-            constants,
+            prg,
             block_local_memory_stores,
             next,
             BlockRef(0),
@@ -735,11 +591,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             after_return: Some(after_return),
             ..
         } => process(
-            blocks,
-            impure_registers,
-            impure_instructions,
-            pure_instructions,
-            constants,
+            prg,
             block_local_memory_stores,
             after_return,
             BlockRef(0),
@@ -753,11 +605,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             after_return: Some(after_return),
             ..
         } => process(
-            blocks,
-            impure_registers,
-            impure_instructions,
-            pure_instructions,
-            constants,
+            prg,
             block_local_memory_stores,
             after_return,
             BlockRef(0),
@@ -771,11 +619,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             r#true, r#false, ..
         } => {
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 r#true,
                 BlockRef(0),
@@ -783,11 +627,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 &mut loop_stack,
             );
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 r#false,
                 BlockRef(0),
@@ -803,11 +643,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
         } => {
             loop_stack.push((r#continue, r#break));
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 body,
                 BlockRef(0),
@@ -816,11 +652,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             );
             loop_stack.pop();
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 r#break,
                 BlockRef(0),
@@ -832,11 +664,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             let &(c, _) = loop_stack.last().expect("continue not in a loop");
             let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 c,
                 BlockRef(0),
@@ -848,11 +676,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             let &(_, b) = loop_stack.last().expect("break not in a loop");
             let mut new_loop_stack = loop_stack[..loop_stack.len() - 1].to_vec();
             process(
-                blocks,
-                impure_registers,
-                impure_instructions,
-                pure_instructions,
-                constants,
+                prg,
                 block_local_memory_stores,
                 b,
                 BlockRef(0),
@@ -870,21 +694,18 @@ pub fn propagate_local_memory_stores<'a, 's>(
 
 /// ローカルメモリのLoadを対応するレジスタへのエイリアスに変える
 pub fn replace_local_memory_load<'a, 's>(
-    blocks: &[Block],
+    prg: &mut BlockifiedProgram<'a, 's>,
     per_block_local_memory_register_map: &HashMap<
         BlockRef,
         HashMap<LocalMemoryIdentifier<'a, 's>, RegisterRef>,
     >,
-    impure_instructions: &mut ImpureInstructionMap,
-    pure_instructions: &PureInstructions<'s>,
-    constants: &Constants<'a, 's>,
 ) {
-    for (bx, b) in blocks.iter().enumerate() {
+    for (bx, b) in prg.blocks.iter().enumerate() {
         let local_memory_register_map = &per_block_local_memory_register_map[&BlockRef(bx)];
 
         for x in b.eval_impure_registers.iter() {
-            match impure_instructions[x] {
-                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match constants[n].inst {
+            match prg.impure_instructions[x] {
+                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match prg.constants[n].inst {
                     BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         if let Some(&r) =
                             local_memory_register_map.get(&LocalMemoryIdentifier::Var(scope, vid))
@@ -892,7 +713,8 @@ pub fn replace_local_memory_load<'a, 's>(
                             match r {
                                 RegisterRef::Impure(n) if b.eval_impure_registers.contains(&n) => {
                                     // Impure（phi）かつ、同ブロック内で評価されるものであれば直接それに変える
-                                    impure_instructions.insert(*x, impure_instructions[&n].clone());
+                                    prg.impure_instructions
+                                        .insert(*x, prg.impure_instructions[&n].clone());
                                 }
                                 _ => {
                                     todo!("not impure register or evaluated at external block");
@@ -909,7 +731,8 @@ pub fn replace_local_memory_load<'a, 's>(
                             match r {
                                 RegisterRef::Impure(n) if b.eval_impure_registers.contains(&n) => {
                                     // Impure（phi）かつ、同ブロック内で評価されるものであれば直接それに変える
-                                    impure_instructions.insert(*x, impure_instructions[&n].clone());
+                                    prg.impure_instructions
+                                        .insert(*x, prg.impure_instructions[&n].clone());
                                 }
                                 _ => {
                                     todo!("not impure register or evaluated at external block");
@@ -930,16 +753,12 @@ pub fn replace_local_memory_load<'a, 's>(
 /// 一つもLoad命令がないローカルメモリのStore命令を削除する
 ///
 /// 本当はRead after WriteじゃないStore命令（つまりStore -> Storeが連続しているもの）も消したいが、フローを含めて正しくRead after Writeを検出するのが難しそうなので一旦諦める
-pub fn strip_never_load_local_memory_stores<'a, 's>(
-    blocks: &mut [Block],
-    impure_instructions: &ImpureInstructionMap,
-    constants: &Constants<'a, 's>,
-) -> bool {
+pub fn strip_never_load_local_memory_stores(prg: &mut BlockifiedProgram) -> bool {
     let mut loaded_local_memories = HashSet::new();
-    for b in blocks.iter() {
+    for b in prg.blocks.iter() {
         for x in b.eval_impure_registers.iter() {
-            match impure_instructions[x] {
-                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match constants[n].inst {
+            match prg.impure_instructions[x] {
+                BlockInstruction::LoadRef(RegisterRef::Const(n)) => match prg.constants[n].inst {
                     BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         loaded_local_memories.insert(LocalMemoryIdentifier::Var(scope, vid));
                     }
@@ -954,14 +773,14 @@ pub fn strip_never_load_local_memory_stores<'a, 's>(
     }
 
     let mut modified = false;
-    for b in blocks.iter_mut() {
+    for b in prg.blocks.iter_mut() {
         match b.flow {
             BlockFlowInstruction::StoreRef {
                 ptr: RegisterRef::Const(n),
                 after,
                 ..
             } => {
-                let loaded = match constants[n].inst {
+                let loaded = match prg.constants[n].inst {
                     BlockConstInstruction::ScopeLocalVarRef(scope, vid) => {
                         loaded_local_memories.contains(&LocalMemoryIdentifier::Var(scope, vid))
                     }
@@ -989,18 +808,11 @@ pub fn strip_never_load_local_memory_stores<'a, 's>(
 }
 
 /// 解決先レジスタがすべて同じなphi命令をエイリアスに置き換える
-pub fn deconstruct_effectless_phi<'s>(
-    blocks: &mut [Block],
-    impure_registers: &[ConcreteType<'s>],
-    impure_instructions: &mut ImpureInstructionMap,
-    pure_instructions: &mut PureInstructions<'s>,
-) -> RegisterAliasMap {
+pub fn deconstruct_effectless_phi(prg: &mut BlockifiedProgram) -> bool {
     let mut register_alias_map = HashMap::new();
 
-    for (r, x) in core::mem::replace(
-        impure_instructions,
-        HashMap::with_capacity(impure_instructions.len()),
-    ) {
+    let new_impure_instruction_sink = HashMap::with_capacity(prg.impure_instructions.len());
+    for (r, x) in core::mem::replace(&mut prg.impure_instructions, new_impure_instruction_sink) {
         match x {
             BlockInstruction::Phi(xs) => {
                 let unique_registers = xs
@@ -1014,39 +826,308 @@ pub fn deconstruct_effectless_phi<'s>(
 
                 if let &[r1] = &unique_registers[..] {
                     // 唯一にunifyできた
-                    pure_instructions.push(
-                        BlockPureInstruction::RegisterAlias(r1).typed(impure_registers[r].clone()),
+                    prg.pure_instructions.push(
+                        BlockPureInstruction::RegisterAlias(r1)
+                            .typed(prg.impure_registers[r].clone()),
                     );
                     register_alias_map.insert(
                         RegisterRef::Impure(r),
-                        RegisterRef::Pure(pure_instructions.len() - 1),
+                        RegisterRef::Pure(prg.pure_instructions.len() - 1),
                     );
-                    for b in blocks.iter_mut() {
+                    for b in prg.blocks.iter_mut() {
                         b.eval_impure_registers.remove(&r);
                     }
                 } else {
-                    impure_instructions.insert(r, BlockInstruction::Phi(xs));
+                    prg.impure_instructions.insert(r, BlockInstruction::Phi(xs));
                 }
             }
             _ => {
-                impure_instructions.insert(r, x);
+                prg.impure_instructions.insert(r, x);
             }
         }
     }
 
-    register_alias_map
+    prg.apply_parallel_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
 }
 
-/// レジスタエイリアス命令を抽出する
-pub fn collect_register_aliases(pure_instructions: &PureInstructions) -> RegisterAliasMap {
-    pure_instructions
-        .iter()
-        .enumerate()
-        .filter_map(|(from, x)| match x.inst {
-            BlockPureInstruction::RegisterAlias(to) => Some((RegisterRef::Pure(from), to)),
-            _ => None,
-        })
-        .collect()
+/// 単純なGotoのブロックをマージしてまとめる
+pub fn merge_simple_goto_blocks(prg: &mut BlockifiedProgram) -> bool {
+    let mut modified = false;
+
+    for n in 0..prg.blocks.len() {
+        if let BlockFlowInstruction::Goto(next) = prg.blocks[n].flow {
+            println!("[MergeSimpleGoto] b{n}->b{next}", next = next.0);
+            let (current, merged) = unsafe {
+                (
+                    &mut *prg.blocks.as_mut_ptr().add(n),
+                    &*prg.blocks.as_ptr().add(next.0),
+                )
+            };
+
+            if !merged.has_block_dependent_instructions(&prg.impure_instructions)
+                && !merged.is_loop_term_block()
+            {
+                current
+                    .eval_impure_registers
+                    .extend(merged.eval_impure_registers.iter().copied());
+                current.flow = merged.flow.clone();
+
+                match merged.flow {
+                    BlockFlowInstruction::Goto(new_after)
+                    | BlockFlowInstruction::Funcall {
+                        after_return: Some(new_after),
+                        ..
+                    }
+                    | BlockFlowInstruction::StoreRef {
+                        after: Some(new_after),
+                        ..
+                    }
+                    | BlockFlowInstruction::IntrinsicImpureFuncall {
+                        after_return: Some(new_after),
+                        ..
+                    } => {
+                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_after.0);
+                        prg.blocks[new_after.0].dup_phi_incoming(
+                            &mut prg.impure_instructions,
+                            next,
+                            BlockRef(n),
+                        );
+                    }
+                    BlockFlowInstruction::Conditional {
+                        r#true: new_true_after,
+                        r#false: new_false_after,
+                        ..
+                    } => {
+                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_true_after.0);
+                        prg.blocks[new_true_after.0].dup_phi_incoming(
+                            &mut prg.impure_instructions,
+                            next,
+                            BlockRef(n),
+                        );
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_false_after.0);
+                        prg.blocks[new_false_after.0].dup_phi_incoming(
+                            &mut prg.impure_instructions,
+                            next,
+                            BlockRef(n),
+                        );
+                    }
+                    BlockFlowInstruction::ConditionalLoop {
+                        r#break: new_break_after,
+                        body: new_body_after,
+                        ..
+                    } => {
+                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_break_after.0);
+                        prg.blocks[new_break_after.0].dup_phi_incoming(
+                            &mut prg.impure_instructions,
+                            next,
+                            BlockRef(n),
+                        );
+                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_body_after.0);
+                        prg.blocks[new_body_after.0].dup_phi_incoming(
+                            &mut prg.impure_instructions,
+                            next,
+                            BlockRef(n),
+                        );
+                    }
+                    BlockFlowInstruction::Break | BlockFlowInstruction::Continue => {
+                        unreachable!("break/continue cannot determine new_after")
+                    }
+                    BlockFlowInstruction::Return(_)
+                    | BlockFlowInstruction::Undetermined
+                    | BlockFlowInstruction::StoreRef { after: None, .. }
+                    | BlockFlowInstruction::Funcall {
+                        after_return: None, ..
+                    }
+                    | BlockFlowInstruction::IntrinsicImpureFuncall {
+                        after_return: None, ..
+                    } => (),
+                }
+
+                modified = true;
+            }
+        }
+    }
+
+    modified
+}
+
+pub fn rechain_blocks(prg: &mut BlockifiedProgram) {
+    let new_blocks = Vec::with_capacity(prg.blocks.len());
+    let mut old_blocks = core::mem::replace(&mut prg.blocks, new_blocks);
+    let mut block_relocate_map = HashMap::new();
+
+    fn collect(
+        old_blocks: &mut Vec<Block>,
+        current_block: BlockRef,
+        sink_blocks: &mut Vec<Block>,
+        block_relocate_map: &mut HashMap<BlockRef, BlockRef>,
+    ) {
+        if block_relocate_map.contains_key(&current_block) {
+            // すでに訪問済み
+            return;
+        }
+
+        sink_blocks.push(core::mem::replace(
+            &mut old_blocks[current_block.0],
+            Block::empty(),
+        ));
+        block_relocate_map.insert(current_block, BlockRef(sink_blocks.len() - 1));
+        match unsafe { &sink_blocks.last().unwrap_unchecked().flow } {
+            BlockFlowInstruction::Undetermined
+            | BlockFlowInstruction::Return(_)
+            | BlockFlowInstruction::Break
+            | BlockFlowInstruction::Continue
+            | BlockFlowInstruction::StoreRef { after: None, .. }
+            | BlockFlowInstruction::Funcall {
+                after_return: None, ..
+            }
+            | BlockFlowInstruction::IntrinsicImpureFuncall {
+                after_return: None, ..
+            } => (),
+            &BlockFlowInstruction::Goto(next)
+            | &BlockFlowInstruction::StoreRef {
+                after: Some(next), ..
+            }
+            | &BlockFlowInstruction::Funcall {
+                after_return: Some(next),
+                ..
+            }
+            | &BlockFlowInstruction::IntrinsicImpureFuncall {
+                after_return: Some(next),
+                ..
+            } => {
+                collect(old_blocks, next, sink_blocks, block_relocate_map);
+            }
+            &BlockFlowInstruction::Conditional {
+                r#true, r#false, ..
+            } => {
+                collect(old_blocks, r#true, sink_blocks, block_relocate_map);
+                collect(old_blocks, r#false, sink_blocks, block_relocate_map);
+            }
+            &BlockFlowInstruction::ConditionalLoop { r#break, body, .. } => {
+                // continueはみなくていい（他のブロックからの流入ですでに訪問済みのはず）
+                collect(old_blocks, body, sink_blocks, block_relocate_map);
+                collect(old_blocks, r#break, sink_blocks, block_relocate_map);
+            }
+        }
+    }
+    collect(
+        &mut old_blocks,
+        BlockRef(0),
+        &mut prg.blocks,
+        &mut block_relocate_map,
+    );
+
+    for b in prg.blocks.iter_mut() {
+        for x in b.eval_impure_registers.iter() {
+            match prg.impure_instructions.get_mut(x).unwrap() {
+                &mut BlockInstruction::Phi(ref mut incomings) => {
+                    *incomings = incomings
+                        .into_iter()
+                        .filter_map(|(b, &mut r)| match block_relocate_map.get(b) {
+                            Some(&nb) => Some((nb, r)),
+                            None => None,
+                        })
+                        .collect();
+                }
+                &mut BlockInstruction::LoadRef(_) => (),
+            }
+        }
+
+        b.flow.relocate_block_ref(|r| {
+            if let Some(&nr) = block_relocate_map.get(r) {
+                *r = nr;
+            }
+        });
+    }
+}
+
+/// 組み込み関数呼び出しを探して命令を変換する
+pub fn resolve_intrinsic_funcalls(prg: &mut BlockifiedProgram) -> bool {
+    let mut register_alias_map = HashMap::new();
+    let mut modified = false;
+
+    for b in prg.blocks.iter_mut() {
+        match b.flow {
+            BlockFlowInstruction::Funcall {
+                result: RegisterRef::Impure(result),
+                callee: RegisterRef::Const(callee),
+                ref args,
+                after_return,
+            } => match prg.constants.get(callee).map(|x| &x.inst) {
+                Some(&BlockConstInstruction::IntrinsicTypeConstructorRef(ty)) => {
+                    // 組み込み型の値コンストラクタ呼び出し
+
+                    prg.pure_instructions.push(
+                        BlockPureInstruction::ConstructIntrinsicComposite(ty, args.clone())
+                            .typed(prg.impure_registers[result].clone()),
+                    );
+                    b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
+                    register_alias_map.insert(
+                        RegisterRef::Impure(result),
+                        RegisterRef::Pure(prg.pure_instructions.len() - 1),
+                    );
+                    modified = true;
+                }
+                Some(BlockConstInstruction::IntrinsicFunctionRef(overloads)) => {
+                    let selected_overload = overloads
+                        .iter()
+                        .find(|o| {
+                            o.args
+                                .iter()
+                                .zip(args.iter())
+                                .all(|(def, call)| match call {
+                                    &RegisterRef::Const(call) => def == &prg.constants[call].ty,
+                                    &RegisterRef::Pure(call) => {
+                                        def == &prg.pure_instructions[call].ty
+                                    }
+                                    &RegisterRef::Impure(call) => {
+                                        def == &prg.impure_registers[call]
+                                    }
+                                })
+                        })
+                        .expect("Error: no matching overload found");
+
+                    if selected_overload.is_pure {
+                        // 純粋関数はinstruction化
+
+                        prg.pure_instructions.push(
+                            BlockPureInstruction::PureIntrinsicCall(
+                                selected_overload.name,
+                                args.clone(),
+                            )
+                            .typed(prg.impure_registers[result].clone()),
+                        );
+                        register_alias_map.insert(
+                            RegisterRef::Impure(result),
+                            RegisterRef::Pure(prg.pure_instructions.len() - 1),
+                        );
+                        b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
+                        modified = true;
+                    } else {
+                        // 非純粋ならFlow
+
+                        b.flow = BlockFlowInstruction::IntrinsicImpureFuncall {
+                            identifier: selected_overload.name,
+                            args: args.clone(),
+                            result: RegisterRef::Impure(result),
+                            after_return,
+                        };
+                        modified = true;
+                    }
+                }
+                _ => (),
+            },
+            _ => (),
+        }
+    }
+
+    prg.apply_register_alias(&register_alias_map);
+    modified
 }
 
 /*
@@ -1206,108 +1287,6 @@ fn replace_inlined_function_input_refs<'a, 's>(
             _ => (),
         }
     }
-}
-
-pub fn merge_simple_goto_blocks<'a, 's>(
-    blocks: &mut [Block],
-    mod_instructions: &mut HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> bool {
-    let mut modified = false;
-
-    for n in 0..blocks.len() {
-        if let BlockFlowInstruction::Goto(next) = blocks[n].flow {
-            println!("[MergeSimpleGoto] b{n}->b{next}", next = next.0);
-            let (current, merged) = unsafe {
-                (
-                    &mut *blocks.as_mut_ptr().add(n),
-                    &*blocks.as_ptr().add(next.0),
-                )
-            };
-
-            if !merged.has_block_dependent_instructions(mod_instructions)
-                && !merged.is_loop_term_block()
-            {
-                current
-                    .eval_impure_registers
-                    .extend(merged.eval_impure_registers.iter().copied());
-                current.flow = merged.flow.clone();
-
-                match merged.flow {
-                    BlockFlowInstruction::Goto(new_after)
-                    | BlockFlowInstruction::Funcall {
-                        after_return: Some(new_after),
-                        ..
-                    }
-                    | BlockFlowInstruction::StoreRef {
-                        after: Some(new_after),
-                        ..
-                    }
-                    | BlockFlowInstruction::IntrinsicImpureFuncall {
-                        after_return: Some(new_after),
-                        ..
-                    } => {
-                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
-                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_after.0);
-                        blocks[new_after.0].dup_phi_incoming(mod_instructions, next, BlockRef(n));
-                    }
-                    BlockFlowInstruction::Conditional {
-                        r#true: new_true_after,
-                        r#false: new_false_after,
-                        ..
-                    } => {
-                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
-                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_true_after.0);
-                        blocks[new_true_after.0].dup_phi_incoming(
-                            mod_instructions,
-                            next,
-                            BlockRef(n),
-                        );
-                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_false_after.0);
-                        blocks[new_false_after.0].dup_phi_incoming(
-                            mod_instructions,
-                            next,
-                            BlockRef(n),
-                        );
-                    }
-                    BlockFlowInstruction::ConditionalLoop {
-                        r#break: new_break_after,
-                        body: new_body_after,
-                        ..
-                    } => {
-                        // 新しいとび先にphiがあれば、元のとび先のエントリと同じものを今のブロックからのものとして追加
-                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_break_after.0);
-                        blocks[new_break_after.0].dup_phi_incoming(
-                            mod_instructions,
-                            next,
-                            BlockRef(n),
-                        );
-                        println!("[MergeSimpleGoto] rechain: phi redirect b{n}->b{next}->b{new_after} => b{n}->b{new_after}", next = next.0, new_after = new_body_after.0);
-                        blocks[new_body_after.0].dup_phi_incoming(
-                            mod_instructions,
-                            next,
-                            BlockRef(n),
-                        );
-                    }
-                    BlockFlowInstruction::Break | BlockFlowInstruction::Continue => {
-                        unreachable!("break/continue cannot determine new_after")
-                    }
-                    BlockFlowInstruction::Return(_)
-                    | BlockFlowInstruction::Undetermined
-                    | BlockFlowInstruction::StoreRef { after: None, .. }
-                    | BlockFlowInstruction::Funcall {
-                        after_return: None, ..
-                    }
-                    | BlockFlowInstruction::IntrinsicImpureFuncall {
-                        after_return: None, ..
-                    } => (),
-                }
-
-                modified = true;
-            }
-        }
-    }
-
-    modified
 }
 
 pub fn strip_unreachable_blocks<'a, 's>(
@@ -1480,78 +1459,6 @@ pub fn block_aliasing<'a, 's>(
                     modified = true;
                 }
             }
-            _ => (),
-        }
-    }
-
-    modified
-}
-
-/// 組み込み関数呼び出しを探して命令を変換する
-pub fn resolve_intrinsic_funcalls<'a, 's>(
-    blocks: &mut [Block],
-    inst_ctx: &mut BlockInstructionEmissionContext<'a, 's>,
-    const_map: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-) -> bool {
-    let mut modified = false;
-
-    for b in blocks.iter_mut() {
-        match b.flow {
-            BlockFlowInstruction::Funcall {
-                result,
-                callee,
-                ref args,
-                after_return,
-            } => match const_map.get(&callee) {
-                Some(&BlockInstruction::IntrinsicTypeConstructorRef(ty)) => {
-                    // 組み込み型の値コンストラクタ呼び出し
-
-                    inst_ctx.instructions.insert(
-                        result,
-                        BlockInstruction::ConstructIntrinsicComposite(ty, args.clone()),
-                    );
-                    b.eval_impure_registers.insert(result);
-                    b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
-                    modified = true;
-                }
-                Some(BlockInstruction::IntrinsicFunctionRef(overloads)) => {
-                    let selected_overload = overloads
-                        .iter()
-                        .find(|o| {
-                            o.args
-                                .iter()
-                                .zip(args.iter())
-                                .all(|(def, call)| def == call.ty(inst_ctx))
-                        })
-                        .expect("Error: no matching overload found");
-
-                    if selected_overload.is_pure {
-                        // 純粋関数はinstruction化
-
-                        inst_ctx.instructions.insert(
-                            result,
-                            BlockInstruction::PureIntrinsicCall(
-                                selected_overload.name,
-                                args.clone(),
-                            ),
-                        );
-                        b.eval_impure_registers.insert(result);
-                        b.flow = BlockFlowInstruction::Goto(after_return.unwrap());
-                        modified = true;
-                    } else {
-                        // 非純粋ならFlow
-
-                        b.flow = BlockFlowInstruction::IntrinsicImpureFuncall {
-                            identifier: selected_overload.name,
-                            args: args.clone(),
-                            result,
-                            after_return,
-                        };
-                        modified = true;
-                    }
-                }
-                _ => (),
-            },
             _ => (),
         }
     }

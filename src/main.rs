@@ -9,16 +9,16 @@ use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
         BlockGenerationContext, BlockInstructionEmissionContext, BlockPureInstruction, BlockRef,
-        Constants, ImpureInstructionMap, PureInstructions, RegisterRef,
+        BlockifiedProgram, Constants, ImpureInstructionMap, PureInstructions, RegisterRef,
     },
     expr::simplify_expression,
     opt::{
-        apply_parallel_register_alias, apply_register_alias, collect_block_incomings,
-        collect_block_local_memory_stores, collect_register_aliases, deconstruct_effectless_phi,
-        fold_const_ops, promote_instantiate_const, propagate_local_memory_stores,
-        replace_local_memory_load, strip_never_load_local_memory_stores, strip_unreferenced_const,
+        collect_block_incomings, collect_block_local_memory_stores, deconstruct_effectless_phi,
+        fold_const_ops, merge_simple_goto_blocks, promote_instantiate_const,
+        propagate_local_memory_stores, rechain_blocks, replace_local_memory_load,
+        resolve_intrinsic_funcalls, strip_never_load_local_memory_stores, strip_unreferenced_const,
         strip_unreferenced_impure_instructions, strip_unreferenced_pure_instructions,
-        unify_constants, unify_pure_instructions,
+        unify_constants, unify_pure_instructions, unify_same_block_load_instructions,
     },
     FunctionBody,
 };
@@ -242,51 +242,34 @@ fn main() {
                     block_generation_context.try_chain(last.end_block, final_return_block),
                     "function body multiple out"
                 );
+                let mut prg = BlockifiedProgram {
+                    blocks: block_generation_context.blocks,
+                    impure_registers: block_instruction_emission_context.impure_registers,
+                    impure_instructions: block_instruction_emission_context.impure_instructions,
+                    pure_instructions: block_instruction_emission_context.pure_instructions,
+                    constants: block_instruction_emission_context.constants,
+                };
                 println!(
                     "Generated({}, last_start_block={} last_eval_block={}):",
                     f.fname_token.slice, last.start_block.0, final_return_block.0
                 );
                 let mut o = std::io::stdout().lock();
-                block_generation_context
-                    .dump_blocks(
-                        &mut o,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                    )
-                    .unwrap();
+                prg.dump(&mut o).unwrap();
                 o.flush().unwrap();
                 drop(o);
 
-                let mut last_ir_document = build_ir_document(
-                    &block_instruction_emission_context.constants,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.impure_registers,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_generation_context.blocks,
-                );
+                let mut last_ir_document = build_ir_document(&prg);
                 fn perform_log(
                     fname: &parser::Token,
                     step_name: &str,
                     modified: bool,
                     last_irdoc: &mut String,
-                    constants: &Constants,
-                    pure_instructions: &PureInstructions,
-                    impure_registers: &[ConcreteType],
-                    impure_instructions: &ImpureInstructionMap,
-                    blocks: &[Block],
+                    prg: &BlockifiedProgram,
                 ) {
                     print_step_header(fname.slice, step_name, modified);
 
                     if modified {
-                        let next_irdoc = build_ir_document(
-                            constants,
-                            pure_instructions,
-                            impure_registers,
-                            impure_instructions,
-                            blocks,
-                        );
+                        let next_irdoc = build_ir_document(prg);
 
                         let diff = similar::TextDiff::from_lines(last_irdoc, &next_irdoc);
                         let mut o = std::io::stdout().lock();
@@ -312,16 +295,8 @@ fn main() {
                     needs_reopt = false;
 
                     loop {
-                        let register_alias_map = promote_instantiate_const(
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &mut block_instruction_emission_context.constants,
-                        );
-                        apply_parallel_register_alias(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.impure_instructions,
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &register_alias_map,
-                        );
+                        let register_alias_map = promote_instantiate_const(&mut prg);
+                        prg.apply_parallel_register_alias(&register_alias_map);
                         needs_reopt = needs_reopt || !register_alias_map.is_empty();
 
                         perform_log(
@@ -329,11 +304,7 @@ fn main() {
                             "PromoteInstantiateConst",
                             !register_alias_map.is_empty(),
                             &mut last_ir_document,
-                            &block_instruction_emission_context.constants,
-                            &block_instruction_emission_context.pure_instructions,
-                            &block_instruction_emission_context.impure_registers,
-                            &block_instruction_emission_context.impure_instructions,
-                            &block_generation_context.blocks,
+                            &prg,
                         );
 
                         if register_alias_map.is_empty() {
@@ -342,16 +313,8 @@ fn main() {
                     }
 
                     loop {
-                        let register_alias_map = fold_const_ops(
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &mut block_instruction_emission_context.constants,
-                        );
-                        apply_parallel_register_alias(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.impure_instructions,
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &register_alias_map,
-                        );
+                        let register_alias_map = fold_const_ops(&mut prg);
+                        prg.apply_parallel_register_alias(&register_alias_map);
                         needs_reopt = needs_reopt || !register_alias_map.is_empty();
 
                         perform_log(
@@ -359,11 +322,7 @@ fn main() {
                             "FoldConst",
                             !register_alias_map.is_empty(),
                             &mut last_ir_document,
-                            &block_instruction_emission_context.constants,
-                            &block_instruction_emission_context.pure_instructions,
-                            &block_instruction_emission_context.impure_registers,
-                            &block_instruction_emission_context.impure_instructions,
-                            &block_generation_context.blocks,
+                            &prg,
                         );
 
                         if register_alias_map.is_empty() {
@@ -373,54 +332,26 @@ fn main() {
                 }
 
                 {
-                    let register_alias_map =
-                        unify_constants(&block_instruction_emission_context.constants);
-                    apply_parallel_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
-                    );
+                    let register_alias_map = unify_constants(&prg);
+                    prg.apply_parallel_register_alias(&register_alias_map);
 
                     perform_log(
                         &f.fname_token,
                         "UnifyConst",
                         !register_alias_map.is_empty(),
                         &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
+                        &prg,
                     );
                 }
 
-                {
-                    let register_alias_map = strip_unreferenced_const(
-                        &mut block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
-                    );
-                    apply_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
-                    );
-
-                    perform_log(
-                        &f.fname_token,
-                        "StripUnreferencedConst",
-                        !register_alias_map.is_empty(),
-                        &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
-                    );
-                }
+                let modified = strip_unreferenced_const(&mut prg);
+                perform_log(
+                    &f.fname_token,
+                    "StripUnreferencedConst",
+                    modified,
+                    &mut last_ir_document,
+                    &prg,
+                );
 
                 // Pure optimization
                 let mut needs_reopt = true;
@@ -428,15 +359,8 @@ fn main() {
                     needs_reopt = false;
 
                     {
-                        let register_alias_map = unify_pure_instructions(
-                            &block_instruction_emission_context.pure_instructions,
-                        );
-                        apply_parallel_register_alias(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.impure_instructions,
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &register_alias_map,
-                        );
+                        let register_alias_map = unify_pure_instructions(&prg);
+                        prg.apply_parallel_register_alias(&register_alias_map);
                         needs_reopt = needs_reopt || !register_alias_map.is_empty();
 
                         perform_log(
@@ -444,66 +368,30 @@ fn main() {
                             "UnifyPureInstructions",
                             !register_alias_map.is_empty(),
                             &mut last_ir_document,
-                            &block_instruction_emission_context.constants,
-                            &block_instruction_emission_context.pure_instructions,
-                            &block_instruction_emission_context.impure_registers,
-                            &block_instruction_emission_context.impure_instructions,
-                            &block_generation_context.blocks,
+                            &prg,
                         );
                     }
 
-                    {
-                        let register_alias_map = strip_unreferenced_pure_instructions(
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &block_instruction_emission_context.impure_instructions,
-                            &block_generation_context.blocks,
-                        );
-                        apply_register_alias(
-                            &mut block_generation_context.blocks,
-                            &mut block_instruction_emission_context.impure_instructions,
-                            &mut block_instruction_emission_context.pure_instructions,
-                            &register_alias_map,
-                        );
-
-                        perform_log(
-                            &f.fname_token,
-                            "StripUnreferencedPureInst",
-                            !register_alias_map.is_empty(),
-                            &mut last_ir_document,
-                            &block_instruction_emission_context.constants,
-                            &block_instruction_emission_context.pure_instructions,
-                            &block_instruction_emission_context.impure_registers,
-                            &block_instruction_emission_context.impure_instructions,
-                            &block_generation_context.blocks,
-                        );
-                    }
+                    let modified = strip_unreferenced_pure_instructions(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedPureInst",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
                 }
 
-                let block_local_memory_stores = collect_block_local_memory_stores(
-                    &block_generation_context.blocks,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.constants,
-                );
-                let per_block_local_mem_current_register_map = propagate_local_memory_stores(
-                    &mut block_generation_context.blocks,
-                    &mut block_instruction_emission_context.impure_registers,
-                    &mut block_instruction_emission_context.impure_instructions,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.constants,
-                    &block_local_memory_stores,
-                );
+                let block_local_memory_stores = collect_block_local_memory_stores(&prg);
+                let per_block_local_mem_current_register_map =
+                    propagate_local_memory_stores(&mut prg, &block_local_memory_stores);
 
                 perform_log(
                     &f.fname_token,
                     "PropagateLocalMemoryStores",
                     true,
                     &mut last_ir_document,
-                    &block_instruction_emission_context.constants,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.impure_registers,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_generation_context.blocks,
+                    &prg,
                 );
                 println!("PerBlock LocalMem -> Register Map:");
                 let mut block_sorted = per_block_local_mem_current_register_map
@@ -516,166 +404,173 @@ fn main() {
                         print!("    {mid:?} = {v} = ");
                         let mut o = std::io::stdout().lock();
                         match v {
-                            &RegisterRef::Const(n) => block_instruction_emission_context.constants
-                                [n]
-                                .inst
-                                .dump(&mut o)
-                                .unwrap(),
-                            &RegisterRef::Pure(n) => block_instruction_emission_context
-                                .pure_instructions[n]
-                                .inst
-                                .dump(&mut o)
-                                .unwrap(),
-                            &RegisterRef::Impure(n) => block_instruction_emission_context
-                                .impure_instructions[&n]
-                                .dump(&mut o)
-                                .unwrap(),
+                            &RegisterRef::Const(n) => prg.constants[n].inst.dump(&mut o).unwrap(),
+                            &RegisterRef::Pure(n) => {
+                                prg.pure_instructions[n].inst.dump(&mut o).unwrap()
+                            }
+                            &RegisterRef::Impure(n) => {
+                                prg.impure_instructions[&n].dump(&mut o).unwrap()
+                            }
                         }
                         o.flush().unwrap();
                         println!();
                     }
                 }
 
-                replace_local_memory_load(
-                    &block_generation_context.blocks,
-                    &per_block_local_mem_current_register_map,
-                    &mut block_instruction_emission_context.impure_instructions,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.constants,
-                );
+                replace_local_memory_load(&mut prg, &per_block_local_mem_current_register_map);
                 perform_log(
                     &f.fname_token,
                     "ReplaceLocalMemoryLoad",
                     true,
                     &mut last_ir_document,
-                    &block_instruction_emission_context.constants,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.impure_registers,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_generation_context.blocks,
+                    &prg,
                 );
 
-                let modified = strip_never_load_local_memory_stores(
-                    &mut block_generation_context.blocks,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_instruction_emission_context.constants,
-                );
+                let modified = strip_never_load_local_memory_stores(&mut prg);
                 perform_log(
                     &f.fname_token,
                     "StripNeverLoadLocalMemStores",
                     modified,
                     &mut last_ir_document,
-                    &block_instruction_emission_context.constants,
-                    &block_instruction_emission_context.pure_instructions,
-                    &block_instruction_emission_context.impure_registers,
-                    &block_instruction_emission_context.impure_instructions,
-                    &block_generation_context.blocks,
+                    &prg,
                 );
 
                 let mut needs_reopt = true;
                 while needs_reopt {
                     needs_reopt = false;
 
-                    let register_alias_map = deconstruct_effectless_phi(
-                        &mut block_generation_context.blocks,
-                        &block_instruction_emission_context.impure_registers,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                    );
-                    apply_parallel_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
-                    );
+                    let modified = deconstruct_effectless_phi(&mut prg);
                     perform_log(
                         &f.fname_token,
                         "DeconstructEffectlessPhi",
-                        !register_alias_map.is_empty(),
+                        modified,
                         &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
+                        &prg,
                     );
 
-                    let register_alias_map = collect_register_aliases(
-                        &block_instruction_emission_context.pure_instructions,
-                    );
-                    apply_parallel_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
-                    );
+                    let register_alias_map = prg.collect_pure_register_aliases();
+                    prg.apply_parallel_register_alias(&register_alias_map);
                     perform_log(
                         &f.fname_token,
                         "ResolveLowestEntropyRegisterAlias",
                         !register_alias_map.is_empty(),
                         &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
+                        &prg,
                     );
 
                     needs_reopt = needs_reopt || !register_alias_map.is_empty();
 
-                    let register_alias_map = strip_unreferenced_pure_instructions(
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
-                    );
-                    apply_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
-                    );
-
+                    let modified = strip_unreferenced_pure_instructions(&mut prg);
                     perform_log(
                         &f.fname_token,
                         "StripUnreferencedPureInst",
-                        !register_alias_map.is_empty(),
+                        modified,
                         &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
+                        &prg,
                     );
                 }
 
+                let modified = resolve_intrinsic_funcalls(&mut prg);
+                perform_log(
+                    &f.fname_token,
+                    "ResolveIntrinsicFuncalls",
+                    modified,
+                    &mut last_ir_document,
+                    &prg,
+                );
+
                 loop {
-                    let (register_alias_map, modified) = strip_unreferenced_impure_instructions(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.pure_instructions,
-                    );
-                    apply_register_alias(
-                        &mut block_generation_context.blocks,
-                        &mut block_instruction_emission_context.impure_instructions,
-                        &mut block_instruction_emission_context.pure_instructions,
-                        &register_alias_map,
+                    let modified = strip_unreferenced_pure_instructions(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedPureInst",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
                     );
 
+                    if !modified {
+                        break;
+                    }
+                }
+
+                loop {
+                    let modified = strip_unreferenced_impure_instructions(&mut prg);
                     perform_log(
                         &f.fname_token,
                         "StripUnreferencedImpureInst",
                         modified,
                         &mut last_ir_document,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                        &block_generation_context.blocks,
+                        &prg,
                     );
 
                     if !modified {
                         break;
+                    }
+                }
+
+                println!("PreMergeSimpleGotoBlocks({}):", f.fname_token.slice);
+                let mut o = std::io::stdout().lock();
+                prg.dump(&mut o).unwrap();
+                o.flush().unwrap();
+                drop(o);
+
+                loop {
+                    let modified = merge_simple_goto_blocks(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "MergeSimpleGotoBlocks",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    if !modified {
+                        break;
+                    }
+                }
+
+                rechain_blocks(&mut prg);
+                perform_log(
+                    &f.fname_token,
+                    "RechainBlocks",
+                    modified,
+                    &mut last_ir_document,
+                    &prg,
+                );
+
+                // Impure optimization
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    {
+                        let register_alias_map = unify_same_block_load_instructions(&prg);
+                        prg.apply_parallel_register_alias(&register_alias_map);
+                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+                        perform_log(
+                            &f.fname_token,
+                            "UnifySameBlockLoadInstructions",
+                            !register_alias_map.is_empty(),
+                            &mut last_ir_document,
+                            &prg,
+                        );
+                    }
+
+                    loop {
+                        let modified = strip_unreferenced_impure_instructions(&mut prg);
+                        perform_log(
+                            &f.fname_token,
+                            "StripUnreferencedImpureInst",
+                            modified,
+                            &mut last_ir_document,
+                            &prg,
+                        );
+
+                        if !modified {
+                            break;
+                        }
                     }
                 }
 
@@ -1134,15 +1029,7 @@ fn main() {
 
                 println!("First Optimized({}):", f.fname_token.slice);
                 let mut o = std::io::stdout().lock();
-                block_generation_context
-                    .dump_blocks(
-                        &mut o,
-                        &block_instruction_emission_context.constants,
-                        &block_instruction_emission_context.pure_instructions,
-                        &block_instruction_emission_context.impure_registers,
-                        &block_instruction_emission_context.impure_instructions,
-                    )
-                    .unwrap();
+                prg.dump(&mut o).unwrap();
                 o.flush().unwrap();
                 drop(o);
 
@@ -1235,11 +1122,7 @@ fn main() {
                     f.fname_token.slice,
                     FunctionBody {
                         symbol_scope: function_symbol_scope,
-                        constants: block_instruction_emission_context.constants,
-                        impure_registers: block_instruction_emission_context.impure_registers,
-                        pure_instructions: block_instruction_emission_context.pure_instructions,
-                        impure_instructions: block_instruction_emission_context.impure_instructions,
-                        blocks: block_generation_context.blocks,
+                        program: prg,
                     },
                 );
             }
@@ -1400,16 +1283,16 @@ fn print_step_header(fname: &str, step_name: &str, modified: bool) {
         if modified { "performed" } else { "skip" }
     );
 }
-fn build_ir_document(
-    constants: &Constants,
-    pure_instructions: &PureInstructions,
-    impure_registers: &[ConcreteType],
-    impure_instructions: &ImpureInstructionMap,
-    blocks: &[Block],
-) -> String {
+fn build_ir_document(prg: &BlockifiedProgram) -> String {
     let mut sink = Vec::new();
-    dump_registers(&mut sink, constants, pure_instructions, impure_registers).unwrap();
-    dump_blocks(&mut sink, blocks, impure_instructions).unwrap();
+    dump_registers(
+        &mut sink,
+        &prg.constants,
+        &prg.pure_instructions,
+        &prg.impure_registers,
+    )
+    .unwrap();
+    dump_blocks(&mut sink, &prg.blocks, &prg.impure_instructions).unwrap();
 
     unsafe { String::from_utf8_unchecked(sink) }
 }

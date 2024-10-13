@@ -16,9 +16,9 @@ use crate::{
 };
 
 use super::{
-    expr::{binary_op, simplify_expression, simplify_lefthand_expression, ConstModifiers},
-    ConstFloatLiteral, ConstIntLiteral, ConstNumberLiteral, ConstSIntLiteral, ConstUIntLiteral,
-    LosslessConst,
+    expr::{binary_op, simplify_expression, simplify_lefthand_expression},
+    ConstFloatLiteral, ConstIntLiteral, ConstModifiers, ConstNumberLiteral, ConstSIntLiteral,
+    ConstUIntLiteral, LosslessConst,
 };
 
 pub struct BaseRegisters {
@@ -59,10 +59,11 @@ pub enum RegisterRef {
     Impure(usize),
 }
 impl RegisterRef {
+    #[inline(always)]
     pub fn ty<'c, 's>(
         self,
         p: &'c (impl RegisterTypeProvider<'c, 's> + ?Sized),
-    ) -> ConcreteTypeRef<'c, 's> {
+    ) -> &'c ConcreteType<'s> {
         p.register_type(self)
     }
 
@@ -108,7 +109,7 @@ pub type Constants<'a, 's> = Vec<TypedBlockConstInstruction<'a, 's>>;
 pub type RegisterAliasMap = HashMap<RegisterRef, RegisterRef>;
 
 pub trait RegisterTypeProvider<'c, 's> {
-    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's>;
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s>;
 }
 
 #[repr(transparent)]
@@ -122,7 +123,6 @@ pub enum BlockFlowInstruction {
         source: RegisterRef,
         r#true: BlockRef,
         r#false: BlockRef,
-        merge: BlockRef,
     },
     Funcall {
         callee: RegisterRef,
@@ -314,7 +314,7 @@ impl BlockFlowInstruction {
         }
     }
 
-    pub fn relocate_next_block(&mut self, mut relocator: impl FnMut(&mut BlockRef)) -> bool {
+    pub fn relocate_block_ref(&mut self, mut relocator: impl FnMut(&mut BlockRef)) -> bool {
         match self {
             Self::Goto(ref mut next)
             | Self::StoreRef {
@@ -336,14 +336,12 @@ impl BlockFlowInstruction {
             Self::Conditional {
                 ref mut r#true,
                 ref mut r#false,
-                ref mut merge,
                 ..
             } => {
-                let (t0, f0, m0) = (r#true.0, r#false.0, merge.0);
+                let (t0, f0) = (r#true.0, r#false.0);
                 relocator(r#true);
                 relocator(r#false);
-                relocator(merge);
-                r#true.0 != t0 || r#false.0 != f0 || merge.0 != m0
+                r#true.0 != t0 || r#false.0 != f0
             }
             Self::ConditionalLoop {
                 ref mut r#break,
@@ -827,6 +825,14 @@ pub struct Block {
 }
 impl Block {
     #[inline(always)]
+    pub fn empty() -> Self {
+        Self {
+            eval_impure_registers: HashSet::new(),
+            flow: BlockFlowInstruction::Undetermined,
+        }
+    }
+
+    #[inline(always)]
     pub fn flow_only(flow: BlockFlowInstruction) -> Self {
         Self {
             eval_impure_registers: HashSet::new(),
@@ -942,7 +948,6 @@ impl Block {
         condition: RegisterRef,
         r#true: BlockRef,
         r#false: BlockRef,
-        merge: BlockRef,
     ) -> bool {
         match self.flow {
             BlockFlowInstruction::Undetermined => {
@@ -950,7 +955,6 @@ impl Block {
                     source: condition,
                     r#true,
                     r#false,
-                    merge,
                 };
                 true
             }
@@ -966,7 +970,7 @@ pub struct BlockInstructionEmitter<'c, 'a, 's> {
 }
 impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmitter<'c, 'a, 's> {
     #[inline(always)]
-    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's> {
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
         self.instruction_emission_context.register_type(register)
     }
 }
@@ -1414,11 +1418,11 @@ pub struct BlockInstructionEmissionContext<'a, 's> {
 }
 impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockInstructionEmissionContext<'a, 's> {
     #[inline(always)]
-    fn register_type(&'c self, register: RegisterRef) -> ConcreteTypeRef<'c, 's> {
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
         match register {
-            RegisterRef::Const(n) => ConcreteTypeRef::Ref(&self.constants[n].ty),
-            RegisterRef::Pure(n) => ConcreteTypeRef::Ref(&self.pure_instructions[n].ty),
-            RegisterRef::Impure(n) => ConcreteTypeRef::Ref(&self.impure_registers[n]),
+            RegisterRef::Const(n) => &self.constants[n].ty,
+            RegisterRef::Pure(n) => &self.pure_instructions[n].ty,
+            RegisterRef::Impure(n) => &self.impure_registers[n],
         }
     }
 }
@@ -1629,11 +1633,7 @@ pub fn dump_blocks(
                 source,
                 r#true: BlockRef(t),
                 r#false: BlockRef(e),
-                merge: BlockRef(merge),
-            } => writeln!(
-                writer,
-                "  branch {source} ? -> b{t} : -> b{e} merge at b{merge}"
-            )?,
+            } => writeln!(writer, "  branch {source} ? -> b{t} : -> b{e}")?,
             BlockFlowInstruction::Return(r) => writeln!(writer, "  return {r}")?,
             BlockFlowInstruction::ConditionalLoop {
                 condition,
@@ -1824,6 +1824,162 @@ pub fn transform_statement<'a, 's>(
             );
 
             (condition.start_block, merge_block)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockifiedProgram<'a, 's> {
+    pub blocks: Vec<Block>,
+    pub impure_registers: Vec<ConcreteType<'s>>,
+    pub impure_instructions: ImpureInstructionMap,
+    pub pure_instructions: PureInstructions<'s>,
+    pub constants: Constants<'a, 's>,
+}
+impl<'a, 's> BlockifiedProgram<'a, 's> {
+    pub fn dump(&self, writer: &mut (impl std::io::Write + ?Sized)) -> std::io::Result<()> {
+        writeln!(writer, "Registers: ")?;
+        dump_registers(
+            writer,
+            &self.constants,
+            &self.pure_instructions,
+            &self.impure_registers,
+        )?;
+        dump_blocks(writer, &self.blocks, &self.impure_instructions)?;
+
+        Ok(())
+    }
+
+    pub fn apply_parallel_register_alias(&mut self, alias_map: &RegisterAliasMap) {
+        if alias_map.is_empty() {
+            // レジスタエイリアスなし
+            return;
+        }
+
+        println!("[Register Alias(Parallel)]");
+        let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
+        sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
+        for (from, to) in sorted_alias {
+            println!("  {from:?} -> {to:?}");
+        }
+
+        for x in self.impure_instructions.values_mut() {
+            x.apply_parallel_register_alias(alias_map);
+        }
+        for x in self.pure_instructions.iter_mut() {
+            x.apply_parallel_register_alias(alias_map);
+        }
+        for b in self.blocks.iter_mut() {
+            b.apply_flow_parallel_register_alias(alias_map);
+        }
+    }
+
+    pub fn apply_register_alias(&mut self, alias_map: &RegisterAliasMap) {
+        if alias_map.is_empty() {
+            // レジスタエイリアスなし
+            return;
+        }
+
+        println!("[Register Alias(ResolveChained)]");
+        let mut sorted_alias = alias_map.iter().collect::<Vec<_>>();
+        sorted_alias.sort_by(|(a, _), (b, _)| a.entropy_order(b));
+        for (from, to) in sorted_alias {
+            println!("  {from:?} -> {to:?}");
+        }
+
+        for x in self.impure_instructions.values_mut() {
+            x.apply_register_alias(alias_map);
+        }
+        for x in self.pure_instructions.iter_mut() {
+            x.apply_register_alias(alias_map);
+        }
+        for b in self.blocks.iter_mut() {
+            b.apply_flow_register_alias(alias_map);
+        }
+    }
+
+    /// どこからも参照されていないPureRegisterを収集する
+    pub fn collect_unreferenced_pure_registers(&self) -> HashSet<usize> {
+        let mut unreferenced = (0..self.pure_instructions.len()).collect::<HashSet<_>>();
+
+        for x in self.pure_instructions.iter() {
+            x.inst.enumerate_ref_registers(|r| {
+                if let RegisterRef::Pure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            });
+        }
+        for x in self.impure_instructions.values() {
+            x.enumerate_ref_registers(|r| {
+                if let RegisterRef::Pure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            });
+        }
+        for b in self.blocks.iter() {
+            b.flow.enumerate_ref_registers(|r| {
+                if let RegisterRef::Pure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            })
+        }
+
+        unreferenced
+    }
+
+    /// どこからも参照されていないImpureRegisterを収集する
+    pub fn collect_unreferenced_impure_registers(&self) -> HashSet<usize> {
+        let mut unreferenced = (0..self.impure_registers.len()).collect::<HashSet<_>>();
+
+        for x in self.pure_instructions.iter() {
+            x.inst.enumerate_ref_registers(|r| {
+                if let RegisterRef::Impure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            });
+        }
+        for x in self.impure_instructions.values() {
+            x.enumerate_ref_registers(|r| {
+                if let RegisterRef::Impure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            });
+        }
+        for b in self.blocks.iter() {
+            b.flow.enumerate_ref_registers(|r| {
+                if let RegisterRef::Impure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            });
+            // Note: Flowのdestはかならずあるものとする（Impureな関数呼び出しはstripしてはいけない）
+            b.flow.enumerate_dest_register(|r| {
+                if let RegisterRef::Impure(n) = r {
+                    unreferenced.remove(&n);
+                }
+            })
+        }
+
+        unreferenced
+    }
+
+    /// Pureなレジスタエイリアス命令を抽出する
+    pub fn collect_pure_register_aliases(&self) -> RegisterAliasMap {
+        self.pure_instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(from, x)| match x.inst {
+                BlockPureInstruction::RegisterAlias(to) => Some((RegisterRef::Pure(from), to)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+impl<'c, 'a, 's> RegisterTypeProvider<'c, 's> for BlockifiedProgram<'a, 's> {
+    fn register_type(&'c self, register: RegisterRef) -> &'c ConcreteType<'s> {
+        match register {
+            RegisterRef::Const(x) => &self.constants[x].ty,
+            RegisterRef::Pure(x) => &self.pure_instructions[x].ty,
+            RegisterRef::Impure(x) => &self.impure_registers[x],
         }
     }
 }

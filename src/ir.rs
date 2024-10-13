@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
 use block::{
-    Block, BlockConstInstruction, BlockPureInstruction, Constants, ImpureInstructionMap,
-    PureInstructions, RegisterRef,
+    Block, BlockConstInstruction, BlockPureInstruction, BlockifiedProgram, Constants,
+    ImpureInstructionMap, PureInstructions, RegisterRef,
 };
-use expr::ConstModifiers;
 
 use crate::{concrete_type::ConcreteType, scope::SymbolScope, source_ref::SourceRefSliceEq};
 
@@ -28,6 +27,15 @@ pub enum LosslessConst {
     Int(isize),
     SInt(i32),
     UInt(u32),
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ConstModifiers: u8 {
+        const NEGATE = 1 << 0;
+        const BIT_NOT = 1 << 1;
+        const LOGICAL_NOT = 1 << 2;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -161,9 +169,5 @@ impl<'s> ConstFloatLiteral<'s> {
 #[derive(Debug, Clone)]
 pub struct FunctionBody<'a, 's> {
     pub symbol_scope: &'a SymbolScope<'a, 's>,
-    pub impure_registers: Vec<ConcreteType<'s>>,
-    pub constants: Constants<'a, 's>,
-    pub pure_instructions: PureInstructions<'s>,
-    pub impure_instructions: ImpureInstructionMap,
-    pub blocks: Vec<Block>,
+    pub program: BlockifiedProgram<'a, 's>,
 }
