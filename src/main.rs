@@ -15,9 +15,10 @@ use ir::{
     expr::simplify_expression,
     opt::{
         collect_block_incomings, collect_block_local_memory_stores, deconstruct_effectless_phi,
-        fold_const_ops, merge_simple_goto_blocks, promote_instantiate_const,
+        fold_const_ops, inline_function1, merge_simple_goto_blocks, promote_instantiate_const,
         propagate_local_memory_stores, rechain_blocks, replace_local_memory_load,
-        resolve_intrinsic_funcalls, strip_never_load_local_memory_stores, strip_unreferenced_const,
+        replace_shader_input_refs, resolve_intrinsic_funcalls,
+        strip_never_load_local_memory_stores, strip_unreferenced_const,
         strip_unreferenced_impure_instructions, strip_unreferenced_pure_instructions,
         transform_swizzle_component_store, unify_constants, unify_pure_instructions,
         unify_same_block_load_instructions, unref_swizzle_ref_loads,
@@ -41,6 +42,7 @@ mod const_expr;
 mod parser;
 mod spirv;
 use spirv as spv;
+use utils::PtrEq;
 mod codegen;
 mod concrete_type;
 mod ir;
@@ -297,37 +299,35 @@ fn main() {
                     needs_reopt = false;
 
                     loop {
-                        let register_alias_map = promote_instantiate_const(&mut prg);
-                        prg.apply_parallel_register_alias(&register_alias_map);
-                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+                        let modified = promote_instantiate_const(&mut prg);
+                        needs_reopt = needs_reopt || modified;
 
                         perform_log(
                             &f.fname_token,
                             "PromoteInstantiateConst",
-                            !register_alias_map.is_empty(),
+                            modified,
                             &mut last_ir_document,
                             &prg,
                         );
 
-                        if register_alias_map.is_empty() {
+                        if !modified {
                             break;
                         }
                     }
 
                     loop {
-                        let register_alias_map = fold_const_ops(&mut prg);
-                        prg.apply_parallel_register_alias(&register_alias_map);
-                        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+                        let modified = fold_const_ops(&mut prg);
+                        needs_reopt = needs_reopt || modified;
 
                         perform_log(
                             &f.fname_token,
                             "FoldConst",
-                            !register_alias_map.is_empty(),
+                            modified,
                             &mut last_ir_document,
                             &prg,
                         );
 
-                        if register_alias_map.is_empty() {
+                        if !modified {
                             break;
                         }
                     }
@@ -1402,6 +1402,361 @@ fn optimize<'a, 's>(
             drop(o);
 
             *last_irdoc = new_irdoc;
+        }
+    }
+
+    loop {
+        let modified = inline_function1(&mut body.program, body.symbol_scope);
+        perform_log(f, "InlineFunction1", modified, &mut last_ir_document, &body);
+
+        if !modified {
+            break;
+        }
+    }
+
+    replace_shader_input_refs(&mut body.program, PtrEq(body.symbol_scope), &f);
+    perform_log(
+        f,
+        "ReplaceShaderInputRefs",
+        true,
+        &mut last_ir_document,
+        &body,
+    );
+
+    // constant optimization
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        loop {
+            let modified = promote_instantiate_const(&mut body.program);
+            needs_reopt = needs_reopt || modified;
+            perform_log(
+                f,
+                "PromoteInstantiateConst",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
+            }
+        }
+
+        loop {
+            let modified = fold_const_ops(&mut body.program);
+            needs_reopt = needs_reopt || modified;
+            perform_log(f, "FoldConst", modified, &mut last_ir_document, body);
+
+            if !modified {
+                break;
+            }
+        }
+    }
+
+    let register_alias_map = unify_constants(&body.program);
+    body.program
+        .apply_parallel_register_alias(&register_alias_map);
+    perform_log(
+        f,
+        "UnifyConst",
+        !register_alias_map.is_empty(),
+        &mut last_ir_document,
+        body,
+    );
+
+    let modified = strip_unreferenced_const(&mut body.program);
+    perform_log(
+        f,
+        "StripUnreferencedConst",
+        modified,
+        &mut last_ir_document,
+        body,
+    );
+
+    // Pure optimization
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        let register_alias_map = unify_pure_instructions(&body.program);
+        body.program
+            .apply_parallel_register_alias(&register_alias_map);
+        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+        perform_log(
+            f,
+            "UnifyPureInstructions",
+            !register_alias_map.is_empty(),
+            &mut last_ir_document,
+            body,
+        );
+
+        let modified = strip_unreferenced_pure_instructions(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedPureInst",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+    }
+
+    // swizzle ref normalization
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        let modified = unref_swizzle_ref_loads(&mut body.program);
+        needs_reopt = needs_reopt || modified;
+        perform_log(
+            f,
+            "UnrefSwizzleRefLoads",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        let modified = transform_swizzle_component_store(&mut body.program);
+        needs_reopt = needs_reopt || modified;
+        perform_log(
+            f,
+            "TransformSwizzleComponentStore",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        loop {
+            let modified = strip_unreferenced_pure_instructions(&mut body.program);
+            perform_log(
+                f,
+                "StripUnreferencedPureInst",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
+            }
+        }
+
+        loop {
+            let modified = strip_unreferenced_impure_instructions(&mut body.program);
+            perform_log(
+                f,
+                "StripUnreferencedImpureInst",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
+            }
+        }
+    }
+
+    let block_local_memory_stores = collect_block_local_memory_stores(&body.program);
+    let per_block_local_mem_current_register_map =
+        propagate_local_memory_stores(&mut body.program, &block_local_memory_stores);
+
+    perform_log(
+        f,
+        "PropagateLocalMemoryStores",
+        true,
+        &mut last_ir_document,
+        body,
+    );
+    println!("PerBlock LocalMem -> Register Map:");
+    let mut block_sorted = per_block_local_mem_current_register_map
+        .iter()
+        .collect::<Vec<_>>();
+    block_sorted.sort_by_key(|(k, _)| k.0);
+    for (bx, map) in block_sorted {
+        println!("  b{}", bx.0);
+        for (mid, v) in map {
+            print!("    {mid:?} = {v} = ");
+            let mut o = std::io::stdout().lock();
+            match v {
+                &RegisterRef::Const(n) => body.program.constants[n].inst.dump(&mut o).unwrap(),
+                &RegisterRef::Pure(n) => {
+                    body.program.pure_instructions[n].inst.dump(&mut o).unwrap()
+                }
+                &RegisterRef::Impure(n) => {
+                    body.program.impure_instructions[&n].dump(&mut o).unwrap()
+                }
+            }
+            o.flush().unwrap();
+            println!();
+        }
+    }
+
+    replace_local_memory_load(&mut body.program, &per_block_local_mem_current_register_map);
+    perform_log(
+        f,
+        "ReplaceLocalMemoryLoad",
+        true,
+        &mut last_ir_document,
+        body,
+    );
+
+    let modified = strip_never_load_local_memory_stores(&mut body.program);
+    perform_log(
+        f,
+        "StripNeverLoadLocalMemStores",
+        modified,
+        &mut last_ir_document,
+        body,
+    );
+
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        let modified = deconstruct_effectless_phi(&mut body.program);
+        perform_log(
+            f,
+            "DeconstructEffectlessPhi",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        let register_alias_map = body.program.collect_pure_register_aliases();
+        body.program
+            .apply_parallel_register_alias(&register_alias_map);
+        perform_log(
+            f,
+            "ResolveLowestEntropyRegisterAlias",
+            !register_alias_map.is_empty(),
+            &mut last_ir_document,
+            body,
+        );
+
+        needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+        let modified = strip_unreferenced_pure_instructions(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedPureInst",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+    }
+
+    let modified = resolve_intrinsic_funcalls(&mut body.program);
+    perform_log(
+        f,
+        "ResolveIntrinsicFuncalls",
+        modified,
+        &mut last_ir_document,
+        body,
+    );
+
+    println!("PreMergeSimpleGotoBlocks({}):", f.name());
+    let mut o = std::io::stdout().lock();
+    body.program.dump(&mut o).unwrap();
+    o.flush().unwrap();
+    drop(o);
+
+    loop {
+        let modified = merge_simple_goto_blocks(&mut body.program);
+        perform_log(
+            f,
+            "MergeSimpleGotoBlocks",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
+        }
+    }
+
+    rechain_blocks(&mut body.program);
+    perform_log(f, "RechainBlocks", modified, &mut last_ir_document, body);
+
+    // Impure optimization
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        {
+            let register_alias_map = unify_same_block_load_instructions(&body.program);
+            body.program
+                .apply_parallel_register_alias(&register_alias_map);
+            needs_reopt = needs_reopt || !register_alias_map.is_empty();
+
+            perform_log(
+                f,
+                "UnifySameBlockLoadInstructions",
+                !register_alias_map.is_empty(),
+                &mut last_ir_document,
+                body,
+            );
+        }
+
+        loop {
+            let modified = strip_unreferenced_impure_instructions(&mut body.program);
+            perform_log(
+                f,
+                "StripUnreferencedImpureInst",
+                modified,
+                &mut last_ir_document,
+                body,
+            );
+
+            if !modified {
+                break;
+            }
+        }
+    }
+
+    // cleanup
+    loop {
+        let modified = strip_unreferenced_impure_instructions(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedImpureInst(Final)",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
+        }
+    }
+    loop {
+        let modified = strip_unreferenced_pure_instructions(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedPureInst(Final)",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
+        }
+    }
+    loop {
+        let modified = strip_unreferenced_const(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedConst(Final)",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        if !modified {
+            break;
         }
     }
 }

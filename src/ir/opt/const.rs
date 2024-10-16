@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// 定数のInstantiateIntrinsicTypeClassを演算して定数化する
-pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> RegisterAliasMap {
+pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> bool {
     let mut register_alias_map = HashMap::new();
     let mut pure_instruction_register_shifts = 0;
 
@@ -101,10 +101,11 @@ pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) ->
         }
     }
 
-    register_alias_map
+    prg.apply_parallel_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
 }
 
-pub fn fold_const_ops<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> RegisterAliasMap {
+pub fn fold_const_ops<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> bool {
     let mut register_alias_map = HashMap::new();
     let mut pure_register_shifts = 0;
 
@@ -452,7 +453,8 @@ pub fn fold_const_ops<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> RegisterAl
         }
     }
 
-    register_alias_map
+    prg.apply_parallel_register_alias(&register_alias_map);
+    !register_alias_map.is_empty()
 }
 
 /// 同じconstant命令を若い番号のregisterにまとめる

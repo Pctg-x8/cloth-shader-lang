@@ -3,13 +3,21 @@ mod r#const;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    concrete_type::ConcreteType, ir::block::BlockFlowInstruction, scope::SymbolScope, utils::PtrEq,
+    concrete_type::ConcreteType,
+    ir::block::BlockFlowInstruction,
+    ref_path::RefPath,
+    scope::{SymbolScope, VarId},
+    symbol::{
+        meta::{BuiltinInputOutput, SymbolAttribute},
+        UserDefinedFunctionSymbol,
+    },
+    utils::PtrEq,
 };
 
 pub use self::r#const::*;
 
 use super::block::{
-    Block, BlockConstInstruction, BlockInstruction, BlockPureInstruction, BlockRef,
+    BaseRegisters, Block, BlockConstInstruction, BlockInstruction, BlockPureInstruction, BlockRef,
     BlockifiedProgram, Constants, ImpureInstructionMap, PureInstructions, RegisterAliasMap,
     RegisterRef,
 };
@@ -1244,6 +1252,389 @@ pub fn transform_swizzle_component_store(prg: &mut BlockifiedProgram) -> bool {
     }
 
     modified
+}
+
+pub fn inline_function1<'a, 's>(
+    prg: &mut BlockifiedProgram<'a, 's>,
+    root_scope: &'a SymbolScope<'a, 's>,
+) -> bool {
+    let mut modified = false;
+
+    let mut bx = 0;
+    let block_lim = prg.blocks.len();
+    while bx < block_lim {
+        match prg.blocks[bx].flow {
+            BlockFlowInstruction::Funcall {
+                result,
+                callee: RegisterRef::Const(callee),
+                ref args,
+                after_return,
+            } => {
+                let (user_function_body, user_function_symbol) = match prg.constants[callee].inst {
+                    BlockConstInstruction::UserDefinedFunctionRef(defscope, ref name) => {
+                        match defscope.0.user_defined_function_body(name.0.slice) {
+                            Some(udf) => (
+                                udf,
+                                defscope
+                                    .0
+                                    .user_defined_function_symbol(name.0.slice)
+                                    .expect("body defined but symbol info not found"),
+                            ),
+                            None => {
+                                // bodyがないfunction(今はないけどプロトタイプ宣言のみとか)はinline化しない
+                                bx += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // calleeの指している先がユーザ定義関数参照ではない（そんなことある？）
+                        bx += 1;
+                        continue;
+                    }
+                };
+
+                println!(
+                    "[InlineFunction1] Inlining {:?}",
+                    user_function_symbol.occurence
+                );
+
+                let ufb = user_function_body.borrow();
+                let args = args.clone();
+
+                // 引数をすべて新たに作ったローカル変数に代入する（こうするとRefが取れる）
+                let (arg_local_vids, arg_store_blocks): (Vec<_>, Vec<_>) =
+                    args.iter()
+                        .zip(user_function_symbol.inputs.iter())
+                        .map(|(&r, a)| {
+                            let VarId::ScopeLocal(lvid) =
+                                root_scope.declare_anon_local_var(a.3.clone(), a.1)
+                            else {
+                                unreachable!();
+                            };
+                            let vptr = prg.add_constant(
+                                BlockConstInstruction::ScopeLocalVarRef(PtrEq(root_scope), lvid)
+                                    .typed(if a.1 {
+                                        a.3.clone().mutable_ref()
+                                    } else {
+                                        a.3.clone().imm_ref()
+                                    }),
+                            );
+
+                            (
+                                lvid,
+                                Block::flow_only(BlockFlowInstruction::StoreRef {
+                                    ptr: vptr,
+                                    value: r,
+                                    after: None,
+                                }),
+                            )
+                        })
+                        .unzip();
+                let arg_store_perform_block_range = prg.append_block_sequence(arg_store_blocks);
+
+                // インライン元のレジスタを全部インライン先に取り込む
+                let base_registers = BaseRegisters {
+                    r#const: prg.constants.len(),
+                    pure: prg.pure_instructions.len(),
+                    impure: prg.impure_registers.len(),
+                };
+                let base_execution_block = prg.blocks.len();
+                prg.constants
+                    .extend(ufb.program.constants.iter().cloned().map(|x| {
+                        match x.inst {
+                            BlockConstInstruction::FunctionInputVarRef(scope, id)
+                                if scope == PtrEq(ufb.symbol_scope) =>
+                            {
+                                // 引数
+                                BlockConstInstruction::ScopeLocalVarRef(
+                                    PtrEq(root_scope),
+                                    arg_local_vids[id],
+                                )
+                                .typed(x.ty)
+                            }
+                            _ => x,
+                        }
+                    }));
+                let new_pure_instructions = ufb
+                    .program
+                    .pure_instructions
+                    .iter()
+                    .cloned()
+                    .map(|mut x| {
+                        x.inst.relocate_register(|r| {
+                            *r = r.based_on(&base_registers);
+                        });
+                        x
+                    })
+                    .collect::<Vec<_>>();
+                prg.pure_instructions.extend(new_pure_instructions);
+                prg.impure_registers
+                    .extend(ufb.program.impure_registers.iter().cloned());
+                let new_impure_instructions = ufb
+                    .program
+                    .impure_instructions
+                    .iter()
+                    .map(|(&r, x)| {
+                        let mut x = x.clone();
+                        x.relocate_register(|r| {
+                            *r = r.based_on(&base_registers);
+                        });
+                        x.relocate_block_ref(|b| b.0 += base_execution_block);
+                        (r + base_registers.impure, x)
+                    })
+                    .collect::<Vec<_>>();
+                prg.impure_instructions.extend(new_impure_instructions);
+
+                // インライン元の実行ブロックを全部インライン先の末尾につなげる
+                prg.blocks.extend(
+                    user_function_body
+                        .borrow()
+                        .program
+                        .blocks
+                        .iter()
+                        .cloned()
+                        .map(|mut b| {
+                            b.eval_impure_registers = b
+                                .eval_impure_registers
+                                .into_iter()
+                                .map(|x| x + base_registers.impure)
+                                .collect();
+                            b.flow
+                                .relocate_register(|r| *r = r.based_on(&base_registers));
+                            b.flow
+                                .relocate_dest_register(|r| *r = r.based_on(&base_registers));
+                            b.flow.relocate_block_ref(|b| b.0 += base_execution_block);
+
+                            b.flow = match b.flow {
+                                BlockFlowInstruction::Return(v) => {
+                                    // インラインされた関数のReturnはresultへのStoreRefにする
+                                    BlockFlowInstruction::StoreRef {
+                                        ptr: result,
+                                        value: v,
+                                        after: after_return,
+                                    }
+                                }
+                                x => x,
+                            };
+
+                            b
+                        }),
+                );
+
+                // 引数セットアップブロックと実行ブロックを繋げる
+                assert!(prg.blocks[arg_store_perform_block_range.end().0]
+                    .try_set_next(BlockRef(base_execution_block)));
+
+                // 関数呼び出しをGotoに変換
+                prg.blocks[bx].flow =
+                    BlockFlowInstruction::Goto(*arg_store_perform_block_range.start());
+                modified = true;
+                bx += 1;
+                continue;
+            }
+            _ => {
+                // 呼び出しフローでなければなにもしない
+                bx += 1;
+                continue;
+            }
+        }
+    }
+
+    modified
+}
+
+fn resolve_refpath(prg: &BlockifiedProgram, r: RegisterRef) -> Option<RefPath> {
+    match r {
+        RegisterRef::Const(r) => match prg.constants[r].inst {
+            BlockConstInstruction::FunctionInputVarRef(_scope, id) => {
+                Some(RefPath::FunctionInput(id))
+            }
+            _ => None,
+        },
+        RegisterRef::Pure(r) => match prg.pure_instructions[r].inst {
+            BlockPureInstruction::MemberRef(src, ref name) => {
+                let member_index = match src.ty(prg).as_dereferenced()? {
+                    &ConcreteType::Struct(ref members) => {
+                        members.iter().position(|m| &m.name == name)?
+                    }
+                    _ => return None,
+                };
+
+                Some(RefPath::Member(
+                    Box::new(resolve_refpath(prg, src)?),
+                    member_index,
+                ))
+            }
+            _ => None,
+        },
+        RegisterRef::Impure(_) => None,
+    }
+}
+
+pub struct DescriptorBound {
+    pub set: u32,
+    pub binding: u32,
+}
+pub struct PushConstantBound {
+    pub offset: u32,
+}
+pub struct BuiltinBound(pub BuiltinInputOutput);
+
+/// シェーダ入力変数への参照を専用の参照命令に置き換える
+pub fn replace_shader_input_refs<'a, 's>(
+    prg: &mut BlockifiedProgram<'a, 's>,
+    root_scope: PtrEq<'a, SymbolScope<'a, 's>>,
+    function_symbol: &UserDefinedFunctionSymbol<'s>,
+) {
+    let mut register_alias_map = HashMap::new();
+
+    for x in prg.constants.iter_mut() {
+        match x.inst {
+            BlockConstInstruction::FunctionInputVarRef(scope, id) if scope == root_scope => {
+                let descriptor_bound = match function_symbol.inputs[id].0 {
+                    SymbolAttribute {
+                        descriptor_set_location: Some(set),
+                        descriptor_set_binding: Some(binding),
+                        ..
+                    } => Some(DescriptorBound { set, binding }),
+                    _ => None,
+                };
+                let push_constant_bound = match function_symbol.inputs[id].0 {
+                    SymbolAttribute {
+                        push_constant_offset: Some(offset),
+                        ..
+                    } => Some(PushConstantBound { offset }),
+                    _ => None,
+                };
+                let builtin_bound = match function_symbol.inputs[id].0 {
+                    SymbolAttribute {
+                        bound_builtin_io: Some(io),
+                        ..
+                    } => Some(BuiltinBound(io)),
+                    _ => None,
+                };
+                let workgroup_shared = function_symbol.inputs[id].0.workgroup_shared;
+
+                match (
+                    descriptor_bound,
+                    push_constant_bound,
+                    builtin_bound,
+                    workgroup_shared,
+                ) {
+                    (Some(b), None, None, false) => {
+                        x.inst = BlockConstInstruction::DescriptorRef {
+                            set: b.set,
+                            binding: b.binding,
+                        };
+                    }
+                    (None, Some(b), None, false) => {
+                        x.inst = BlockConstInstruction::PushConstantRef(b.offset);
+                    }
+                    (None, None, Some(b), false) => {
+                        x.inst = BlockConstInstruction::BuiltinIORef(b.0);
+                    }
+                    (None, None, None, true) => {
+                        x.inst = BlockConstInstruction::WorkgroupSharedMemoryRef(
+                            RefPath::FunctionInput(id),
+                        );
+                    }
+                    (None, None, None, false) => (),
+                    _ => panic!("conflicting bound attributes"),
+                }
+            }
+            _ => (),
+        }
+    }
+
+    for r in 0..prg.pure_instructions.len() {
+        match prg.pure_instructions[r].inst {
+            BlockPureInstruction::MemberRef(src, ref name) => {
+                let member = match src
+                    .ty(prg)
+                    .as_dereferenced()
+                    .expect("cannot dereference a source of a MemberRef")
+                {
+                    &ConcreteType::Struct(ref members) => members
+                        .iter()
+                        .find(|m| &m.name == name)
+                        .expect("no member in source struct"),
+                    _ => continue,
+                };
+
+                let descriptor_bound = match member.attribute {
+                    SymbolAttribute {
+                        descriptor_set_location: Some(set),
+                        descriptor_set_binding: Some(binding),
+                        ..
+                    } => Some(DescriptorBound { set, binding }),
+                    _ => None,
+                };
+                let push_constant_bound = match member.attribute {
+                    SymbolAttribute {
+                        push_constant_offset: Some(offset),
+                        ..
+                    } => Some(PushConstantBound { offset }),
+                    _ => None,
+                };
+                let builtin_bound = match member.attribute {
+                    SymbolAttribute {
+                        bound_builtin_io: Some(io),
+                        ..
+                    } => Some(BuiltinBound(io)),
+                    _ => None,
+                };
+                let workgroup_shared = member.attribute.workgroup_shared;
+
+                match (
+                    descriptor_bound,
+                    push_constant_bound,
+                    builtin_bound,
+                    workgroup_shared,
+                ) {
+                    (Some(b), None, None, false) => {
+                        let cr = prg.add_constant(
+                            BlockConstInstruction::DescriptorRef {
+                                set: b.set,
+                                binding: b.binding,
+                            }
+                            .typed(prg.pure_instructions[r].ty.clone()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), cr);
+                    }
+                    (None, Some(b), None, false) => {
+                        let cr = prg.add_constant(
+                            BlockConstInstruction::PushConstantRef(b.offset)
+                                .typed(prg.pure_instructions[r].ty.clone()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), cr);
+                    }
+                    (None, None, Some(b), false) => {
+                        let cr = prg.add_constant(
+                            BlockConstInstruction::BuiltinIORef(b.0)
+                                .typed(prg.pure_instructions[r].ty.clone()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), cr);
+                    }
+                    (None, None, None, true) => {
+                        let cr = prg.add_constant(
+                            BlockConstInstruction::WorkgroupSharedMemoryRef(
+                                resolve_refpath(prg, RegisterRef::Pure(r))
+                                    .expect("register does not have any RefPath"),
+                            )
+                            .typed(prg.pure_instructions[r].ty.clone()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), cr);
+                    }
+                    (None, None, None, false) => (),
+                    _ => panic!("conflicting bound attributes"),
+                }
+            }
+            _ => (),
+        }
+    }
+
+    prg.apply_register_alias(&register_alias_map);
 }
 
 /*

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Write,
+    ops::RangeInclusive,
 };
 
 use typed_arena::Arena;
@@ -1857,6 +1858,30 @@ impl<'a, 's> BlockifiedProgram<'a, 's> {
         Ok(())
     }
 
+    /// 一連のブロックを接続しつつ末尾に追加する
+    /// 返り値: 追加されたBlockRefの範囲
+    pub fn append_block_sequence(
+        &mut self,
+        seq: impl IntoIterator<Item = Block>,
+    ) -> RangeInclusive<BlockRef> {
+        let first_block_ref = BlockRef(self.blocks.len());
+        let blocks_iter = seq.into_iter();
+        let block_size_hint = blocks_iter.size_hint();
+        self.blocks
+            .reserve(block_size_hint.1.unwrap_or(block_size_hint.0));
+        let mut last_block_ref: Option<BlockRef> = None;
+        for (oref, b) in blocks_iter.enumerate() {
+            let new_block_ref = BlockRef(first_block_ref.0 + oref);
+            if let Some(lb) = last_block_ref {
+                assert!(self.blocks[lb.0].try_set_next(new_block_ref));
+            }
+            self.blocks.push(b);
+            last_block_ref = Some(new_block_ref);
+        }
+
+        first_block_ref..=last_block_ref.unwrap_or(first_block_ref)
+    }
+
     #[inline]
     pub fn add_evaluated_impure_instruction(
         &mut self,
@@ -1889,6 +1914,12 @@ impl<'a, 's> BlockifiedProgram<'a, 's> {
         self.pure_instructions.push(pure_instruction);
 
         RegisterRef::Pure(self.pure_instructions.len() - 1)
+    }
+
+    pub fn add_constant(&mut self, c: TypedBlockConstInstruction<'a, 's>) -> RegisterRef {
+        self.constants.push(c);
+
+        RegisterRef::Const(self.constants.len() - 1)
     }
 
     pub fn apply_parallel_register_alias(&mut self, alias_map: &RegisterAliasMap) {
