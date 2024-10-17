@@ -131,7 +131,9 @@ pub enum BlockFlowInstruction {
         source: RegisterRef,
         r#true: BlockRef,
         r#false: BlockRef,
+        merge: BlockRef,
     },
+    ConditionalEnd,
     Funcall {
         callee: RegisterRef,
         args: Vec<RegisterRef>,
@@ -179,7 +181,8 @@ impl BlockFlowInstruction {
             | Self::Break
             | Self::Continue
             | Self::Return(_)
-            | Self::Undetermined => false,
+            | Self::Undetermined
+            | Self::ConditionalEnd => false,
         }
     }
 
@@ -225,7 +228,7 @@ impl BlockFlowInstruction {
             &Self::ConditionalLoop { condition, .. } => reporter(condition),
             Self::Break | Self::Continue => (),
             &Self::Return(r) => reporter(r),
-            Self::Undetermined => (),
+            Self::Undetermined | Self::ConditionalEnd => (),
         }
     }
 
@@ -282,7 +285,7 @@ impl BlockFlowInstruction {
                 relocator(r);
                 *r != x0
             }
-            Self::Undetermined => false,
+            Self::Undetermined | Self::ConditionalEnd => false,
         }
     }
 
@@ -295,7 +298,8 @@ impl BlockFlowInstruction {
             | Self::Break
             | Self::Continue
             | Self::Return(_)
-            | Self::Undetermined => (),
+            | Self::Undetermined
+            | Self::ConditionalEnd => (),
             &Self::Funcall { result, .. } | &Self::IntrinsicImpureFuncall { result, .. } => {
                 reporter(result);
             }
@@ -312,7 +316,8 @@ impl BlockFlowInstruction {
             | Self::Break
             | Self::Continue
             | Self::Return(_)
-            | Self::Undetermined => false,
+            | Self::Undetermined
+            | Self::ConditionalEnd => false,
             Self::Funcall { ref mut result, .. }
             | Self::IntrinsicImpureFuncall { ref mut result, .. } => {
                 let x0 = *result;
@@ -344,12 +349,14 @@ impl BlockFlowInstruction {
             Self::Conditional {
                 ref mut r#true,
                 ref mut r#false,
+                ref mut merge,
                 ..
             } => {
-                let (t0, f0) = (r#true.0, r#false.0);
+                let (t0, f0, m0) = (r#true.0, r#false.0, merge.0);
                 relocator(r#true);
                 relocator(r#false);
-                r#true.0 != t0 || r#false.0 != f0
+                relocator(merge);
+                r#true.0 != t0 || r#false.0 != f0 || merge.0 != m0
             }
             Self::ConditionalLoop {
                 ref mut r#break,
@@ -363,17 +370,18 @@ impl BlockFlowInstruction {
                 relocator(body);
                 r#break.0 != b0 || r#continue.0 != c0 || body.0 != bd0
             }
-            BlockFlowInstruction::StoreRef { after: None, .. }
-            | BlockFlowInstruction::Funcall {
+            Self::StoreRef { after: None, .. }
+            | Self::Funcall {
                 after_return: None, ..
             }
-            | BlockFlowInstruction::IntrinsicImpureFuncall {
+            | Self::IntrinsicImpureFuncall {
                 after_return: None, ..
             }
-            | BlockFlowInstruction::Break
-            | BlockFlowInstruction::Continue
-            | BlockFlowInstruction::Undetermined
-            | BlockFlowInstruction::Return(_) => false,
+            | Self::Break
+            | Self::Continue
+            | Self::Undetermined
+            | Self::Return(_)
+            | Self::ConditionalEnd => false,
         }
     }
 }
@@ -867,6 +875,11 @@ impl Block {
     }
 
     #[inline(always)]
+    pub fn is_branch_term_block(&self) -> bool {
+        matches!(self.flow, BlockFlowInstruction::ConditionalEnd)
+    }
+
+    #[inline(always)]
     pub fn apply_flow_register_alias(&mut self, map: &HashMap<RegisterRef, RegisterRef>) -> bool {
         self.flow.relocate_register(|r| {
             while let Some(&nr) = map.get(r) {
@@ -956,6 +969,7 @@ impl Block {
         condition: RegisterRef,
         r#true: BlockRef,
         r#false: BlockRef,
+        merge: BlockRef,
     ) -> bool {
         match self.flow {
             BlockFlowInstruction::Undetermined => {
@@ -963,6 +977,7 @@ impl Block {
                     source: condition,
                     r#true,
                     r#false,
+                    merge,
                 };
                 true
             }
@@ -1641,7 +1656,14 @@ pub fn dump_blocks(
                 source,
                 r#true: BlockRef(t),
                 r#false: BlockRef(e),
-            } => writeln!(writer, "  branch {source} ? -> b{t} : -> b{e}")?,
+                merge: BlockRef(m),
+            } => writeln!(
+                writer,
+                "  branch {source} ? -> b{t} : -> b{e} merged at b{m}"
+            )?,
+            BlockFlowInstruction::ConditionalEnd => {
+                writeln!(writer, "  -- conditional branch end")?
+            }
             BlockFlowInstruction::Return(r) => writeln!(writer, "  return {r}")?,
             BlockFlowInstruction::ConditionalLoop {
                 condition,
@@ -2060,6 +2082,7 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
     let mut incomings = HashMap::new();
     let mut processed = HashSet::new();
     let mut loop_stack = Vec::new();
+    let mut merge_stack = Vec::new();
 
     fn parse(
         blocks: &[Block],
@@ -2067,6 +2090,7 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
         incomings: &mut HashMap<BlockRef, Vec<BlockRef>>,
         processed: &mut HashSet<BlockRef>,
         loop_stack: &mut Vec<(BlockRef, BlockRef)>,
+        merge_stack: &mut Vec<BlockRef>,
     ) {
         if processed.contains(&n) {
             return;
@@ -2076,13 +2100,13 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
         match blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => {
                 incomings.entry(next).or_insert_with(Vec::new).push(n);
-                parse(blocks, next, incomings, processed, loop_stack);
+                parse(blocks, next, incomings, processed, loop_stack, merge_stack);
             }
             BlockFlowInstruction::StoreRef {
                 after: Some(after), ..
             } => {
                 incomings.entry(after).or_insert_with(Vec::new).push(n);
-                parse(blocks, after, incomings, processed, loop_stack);
+                parse(blocks, after, incomings, processed, loop_stack, merge_stack);
             }
             BlockFlowInstruction::StoreRef { .. } => (),
             BlockFlowInstruction::Funcall {
@@ -2093,7 +2117,14 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
                     .entry(after_return)
                     .or_insert_with(Vec::new)
                     .push(n);
-                parse(blocks, after_return, incomings, processed, loop_stack);
+                parse(
+                    blocks,
+                    after_return,
+                    incomings,
+                    processed,
+                    loop_stack,
+                    merge_stack,
+                );
             }
             BlockFlowInstruction::Funcall { .. } => (),
             BlockFlowInstruction::IntrinsicImpureFuncall {
@@ -2104,16 +2135,47 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
                     .entry(after_return)
                     .or_insert_with(Vec::new)
                     .push(n);
-                parse(blocks, after_return, incomings, processed, loop_stack);
+                parse(
+                    blocks,
+                    after_return,
+                    incomings,
+                    processed,
+                    loop_stack,
+                    merge_stack,
+                );
             }
             BlockFlowInstruction::IntrinsicImpureFuncall { .. } => (),
             BlockFlowInstruction::Conditional {
-                r#true, r#false, ..
+                r#true,
+                r#false,
+                merge,
+                ..
             } => {
                 incomings.entry(r#true).or_insert_with(Vec::new).push(n);
                 incomings.entry(r#false).or_insert_with(Vec::new).push(n);
-                parse(blocks, r#true, incomings, processed, loop_stack);
-                parse(blocks, r#false, incomings, processed, loop_stack);
+                merge_stack.push(merge);
+                parse(
+                    blocks,
+                    r#true,
+                    incomings,
+                    processed,
+                    loop_stack,
+                    &mut merge_stack.clone(),
+                );
+                parse(
+                    blocks,
+                    r#false,
+                    incomings,
+                    processed,
+                    loop_stack,
+                    &mut merge_stack.clone(),
+                );
+                merge_stack.pop();
+            }
+            BlockFlowInstruction::ConditionalEnd => {
+                let m = merge_stack.pop().expect("not in conditional branch");
+                incomings.entry(m).or_insert_with(Vec::new).push(n);
+                parse(blocks, m, incomings, processed, loop_stack, merge_stack);
             }
             BlockFlowInstruction::ConditionalLoop {
                 r#break,
@@ -2125,8 +2187,15 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
                 incomings.entry(r#break).or_insert_with(Vec::new).push(n);
 
                 loop_stack.push((r#break, r#continue));
-                parse(blocks, body, incomings, processed, loop_stack);
-                parse(blocks, r#break, incomings, processed, loop_stack);
+                parse(blocks, body, incomings, processed, loop_stack, merge_stack);
+                parse(
+                    blocks,
+                    r#break,
+                    incomings,
+                    processed,
+                    loop_stack,
+                    merge_stack,
+                );
                 loop_stack.pop();
             }
             BlockFlowInstruction::Break => {
@@ -2148,6 +2217,7 @@ pub fn parse_incoming_flows(blocks: &[Block]) -> HashMap<BlockRef, Vec<BlockRef>
         &mut incomings,
         &mut processed,
         &mut loop_stack,
+        &mut merge_stack,
     );
     incomings
 }

@@ -1215,7 +1215,7 @@ fn main() {
 
     struct OptimizedShaderEntryPoint<'s> {
         pub info: ShaderEntryPointDescription<'s>,
-        // pub ir2: ir2::Function<'s>,
+        pub ir2: ir2::Function<'s>,
     }
 
     let optimized_entry_points = entry_points
@@ -1226,20 +1226,15 @@ fn main() {
                 .user_defined_function_body(ep.name)
                 .expect("cannot emit entry point without body");
             optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
-            // let ir2 = ir2::reconstruct(
-            //     &body.borrow().blocks,
-            //     &body.borrow().instructions,
-            //     &body.borrow().registers,
-            //     &body.borrow().constants,
-            // );
+            let ir2 = ir2::reconstruct(&body.borrow().program);
 
-            // println!("IR2({}):", ep.name);
-            // let mut o = std::io::stdout().lock();
-            // ir2::Inst::dump_list(&ir2.instructions, &mut o).unwrap();
-            // o.flush().unwrap();
-            // drop(o);
+            println!("IR2({}):", ep.name);
+            let mut o = std::io::stdout().lock();
+            ir2::Inst::dump_ordered(&ir2.instructions, &ir2.instruction_order, &mut o).unwrap();
+            o.flush().unwrap();
+            drop(o);
 
-            OptimizedShaderEntryPoint { info: ep }
+            OptimizedShaderEntryPoint { info: ep, ir2 }
         })
         .collect::<Vec<_>>();
 

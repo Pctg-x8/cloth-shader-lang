@@ -1,9 +1,10 @@
-/*
 use crate::concrete_type::IntrinsicType;
-use crate::ir::block::BlockFlowInstruction;
+use crate::ir::block::{
+    BlockConstInstruction, BlockFlowInstruction, BlockPureInstruction, BlockRef, BlockifiedProgram,
+};
 use crate::ir::{ConstIntLiteral, ConstNumberLiteral};
 use crate::spirv as spv;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::symbol::meta::BuiltinInputOutput;
@@ -17,7 +18,7 @@ use crate::{
 };
 
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstRef(pub usize);
 impl std::fmt::Debug for InstRef {
     #[inline(always)]
@@ -43,6 +44,12 @@ pub enum ConstValue<'s> {
 pub enum ConstOrInst<'s> {
     Const(ConstValue<'s>),
     Inst(InstRef),
+}
+impl From<InstRef> for ConstOrInst<'_> {
+    #[inline(always)]
+    fn from(value: InstRef) -> Self {
+        Self::Inst(value)
+    }
 }
 
 #[repr(transparent)]
@@ -108,6 +115,11 @@ pub enum Inst<'s> {
     ConstructIntrinsicType(IntrinsicType, Vec<ConstOrInst<'s>>),
     ConstructComposite(Vec<ConstOrInst<'s>>),
     Swizzle(ConstOrInst<'s>, Vec<usize>),
+    CompositeInsert {
+        source: ConstOrInst<'s>,
+        index: usize,
+        value: ConstOrInst<'s>,
+    },
     LoadRef(InstRef),
     StoreRef {
         ptr: InstRef,
@@ -119,24 +131,30 @@ pub enum Inst<'s> {
     },
     Branch {
         source: ConstOrInst<'s>,
-        true_instructions: Vec<Inst<'s>>,
-        false_instructions: Vec<Inst<'s>>,
+        true_instructions: HashMap<InstRef, Inst<'s>>,
+        true_instruction_order: Vec<InstRef>,
+        false_instructions: HashMap<InstRef, Inst<'s>>,
+        false_instruction_order: Vec<InstRef>,
     },
     LoopWhile {
         condition: ConstOrInst<'s>,
-        body: Vec<Inst<'s>>,
+        body: HashMap<InstRef, Inst<'s>>,
+        body_order: Vec<InstRef>,
     },
     BlockValue(ConstOrInst<'s>),
     ContinueLoop,
     BreakLoop,
     Return(ConstOrInst<'s>),
+    LoopStateStorage(BTreeMap<BlockRef, RegisterRef>),
 }
 impl<'s> Inst<'s> {
-    pub fn dump_list(
-        list: &[Self],
+    pub fn dump_ordered(
+        list: &HashMap<InstRef, Self>,
+        order: &[InstRef],
         sink: &mut (impl std::io::Write + ?Sized),
     ) -> std::io::Result<()> {
         fn dump(
+            ord: &InstRef,
             x: &Inst,
             sink: &mut (impl std::io::Write + ?Sized),
             depth: usize,
@@ -144,71 +162,108 @@ impl<'s> Inst<'s> {
             let indent = IndentWriter(depth);
 
             match x {
-                Inst::BuiltinIORef(b) => writeln!(sink, "{indent}BuiltinIORef {b:?}"),
+                Inst::BuiltinIORef(b) => writeln!(sink, "{indent}{ord:?}: BuiltinIORef {b:?}"),
                 Inst::DescriptorRef { set, binding } => {
-                    writeln!(sink, "{indent}DescriptorRef set={set} binding={binding}")
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: DescriptorRef set={set} binding={binding}"
+                    )
                 }
-                Inst::PushConstantRef(o) => writeln!(sink, "{indent}PushConstantRef offset={o}"),
+                Inst::PushConstantRef(o) => {
+                    writeln!(sink, "{indent}{ord:?}: PushConstantRef offset={o}")
+                }
                 Inst::WorkgroupSharedMemoryRef(rp) => {
-                    writeln!(sink, "{indent}WorkgroupSharedMemoryRef id={rp:?}")
+                    writeln!(sink, "{indent}{ord:?}: WorkgroupSharedMemoryRef id={rp:?}")
                 }
                 Inst::CompositeRef(src, compo) => {
-                    writeln!(sink, "{indent}CompositeRef {src:?} {compo:?}")
+                    writeln!(sink, "{indent}{ord:?}: CompositeRef {src:?} {compo:?}")
                 }
                 Inst::IntrinsicBinary(left, op, right) => {
-                    writeln!(sink, "{indent}{left:?} `{op:?}` {right:?}")
+                    writeln!(sink, "{indent}{ord:?}: {left:?} `{op:?}` {right:?}")
                 }
-                Inst::IntrinsicUnary(value, op) => writeln!(sink, "{indent}unary-{op:?} {value:?}"),
-                Inst::Cast(src, t) => writeln!(sink, "{indent}{src:?} as {t:?}"),
+                Inst::IntrinsicUnary(value, op) => {
+                    writeln!(sink, "{indent}{ord:?}: unary-{op:?} {value:?}")
+                }
+                Inst::Cast(src, t) => writeln!(sink, "{indent}{ord:?}: {src:?} as {t:?}"),
                 Inst::ConstructIntrinsicType(it, xs) => {
-                    writeln!(sink, "{indent}{it:?}({:?})", CommaSeparatedWriter(xs))
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: {it:?}({:?})",
+                        CommaSeparatedWriter(xs)
+                    )
                 }
                 Inst::ConstructComposite(xs) => {
-                    writeln!(sink, "{indent}composite({:?})", CommaSeparatedWriter(xs))
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: composite({:?})",
+                        CommaSeparatedWriter(xs)
+                    )
                 }
                 Inst::Swizzle(src, xs) => {
-                    writeln!(sink, "{indent}{src:?}.{}", SwizzleElementWriter(xs))
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: {src:?}.{}",
+                        SwizzleElementWriter(xs)
+                    )
                 }
-                Inst::LoadRef(ptr) => writeln!(sink, "{indent}Load {ptr:?}"),
+                Inst::CompositeInsert {
+                    source,
+                    index,
+                    value,
+                } => writeln!(
+                    sink,
+                    "{indent}{ord:?}: {source:?}.{} <- {value:?}",
+                    SwizzleElementWriter(&[*index])
+                ),
+                Inst::LoadRef(ptr) => writeln!(sink, "{indent}{ord:?}: Load {ptr:?}"),
                 Inst::StoreRef { ptr, value } => {
-                    writeln!(sink, "{indent}Store {ptr:?} <- {value:?}")
+                    writeln!(sink, "{indent}{ord:?}: Store {ptr:?} <- {value:?}")
                 }
                 Inst::IntrinsicCall { identifier, args } => writeln!(
                     sink,
-                    "{indent}IntrinsicCall {identifier}({:?})",
+                    "{indent}{ord:?}: IntrinsicCall {identifier}({:?})",
                     CommaSeparatedWriter(args)
                 ),
                 Inst::Branch {
                     source,
                     true_instructions,
+                    true_instruction_order,
                     false_instructions,
+                    false_instruction_order,
                 } => {
-                    writeln!(sink, "{indent}Branch if {source:?} {{")?;
-                    for x in true_instructions.iter() {
-                        dump(x, sink, depth + 1)?;
+                    writeln!(sink, "{indent}{ord:?}: Branch if {source:?} {{")?;
+                    for x in true_instruction_order.iter() {
+                        dump(x, &true_instructions[x], sink, depth + 1)?;
                     }
                     writeln!(sink, "{indent}}} else {{")?;
-                    for x in false_instructions.iter() {
-                        dump(x, sink, depth + 1)?;
+                    for x in false_instruction_order.iter() {
+                        dump(x, &false_instructions[x], sink, depth + 1)?;
                     }
                     writeln!(sink, "{indent}}}")
                 }
-                Inst::LoopWhile { condition, body } => {
-                    writeln!(sink, "{indent}Loop while {condition:?} {{")?;
-                    for x in body.iter() {
-                        dump(x, sink, depth + 1)?;
+                Inst::LoopWhile {
+                    condition,
+                    body,
+                    body_order,
+                } => {
+                    writeln!(sink, "{indent}{ord:?}: Loop while {condition:?} {{")?;
+                    for x in body_order.iter() {
+                        dump(x, &body[x], sink, depth + 1)?;
                     }
                     writeln!(sink, "{indent}}}")
                 }
-                Inst::ContinueLoop => writeln!(sink, "{indent}continue"),
-                Inst::BreakLoop => writeln!(sink, "{indent}break"),
-                Inst::Return(v) => writeln!(sink, "{indent}return {v:?}"),
-                Inst::BlockValue(v) => writeln!(sink, "{indent}block value = {v:?}"),
+                Inst::ContinueLoop => writeln!(sink, "{indent}{ord:?}: continue"),
+                Inst::BreakLoop => writeln!(sink, "{indent}{ord:?}: break"),
+                Inst::Return(v) => writeln!(sink, "{indent}{ord:?}: return {v:?}"),
+                Inst::BlockValue(v) => writeln!(sink, "{indent}{ord:?}: block value = {v:?}"),
+                Inst::LoopStateStorage(v) => {
+                    writeln!(sink, "{indent}{ord:?}: (LoopStateStorage) {v:?}")
+                }
             }
         }
 
-        for x in list {
-            dump(x, sink, 0)?;
+        for x in order.iter() {
+            dump(x, &list[x], sink, 0)?;
         }
 
         Ok(())
@@ -216,454 +271,453 @@ impl<'s> Inst<'s> {
 }
 
 pub struct Function<'s> {
-    pub instructions: Vec<Inst<'s>>,
+    pub instructions: HashMap<InstRef, Inst<'s>>,
+    pub instruction_order: Vec<InstRef>,
 }
 
-pub fn reconstruct<'a, 's>(
-    blocks: &[crate::ir::block::Block],
-    mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-    registers: &[ConcreteType<'s>],
-    const_map: &HashMap<crate::ir::block::RegisterRef, crate::ir::block::BlockInstruction<'a, 's>>,
-) -> Function<'s> {
-    let mut function = Function {
-        instructions: Vec::new(),
-    };
-    let mut register_to_inst_const_map = HashMap::new();
-
-    for (&r, x) in const_map.iter() {
-        match x {
-            BlockInstruction::ConstUnit => {
-                register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::Unit));
-            }
-            &BlockInstruction::ConstInt(ConstIntLiteral(ref s, m)) => {
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Const(ConstValue::SIntLit(ConstSIntLiteral(s.clone(), m))),
-                );
-            }
-            &BlockInstruction::ConstNumber(ConstNumberLiteral(ref s, m)) => {
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Const(ConstValue::FloatLit(ConstFloatLiteral(s.clone(), m))),
-                );
-            }
-            BlockInstruction::ConstSInt(l) => {
-                register_to_inst_const_map
-                    .insert(r, ConstOrInst::Const(ConstValue::SIntLit(l.clone())));
-            }
-            BlockInstruction::ConstUInt(l) => {
-                register_to_inst_const_map
-                    .insert(r, ConstOrInst::Const(ConstValue::UIntLit(l.clone())));
-            }
-            BlockInstruction::ConstFloat(l) => {
-                register_to_inst_const_map
-                    .insert(r, ConstOrInst::Const(ConstValue::FloatLit(l.clone())));
-            }
-            BlockInstruction::ImmBool(true) => {
-                register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::True));
-            }
-            BlockInstruction::ImmBool(false) => {
-                register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::False));
-            }
-            &BlockInstruction::ImmInt(v) => {
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Const(ConstValue::SInt(v.try_into().unwrap())),
-                );
-            }
-            &BlockInstruction::ImmSInt(v) => {
-                register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::SInt(v)));
-            }
-            &BlockInstruction::ImmUInt(v) => {
-                register_to_inst_const_map.insert(r, ConstOrInst::Const(ConstValue::UInt(v)));
-            }
-            BlockInstruction::ScopeLocalVarRef(_, _) => {
-                unreachable!("non strippped scope local var")
-            }
-            BlockInstruction::FunctionInputVarRef(_, _) => {
-                unreachable!("non strippped function input var")
-            }
-            BlockInstruction::IntrinsicFunctionRef(_) => {
-                unreachable!("non stripped intrinsic function ref")
-            }
-            BlockInstruction::UserDefinedFunctionRef(_, _) => {
-                unreachable!("non inlined user defined function")
-            }
-            BlockInstruction::IntrinsicTypeConstructorRef(_) => {
-                unreachable!("non stripped intrinsic type ctor ref")
-            }
-            &BlockInstruction::BuiltinIORef(b) => {
-                function.instructions.push(Inst::BuiltinIORef(b));
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Inst(InstRef(function.instructions.len() - 1)),
-                );
-            }
-            &BlockInstruction::PushConstantRef(o) => {
-                function.instructions.push(Inst::PushConstantRef(o));
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Inst(InstRef(function.instructions.len() - 1)),
-                );
-            }
-            &BlockInstruction::DescriptorRef { set, binding } => {
-                function
-                    .instructions
-                    .push(Inst::DescriptorRef { set, binding });
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Inst(InstRef(function.instructions.len() - 1)),
-                );
-            }
-            &BlockInstruction::WorkgroupSharedMemoryRef(ref p) => {
-                function
-                    .instructions
-                    .push(Inst::WorkgroupSharedMemoryRef(p.clone()));
-                register_to_inst_const_map.insert(
-                    r,
-                    ConstOrInst::Inst(InstRef(function.instructions.len() - 1)),
-                );
-            }
-            BlockInstruction::Cast(_, _)
-            | BlockInstruction::InstantiateIntrinsicTypeClass(_, _)
-            | BlockInstruction::LoadRef(_)
-            | BlockInstruction::ConstructIntrinsicComposite(_, _)
-            | BlockInstruction::ConstructTuple(_)
-            | BlockInstruction::ConstructStruct(_)
-            | BlockInstruction::PromoteIntToNumber(_)
-            | BlockInstruction::IntrinsicBinaryOp(_, _, _)
-            | BlockInstruction::IntrinsicUnaryOp(_, _)
-            | BlockInstruction::Swizzle(_, _)
-            | BlockInstruction::SwizzleRef(_, _)
-            | BlockInstruction::StaticPathRef(_)
-            | BlockInstruction::MemberRef(_, _)
-            | BlockInstruction::TupleRef(_, _)
-            | BlockInstruction::ArrayRef { .. }
-            | BlockInstruction::Phi(_)
-            | BlockInstruction::RegisterAlias(_)
-            | BlockInstruction::PureIntrinsicCall(_, _)
-            | BlockInstruction::PureFuncall(_, _)
-            | BlockInstruction::CompositeInsert { .. } => {
-                unreachable!("Not a const instruction {x:?}")
-            }
+struct FnInstGenContext<'s> {
+    last_ref_id: usize,
+    generated_inst_register_map: HashMap<RegisterRef, ConstOrInst<'s>>,
+}
+impl<'s> FnInstGenContext<'s> {
+    fn new() -> Self {
+        Self {
+            last_ref_id: 0,
+            generated_inst_register_map: HashMap::new(),
         }
     }
 
+    fn alloc_inst_ref(&mut self) -> InstRef {
+        self.last_ref_id += 1;
+
+        InstRef(self.last_ref_id - 1)
+    }
+
+    fn map_register(&mut self, register: RegisterRef, ci: ConstOrInst<'s>) {
+        self.generated_inst_register_map.insert(register, ci);
+    }
+
+    fn try_get_for_register<'c>(&'c self, register: &RegisterRef) -> Option<&'c ConstOrInst<'s>> {
+        self.generated_inst_register_map.get(register)
+    }
+
+    fn has_generated(&self, register: &RegisterRef) -> bool {
+        self.generated_inst_register_map.contains_key(register)
+    }
+}
+
+struct LocalInstGenContext<'s> {
+    pub instructions: HashMap<InstRef, Inst<'s>>,
+    pub instruction_order: Vec<InstRef>,
+}
+impl<'s> LocalInstGenContext<'s> {
+    fn new() -> Self {
+        Self {
+            instructions: HashMap::new(),
+            instruction_order: Vec::new(),
+        }
+    }
+
+    fn emit_inst(&mut self, fnctx: &mut FnInstGenContext<'s>, inst: Inst<'s>) -> InstRef {
+        let ir = fnctx.alloc_inst_ref();
+        self.instructions.insert(ir, inst);
+        self.instruction_order.push(ir);
+
+        ir
+    }
+}
+
+pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
+    fn emit_const_or_inst<'a, 's>(
+        prg: &BlockifiedProgram<'a, 's>,
+        r: RegisterRef,
+        fnctx: &mut FnInstGenContext<'s>,
+        ctx: &mut LocalInstGenContext<'s>,
+        impure_allowlist: &HashSet<usize>,
+    ) -> ConstOrInst<'s> {
+        if let Some(ir) = fnctx.try_get_for_register(&r) {
+            // すでに生成済み
+            return ir.clone();
+        }
+
+        match r {
+            RegisterRef::Const(r) => match prg.constants[r].inst {
+                BlockConstInstruction::BuiltinIORef(b) => {
+                    let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::BuiltinIORef(b)).into();
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::PushConstantRef(o) => {
+                    let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::PushConstantRef(o)).into();
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::DescriptorRef { set, binding } => {
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::DescriptorRef { set, binding })
+                        .into();
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::WorkgroupSharedMemoryRef(ref rp) => {
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::WorkgroupSharedMemoryRef(rp.clone()))
+                        .into();
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ScopeLocalVarRef(_, _) => {
+                    unreachable!("scope local vars must be stripped")
+                }
+                BlockConstInstruction::FunctionInputVarRef(_, _) => {
+                    unreachable!("function input vars must be stripped")
+                }
+                // そろそろこの辺を考え始めないといけない（usageをトラックして適切な型を推論するようにするのがよさそうか？）
+                BlockConstInstruction::LitInt(ref l) => {
+                    // 一旦IntはSIntで取り扱う（RustもC++もこれっぽいのでそれにならっておく）
+                    let ir =
+                        ConstOrInst::Const(ConstValue::SIntLit(ConstSIntLiteral(l.0.clone(), l.1)));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::LitNum(_) => todo!("litnum"),
+                BlockConstInstruction::LitUInt(ref l) => {
+                    let ir = ConstOrInst::Const(ConstValue::UIntLit(l.clone()));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::LitSInt(ref l) => {
+                    let ir = ConstOrInst::Const(ConstValue::SIntLit(l.clone()));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::LitFloat(ref l) => {
+                    let ir = ConstOrInst::Const(ConstValue::FloatLit(l.clone()));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmBool(true) => {
+                    let ir = ConstOrInst::Const(ConstValue::True);
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmBool(false) => {
+                    let ir = ConstOrInst::Const(ConstValue::False);
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmInt(v) => {
+                    // 一旦IntはSIntで取り扱う（RustもC++もこれっぽいのでそれにならっておく）
+                    let ir = ConstOrInst::Const(ConstValue::SInt(
+                        v.try_into().expect("too large imm number"),
+                    ));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmUInt(v) => {
+                    let ir = ConstOrInst::Const(ConstValue::UInt(v));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmSInt(v) => {
+                    let ir = ConstOrInst::Const(ConstValue::SInt(v));
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::ImmUnit => {
+                    let ir = ConstOrInst::Const(ConstValue::Unit);
+                    fnctx.map_register(RegisterRef::Const(r), ir.clone());
+                    ir
+                }
+                BlockConstInstruction::IntrinsicFunctionRef(_) => {
+                    unreachable!("unprocessed pseudo ref")
+                }
+                BlockConstInstruction::IntrinsicTypeConstructorRef(_) => {
+                    unreachable!("unprocessed pseudo ref")
+                }
+                BlockConstInstruction::UserDefinedFunctionRef(_, _) => {
+                    unreachable!("unprocessed udf ref")
+                }
+            },
+            RegisterRef::Pure(r) => match prg.pure_instructions[r].inst {
+                BlockPureInstruction::Cast(src, ref t) => {
+                    let ConstOrInst::Inst(src) =
+                        emit_const_or_inst(prg, src, fnctx, ctx, impure_allowlist)
+                    else {
+                        unreachable!("cannot emit const cast(needs precomputed)");
+                    };
+
+                    let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::Cast(src, t.clone())).into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::InstantiateIntrinsicTypeClass(_, _) => {
+                    unreachable!("InstantiateIntrinsicTypeClass must be desugared");
+                }
+                BlockPureInstruction::PromoteIntToNumber(_) => {
+                    unreachable!("PromoteIntToNumber must be desugared")
+                }
+                BlockPureInstruction::ConstructIntrinsicComposite(it, ref args) => {
+                    let args = args
+                        .iter()
+                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .collect::<Vec<_>>();
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::ConstructIntrinsicType(it, args))
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::ConstructTuple(ref args) => {
+                    let args = args
+                        .iter()
+                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .collect::<Vec<_>>();
+
+                    let ir: ConstOrInst =
+                        ctx.emit_inst(fnctx, Inst::ConstructComposite(args)).into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::ConstructStruct(ref args) => {
+                    let args = args
+                        .iter()
+                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .collect::<Vec<_>>();
+
+                    let ir: ConstOrInst =
+                        ctx.emit_inst(fnctx, Inst::ConstructComposite(args)).into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::ArrayRef { source, index } => {
+                    let ConstOrInst::Inst(src) =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                    else {
+                        unreachable!("cannot CompositeRef for const value");
+                    };
+                    let index = emit_const_or_inst(prg, index, fnctx, ctx, impure_allowlist);
+
+                    let ir: ConstOrInst =
+                        ctx.emit_inst(fnctx, Inst::CompositeRef(src, index)).into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::TupleRef(source, index) => {
+                    let ConstOrInst::Inst(src) =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                    else {
+                        unreachable!("cannot CompositeRef for const value");
+                    };
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(
+                            fnctx,
+                            Inst::CompositeRef(
+                                src,
+                                ConstOrInst::Const(ConstValue::UInt(
+                                    index.try_into().expect("too large tuple index"),
+                                )),
+                            ),
+                        )
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::MemberRef(source, ref name) => {
+                    let ConstOrInst::Inst(src) =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                    else {
+                        unreachable!("cannot CompositeRef for const value");
+                    };
+                    let member_index = match source
+                        .ty(prg)
+                        .as_dereferenced()
+                        .expect("cannot dereference source of MemberRef")
+                    {
+                        ConcreteType::Struct(members) => members
+                            .iter()
+                            .position(|m| &m.name == name)
+                            .expect("no member found"),
+                        _ => unreachable!("cannot MemberRef to non-struct type"),
+                    };
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(
+                            fnctx,
+                            Inst::CompositeRef(
+                                src,
+                                ConstOrInst::Const(ConstValue::UInt(
+                                    member_index.try_into().expect("too large struct"),
+                                )),
+                            ),
+                        )
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::Swizzle(source, ref indices) => {
+                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::Swizzle(source, indices.clone()))
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::SwizzleRef(_, _) => {
+                    unreachable!("SwizzleRef must be desugared")
+                }
+                BlockPureInstruction::IntrinsicBinaryOp(left, op, right) => {
+                    let left = emit_const_or_inst(prg, left, fnctx, ctx, impure_allowlist);
+                    let right = emit_const_or_inst(prg, right, fnctx, ctx, impure_allowlist);
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::IntrinsicBinary(left, op, right))
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::IntrinsicUnaryOp(source, op) => {
+                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::IntrinsicUnary(source, op))
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::CompositeInsert {
+                    source,
+                    value,
+                    index,
+                } => {
+                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+                    let value = emit_const_or_inst(prg, value, fnctx, ctx, impure_allowlist);
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(
+                            fnctx,
+                            Inst::CompositeInsert {
+                                source,
+                                index,
+                                value,
+                            },
+                        )
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+                BlockPureInstruction::StaticPathRef(_) => unreachable!("deprecated StaticPathRef"),
+                BlockPureInstruction::RegisterAlias(_) => unreachable!("unresolved register alias"),
+                BlockPureInstruction::PureFuncall(_, _) => unreachable!("non inlined funcall"),
+                BlockPureInstruction::PureIntrinsicCall(id, ref args) => {
+                    let args = args
+                        .iter()
+                        .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, impure_allowlist))
+                        .collect::<Vec<_>>();
+
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(
+                            fnctx,
+                            Inst::IntrinsicCall {
+                                identifier: id,
+                                args,
+                            },
+                        )
+                        .into();
+                    fnctx.map_register(RegisterRef::Pure(r), ir.clone());
+                    ir
+                }
+            },
+            // allowlistにあるImpure Register（同ブロック内）はここで処理してもいい
+            RegisterRef::Impure(r) if impure_allowlist.contains(&r) => {
+                match prg.impure_instructions[&r] {
+                    BlockInstruction::LoadRef(ptr) => {
+                        let ConstOrInst::Inst(ptr) =
+                            emit_const_or_inst(prg, ptr, fnctx, ctx, impure_allowlist)
+                        else {
+                            unreachable!("cannot load from const");
+                        };
+
+                        let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::LoadRef(ptr)).into();
+                        fnctx.map_register(RegisterRef::Impure(r), ir.clone());
+                        ir
+                    }
+                    BlockInstruction::Phi(ref incomings) => {
+                        // unimplemented!("phi decoding: {incomings:?}")
+                        let ir: ConstOrInst = ctx
+                            .emit_inst(fnctx, Inst::LoopStateStorage(incomings.clone()))
+                            .into();
+                        fnctx.map_register(RegisterRef::Impure(r), ir.clone());
+                        ir
+                    }
+                }
+            }
+            RegisterRef::Impure(r) => todo!("impure to const_or_inst: r{r}"),
+        }
+    }
     fn process<'a, 's>(
-        blocks: &[crate::ir::block::Block],
-        mod_instructions: &HashMap<RegisterRef, BlockInstruction<'a, 's>>,
-        registers: &[ConcreteType<'s>],
-        const_map: &HashMap<
-            crate::ir::block::RegisterRef,
-            crate::ir::block::BlockInstruction<'a, 's>,
-        >,
+        prg: &BlockifiedProgram<'a, 's>,
         n: crate::ir::block::BlockRef,
         until: Option<crate::ir::block::BlockRef>,
         last_block: &mut crate::ir::block::BlockRef,
-        register_to_inst_const_map: &mut HashMap<RegisterRef, ConstOrInst<'s>>,
-        instructions: &mut Vec<Inst<'s>>,
+        fnctx: &mut FnInstGenContext<'s>,
+        ctx: &mut LocalInstGenContext<'s>,
     ) {
         if until.is_some_and(|x| x == n) {
             // ここまで
             return;
         }
 
-        let mut generated = true;
-        while generated {
-            generated = false;
+        for imr in prg.blocks[n.0].eval_impure_registers.iter() {
+            if fnctx.has_generated(&RegisterRef::Impure(*imr)) {
+                // すでに生成済み
+                continue;
+            }
 
-            for r in blocks[n.0].eval_impure_registers.iter() {
-                if register_to_inst_const_map.contains_key(r) {
-                    // 生成済み
-                    continue;
+            match prg.impure_instructions[imr] {
+                BlockInstruction::LoadRef(ptr) => {
+                    let ConstOrInst::Inst(ptr) = emit_const_or_inst(
+                        prg,
+                        ptr,
+                        fnctx,
+                        ctx,
+                        &prg.blocks[n.0].eval_impure_registers,
+                    ) else {
+                        unreachable!("cannot load from const");
+                    };
+
+                    let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::LoadRef(ptr)).into();
+                    fnctx.map_register(RegisterRef::Impure(*imr), ir);
                 }
-
-                match mod_instructions[r] {
-                    BlockInstruction::ConstUnit => {
-                        unreachable!("ConstUnit cannot be appeared in block")
-                    }
-                    BlockInstruction::ConstFloat(_) => {
-                        unreachable!("ConstFloat cannot be appeared in block")
-                    }
-                    BlockInstruction::ConstSInt(_) => {
-                        unreachable!("ConstSInt cannot be appeared in block")
-                    }
-                    BlockInstruction::ConstUInt(_) => {
-                        unreachable!("ConstUInt cannot be appeared in block")
-                    }
-                    BlockInstruction::ImmBool(_) => {
-                        unreachable!("ImmBool cannot be appeared in block")
-                    }
-                    BlockInstruction::ImmSInt(_) => {
-                        unreachable!("ImmSInt cannot be appeared in block")
-                    }
-                    BlockInstruction::ImmUInt(_) => {
-                        unreachable!("ImmUInt cannot be appeared in block")
-                    }
-                    BlockInstruction::ImmInt(_) => unreachable!("non instantiated imm int"),
-                    BlockInstruction::ConstInt(_) => unreachable!("non instantiated int lit"),
-                    BlockInstruction::ConstNumber(_) => unreachable!("non instantiated number lit"),
-                    BlockInstruction::PromoteIntToNumber(_) => {
-                        unreachable!("unprocessed promotion int -> number")
-                    }
-                    BlockInstruction::BuiltinIORef(_) => {
-                        unreachable!("BuiltinIORef cannot be appeared in block")
-                    }
-                    BlockInstruction::DescriptorRef { .. } => {
-                        unreachable!("DescriptorRef cannot be appeared in block")
-                    }
-                    BlockInstruction::PushConstantRef(_) => {
-                        unreachable!("PushConstantRef cannot be appeared in block")
-                    }
-                    BlockInstruction::WorkgroupSharedMemoryRef(_) => {
-                        unreachable!("WorkgroupSharedMemoryRef cannot be appeared in block")
-                    }
-                    BlockInstruction::StaticPathRef(_) => unreachable!("deprecated"),
-                    BlockInstruction::Cast(src, ref ty) => {
-                        match register_to_inst_const_map.get(&src) {
-                            Some(&ConstOrInst::Inst(i)) => {
-                                instructions.push(Inst::Cast(i, ty.clone()));
-                                register_to_inst_const_map
-                                    .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                                generated = true;
-                            }
-                            Some(ConstOrInst::Const(_)) => unimplemented!("reduce const cast"),
-                            _ => (),
-                        }
-                    }
-                    BlockInstruction::InstantiateIntrinsicTypeClass(_, _) => {
-                        unreachable!("non instantiated inst")
-                    }
-                    BlockInstruction::LoadRef(ptr) => match register_to_inst_const_map.get(&ptr) {
-                        Some(&ConstOrInst::Inst(i)) => {
-                            instructions.push(Inst::LoadRef(i));
-                            register_to_inst_const_map
-                                .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                            generated = true;
-                        }
-                        Some(ConstOrInst::Const(_)) => unreachable!("cannot load ref of const"),
-                        _ => (),
-                    },
-                    BlockInstruction::ConstructIntrinsicComposite(it, ref args) => 'try_emit: {
-                        let mut arg_refs = Vec::with_capacity(args.len());
-                        for a in args.iter() {
-                            let Some(x) = register_to_inst_const_map.get(a) else {
-                                break 'try_emit;
-                            };
-
-                            arg_refs.push(x.clone());
-                        }
-
-                        instructions.push(Inst::ConstructIntrinsicType(it, arg_refs));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::ConstructTuple(ref xs) => 'try_emit: {
-                        let mut arg_refs = Vec::with_capacity(xs.len());
-                        for x in xs.iter() {
-                            let Some(x) = register_to_inst_const_map.get(x) else {
-                                break 'try_emit;
-                            };
-
-                            arg_refs.push(x.clone());
-                        }
-
-                        instructions.push(Inst::ConstructComposite(arg_refs));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::ConstructStruct(ref members) => 'try_emit: {
-                        let mut arg_refs = Vec::with_capacity(members.len());
-                        for x in members.iter() {
-                            let Some(x) = register_to_inst_const_map.get(x) else {
-                                break 'try_emit;
-                            };
-
-                            arg_refs.push(x.clone());
-                        }
-
-                        instructions.push(Inst::ConstructComposite(arg_refs));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::IntrinsicBinaryOp(left, op, right) => 'try_emit: {
-                        let Some(left) = register_to_inst_const_map.get(&left) else {
-                            break 'try_emit;
-                        };
-                        let Some(right) = register_to_inst_const_map.get(&right) else {
-                            break 'try_emit;
-                        };
-
-                        instructions.push(Inst::IntrinsicBinary(left.clone(), op, right.clone()));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::IntrinsicUnaryOp(value, op) => 'try_emit: {
-                        let Some(value) = register_to_inst_const_map.get(&value) else {
-                            break 'try_emit;
-                        };
-
-                        instructions.push(Inst::IntrinsicUnary(value.clone(), op));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::IntrinsicFunctionRef(_) => {
-                        unreachable!("unresolved intrinsic function ref")
-                    }
-                    BlockInstruction::IntrinsicTypeConstructorRef(_) => {
-                        unreachable!("unresolved intrinsic tycon ref")
-                    }
-                    BlockInstruction::ScopeLocalVarRef(_, _) => {
-                        unreachable!("scope local vars are stripped")
-                    }
-                    BlockInstruction::FunctionInputVarRef(_, _) => {
-                        unreachable!("function input vars are stripped")
-                    }
-                    BlockInstruction::UserDefinedFunctionRef(_, _) => {
-                        unreachable!("all user defined functions inlined")
-                    }
-                    BlockInstruction::Swizzle(src, ref elements) => 'try_emit: {
-                        let Some(src) = register_to_inst_const_map.get(&src) else {
-                            break 'try_emit;
-                        };
-
-                        instructions.push(Inst::Swizzle(src.clone(), elements.clone()));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::SwizzleRef(_, _) => unimplemented!("Swizzle Ref"),
-                    BlockInstruction::MemberRef(src, ref name) => match register_to_inst_const_map
-                        .get(&src)
-                    {
-                        Some(&ConstOrInst::Inst(i)) => {
-                            let member_index = match registers[src.0] {
-                                ConcreteType::Ref(ref r) | ConcreteType::MutableRef(ref r) => {
-                                    match &**r {
-                                        ConcreteType::Struct(members) => {
-                                            members.iter().position(|m| m.name == *name).unwrap()
-                                        }
-                                        _ => unreachable!("cannot ref member of this type"),
-                                    }
-                                }
-                                _ => unreachable!("cannot make ref from this type"),
-                            };
-
-                            instructions.push(Inst::CompositeRef(
-                                i,
-                                ConstOrInst::Const(ConstValue::UInt(member_index as _)),
-                            ));
-                            register_to_inst_const_map
-                                .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                            generated = true;
-                        }
-                        Some(&ConstOrInst::Const(_)) => unimplemented!("member ref of const value"),
-                        None => (),
-                    },
-                    BlockInstruction::TupleRef(src, index) => {
-                        match register_to_inst_const_map.get(&src) {
-                            Some(&ConstOrInst::Inst(i)) => {
-                                instructions.push(Inst::CompositeRef(
-                                    i,
-                                    ConstOrInst::Const(ConstValue::UInt(index as _)),
-                                ));
-                                register_to_inst_const_map
-                                    .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                                generated = true;
-                            }
-                            Some(&ConstOrInst::Const(_)) => {
-                                unimplemented!("member ref of const value")
-                            }
-                            None => (),
-                        }
-                    }
-                    BlockInstruction::ArrayRef { source, index } => 'try_emit: {
-                        let source = match register_to_inst_const_map.get(&source) {
-                            Some(&ConstOrInst::Inst(i)) => i,
-                            Some(&ConstOrInst::Const(_)) => {
-                                unimplemented!("array ref of const value")
-                            }
-                            None => break 'try_emit,
-                        };
-                        let Some(index) = register_to_inst_const_map.get(&index) else {
-                            break 'try_emit;
-                        };
-
-                        instructions.push(Inst::CompositeRef(source, index.clone()));
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::Phi(_) => unimplemented!("phi decoding"),
-                    BlockInstruction::RegisterAlias(_) => unreachable!("Unresolved register alias"),
-                    BlockInstruction::PureIntrinsicCall(identifier, ref args) => 'try_emit: {
-                        let mut arg_refs = Vec::with_capacity(args.len());
-                        for a in args.iter() {
-                            let Some(x) = register_to_inst_const_map.get(a) else {
-                                break 'try_emit;
-                            };
-
-                            arg_refs.push(x.clone());
-                        }
-
-                        instructions.push(Inst::IntrinsicCall {
-                            identifier,
-                            args: arg_refs,
-                        });
-                        register_to_inst_const_map
-                            .insert(*r, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                        generated = true;
-                    }
-                    BlockInstruction::PureFuncall(_, _) => {
-                        unreachable!("all user defined functions inlined")
-                    }
-                    BlockInstruction::CompositeInsert { .. } => unimplemented!(),
+                BlockInstruction::Phi(ref incomings) => {
+                    // unimplemented!("phi decoding: {incomings:?}")
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(fnctx, Inst::LoopStateStorage(incomings.clone()))
+                        .into();
+                    fnctx.map_register(RegisterRef::Impure(*imr), ir);
                 }
             }
         }
 
         *last_block = n;
 
-        match blocks[n.0].flow {
+        match prg.blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => {
-                process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
-                    next,
-                    until,
-                    last_block,
-                    register_to_inst_const_map,
-                    instructions,
-                );
+                process(prg, next, until, last_block, fnctx, ctx);
             }
             BlockFlowInstruction::StoreRef { ptr, value, after } => {
-                let Some(&ConstOrInst::Inst(ptr)) = register_to_inst_const_map.get(&ptr) else {
-                    eprintln!("ptr not found: {:#?}", register_to_inst_const_map);
-                    unreachable!("b{} r{} {:?}", n.0, ptr.0, blocks[n.0].flow);
+                let ConstOrInst::Inst(ptr) =
+                    emit_const_or_inst(prg, ptr, fnctx, ctx, &HashSet::new())
+                else {
+                    unreachable!("cannot store to const value");
                 };
-                let Some(value) = register_to_inst_const_map.get(&value).cloned() else {
-                    unreachable!();
-                };
-                instructions.push(Inst::StoreRef { ptr, value });
+                let value = emit_const_or_inst(prg, value, fnctx, ctx, &HashSet::new());
+                ctx.emit_inst(fnctx, Inst::StoreRef { ptr, value });
 
-                process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
-                    after.unwrap(),
-                    until,
-                    last_block,
-                    register_to_inst_const_map,
-                    instructions,
-                );
+                process(prg, after.unwrap(), until, last_block, fnctx, ctx);
             }
             BlockFlowInstruction::Funcall {
                 callee,
@@ -671,14 +725,6 @@ pub fn reconstruct<'a, 's>(
                 result,
                 after_return,
             } => {
-                let Some(callee) = register_to_inst_const_map.get(&callee) else {
-                    eprintln!("callee not found: {:#?}", register_to_inst_const_map);
-                    unreachable!("b{} r{} {:?}", n.0, callee.0, blocks[n.0].flow);
-                };
-                let mut arg_refs = Vec::with_capacity(args.len());
-                for a in args.iter() {
-                    arg_refs.push(register_to_inst_const_map.get(a).unwrap());
-                }
                 unimplemented!("FunctionCall {callee:?}");
             }
             BlockFlowInstruction::IntrinsicImpureFuncall {
@@ -687,28 +733,23 @@ pub fn reconstruct<'a, 's>(
                 result,
                 after_return,
             } => {
-                let mut arg_refs = Vec::with_capacity(args.len());
-                for a in args.iter() {
-                    arg_refs.push(register_to_inst_const_map.get(a).unwrap().clone());
-                }
+                let arg_refs = args
+                    .iter()
+                    .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, &HashSet::new()))
+                    .collect::<Vec<_>>();
 
-                instructions.push(Inst::IntrinsicCall {
-                    identifier,
-                    args: arg_refs,
-                });
-                register_to_inst_const_map
-                    .insert(result, ConstOrInst::Inst(InstRef(instructions.len() - 1)));
-                process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
-                    after_return.unwrap(),
-                    until,
-                    last_block,
-                    register_to_inst_const_map,
-                    instructions,
-                );
+                let ir: ConstOrInst = ctx
+                    .emit_inst(
+                        fnctx,
+                        Inst::IntrinsicCall {
+                            identifier,
+                            args: arg_refs,
+                        },
+                    )
+                    .into();
+                fnctx.map_register(result, ir);
+
+                process(prg, after_return.unwrap(), until, last_block, fnctx, ctx);
             }
             BlockFlowInstruction::Conditional {
                 source,
@@ -716,46 +757,38 @@ pub fn reconstruct<'a, 's>(
                 r#false,
                 merge,
             } => {
-                let Some(source) = register_to_inst_const_map.get(&source).cloned() else {
-                    eprintln!("source not found: {:#?}", register_to_inst_const_map);
-                    unreachable!("b{} r{} {:?}", n.0, source.0, blocks[n.0].flow);
-                };
-                let mut true_instructions = Vec::new();
+                let source = emit_const_or_inst(prg, source, fnctx, ctx, &HashSet::new());
+
+                let mut true_local_ctx = LocalInstGenContext::new();
                 let mut true_last_block = n;
                 process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
+                    prg,
                     r#true,
                     Some(merge),
                     &mut true_last_block,
-                    register_to_inst_const_map,
-                    &mut true_instructions,
+                    fnctx,
+                    &mut true_local_ctx,
                 );
-                let mut false_instructions = Vec::new();
+                let mut false_local_ctx = LocalInstGenContext::new();
                 let mut false_last_block = n;
                 process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
+                    prg,
                     r#false,
                     Some(merge),
                     &mut false_last_block,
-                    register_to_inst_const_map,
-                    &mut false_instructions,
+                    fnctx,
+                    &mut false_local_ctx,
                 );
 
-                if let Some((merge_phi_register, merge_phi_incomings)) = blocks[merge.0]
+                if let Some((merge_phi_register, merge_phi_incomings)) = prg.blocks[merge.0]
                     .eval_impure_registers
                     .iter()
-                    .find_map(|r| match mod_instructions[r] {
+                    .find_map(|r| match prg.impure_instructions[r] {
                         BlockInstruction::Phi(ref incomings) => Some((*r, incomings)),
                         _ => None,
                     })
                 {
-                    let Some(true_phi_incoming_register) =
+                    let Some(&true_phi_incoming_register) =
                         merge_phi_incomings.get(&true_last_block)
                     else {
                         unreachable!(
@@ -763,7 +796,7 @@ pub fn reconstruct<'a, 's>(
                             true_last_block.0
                         );
                     };
-                    let Some(false_phi_incoming_register) =
+                    let Some(&false_phi_incoming_register) =
                         merge_phi_incomings.get(&false_last_block)
                     else {
                         unreachable!(
@@ -771,117 +804,110 @@ pub fn reconstruct<'a, 's>(
                             false_last_block.0
                         );
                     };
-                    let Some(true_phi_value) =
-                        register_to_inst_const_map.get(true_phi_incoming_register)
-                    else {
-                        unreachable!("no value for true phi");
-                    };
-                    let Some(false_phi_value) =
-                        register_to_inst_const_map.get(false_phi_incoming_register)
-                    else {
-                        unreachable!("no value for false phi");
-                    };
 
-                    true_instructions.push(Inst::BlockValue(true_phi_value.clone()));
-                    false_instructions.push(Inst::BlockValue(false_phi_value.clone()));
-                    instructions.push(Inst::Branch {
-                        source,
-                        true_instructions,
-                        false_instructions,
-                    });
-                    register_to_inst_const_map.insert(
-                        merge_phi_register,
-                        ConstOrInst::Inst(InstRef(instructions.len() - 1)),
+                    let true_phi_value = emit_const_or_inst(
+                        prg,
+                        true_phi_incoming_register,
+                        fnctx,
+                        &mut true_local_ctx,
+                        &HashSet::new(),
                     );
+                    let false_phi_value = emit_const_or_inst(
+                        prg,
+                        false_phi_incoming_register,
+                        fnctx,
+                        &mut false_local_ctx,
+                        &HashSet::new(),
+                    );
+
+                    true_local_ctx.emit_inst(fnctx, Inst::BlockValue(true_phi_value.clone()));
+                    false_local_ctx.emit_inst(fnctx, Inst::BlockValue(false_phi_value.clone()));
+                    let ir: ConstOrInst = ctx
+                        .emit_inst(
+                            fnctx,
+                            Inst::Branch {
+                                source,
+                                true_instructions: true_local_ctx.instructions,
+                                true_instruction_order: true_local_ctx.instruction_order,
+                                false_instructions: false_local_ctx.instructions,
+                                false_instruction_order: false_local_ctx.instruction_order,
+                            },
+                        )
+                        .into();
+                    fnctx.map_register(RegisterRef::Impure(merge_phi_register), ir);
                 } else {
-                    instructions.push(Inst::Branch {
-                        source,
-                        true_instructions,
-                        false_instructions,
-                    });
+                    ctx.emit_inst(
+                        fnctx,
+                        Inst::Branch {
+                            source,
+                            true_instructions: true_local_ctx.instructions,
+                            true_instruction_order: true_local_ctx.instruction_order,
+                            false_instructions: false_local_ctx.instructions,
+                            false_instruction_order: false_local_ctx.instruction_order,
+                        },
+                    );
                 }
 
-                process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
-                    merge,
-                    until,
-                    last_block,
-                    register_to_inst_const_map,
-                    instructions,
-                );
+                process(prg, merge, until, last_block, fnctx, ctx);
             }
+            BlockFlowInstruction::ConditionalEnd => (/* end */),
             BlockFlowInstruction::ConditionalLoop {
                 condition,
                 r#break,
                 r#continue,
                 body,
             } => {
-                let Some(condition) = register_to_inst_const_map.get(&condition).cloned() else {
-                    unreachable!();
-                };
+                let condition = emit_const_or_inst(prg, condition, fnctx, ctx, &HashSet::new());
 
-                let mut body_instructions = Vec::new();
+                let mut body_local_ctx = LocalInstGenContext::new();
                 let mut body_last_block = body;
                 process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
+                    prg,
                     body,
                     Some(r#break),
                     &mut body_last_block,
-                    register_to_inst_const_map,
-                    &mut body_instructions,
+                    fnctx,
+                    &mut body_local_ctx,
                 );
 
-                instructions.push(Inst::LoopWhile {
-                    condition,
-                    body: body_instructions,
-                });
-                process(
-                    blocks,
-                    mod_instructions,
-                    registers,
-                    const_map,
-                    r#break,
-                    until,
-                    last_block,
-                    register_to_inst_const_map,
-                    instructions,
+                ctx.emit_inst(
+                    fnctx,
+                    Inst::LoopWhile {
+                        condition,
+                        body: body_local_ctx.instructions,
+                        body_order: body_local_ctx.instruction_order,
+                    },
                 );
+                process(prg, r#break, until, last_block, fnctx, ctx);
             }
             BlockFlowInstruction::Break => {
-                instructions.push(Inst::BreakLoop);
+                ctx.emit_inst(fnctx, Inst::BreakLoop);
             }
             BlockFlowInstruction::Continue => {
-                instructions.push(Inst::ContinueLoop);
+                ctx.emit_inst(fnctx, Inst::ContinueLoop);
             }
             BlockFlowInstruction::Return(v) => {
-                let Some(v) = register_to_inst_const_map.get(&v).cloned() else {
-                    unreachable!();
-                };
-
-                instructions.push(Inst::Return(v));
+                let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new());
+                ctx.emit_inst(fnctx, Inst::Return(v));
             }
             BlockFlowInstruction::Undetermined => unreachable!("undetermined destination"),
         }
     }
 
+    let mut function_ctx = FnInstGenContext::new();
+    let mut function_local_ctx = LocalInstGenContext::new();
+
     process(
-        blocks,
-        mod_instructions,
-        registers,
-        const_map,
+        prg,
         crate::ir::block::BlockRef(0),
         None,
         &mut crate::ir::block::BlockRef(0),
-        &mut register_to_inst_const_map,
-        &mut function.instructions,
+        &mut function_ctx,
+        &mut function_local_ctx,
     );
 
-    function
+    Function {
+        instructions: function_local_ctx.instructions,
+        instruction_order: function_local_ctx.instruction_order,
+    }
 }
-*/

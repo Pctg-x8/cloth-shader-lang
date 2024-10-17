@@ -1,6 +1,6 @@
 mod r#const;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     concrete_type::ConcreteType,
@@ -167,6 +167,7 @@ pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<Bl
         processing: BlockRef,
         incoming: BlockRef,
         loop_stack: &mut Vec<(BlockRef, BlockRef)>,
+        merge_stack: &mut Vec<BlockRef>,
         collect: &mut HashMap<BlockRef, HashSet<BlockRef>>,
     ) {
         match collect.entry(processing) {
@@ -183,32 +184,55 @@ pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<Bl
 
         match blocks[processing.0].flow {
             BlockFlowInstruction::Goto(next) => {
-                process(blocks, next, processing, loop_stack, collect)
+                process(blocks, next, processing, loop_stack, merge_stack, collect)
             }
             BlockFlowInstruction::StoreRef {
                 after: Some(next), ..
-            } => process(blocks, next, processing, loop_stack, collect),
+            } => process(blocks, next, processing, loop_stack, merge_stack, collect),
             BlockFlowInstruction::StoreRef { after: None, .. } => (),
             BlockFlowInstruction::Funcall {
                 after_return: Some(next),
                 ..
-            } => process(blocks, next, processing, loop_stack, collect),
+            } => process(blocks, next, processing, loop_stack, merge_stack, collect),
             BlockFlowInstruction::Funcall {
                 after_return: None, ..
             } => (),
             BlockFlowInstruction::IntrinsicImpureFuncall {
                 after_return: Some(next),
                 ..
-            } => process(blocks, next, processing, loop_stack, collect),
+            } => process(blocks, next, processing, loop_stack, merge_stack, collect),
             BlockFlowInstruction::IntrinsicImpureFuncall {
                 after_return: None, ..
             } => (),
             BlockFlowInstruction::Return(_) => (),
             BlockFlowInstruction::Conditional {
-                r#true, r#false, ..
+                r#true,
+                r#false,
+                merge,
+                ..
             } => {
-                process(blocks, r#true, processing, loop_stack, collect);
-                process(blocks, r#false, processing, loop_stack, collect);
+                merge_stack.push(merge);
+                process(
+                    blocks,
+                    r#true,
+                    processing,
+                    loop_stack,
+                    &mut merge_stack.clone(),
+                    collect,
+                );
+                process(
+                    blocks,
+                    r#false,
+                    processing,
+                    loop_stack,
+                    &mut merge_stack.clone(),
+                    collect,
+                );
+                merge_stack.pop();
+            }
+            BlockFlowInstruction::ConditionalEnd => {
+                let m = merge_stack.pop().expect("not in conditional branch");
+                process(blocks, m, processing, loop_stack, merge_stack, collect);
             }
             BlockFlowInstruction::ConditionalLoop {
                 r#break,
@@ -217,20 +241,41 @@ pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<Bl
                 ..
             } => {
                 loop_stack.push((r#continue, r#break));
-                process(blocks, body, processing, loop_stack, collect);
+                process(blocks, body, processing, loop_stack, merge_stack, collect);
                 loop_stack.pop();
 
-                process(blocks, r#break, processing, loop_stack, collect);
+                process(
+                    blocks,
+                    r#break,
+                    processing,
+                    loop_stack,
+                    merge_stack,
+                    collect,
+                );
             }
             BlockFlowInstruction::Continue => {
                 let &(next, _) = loop_stack.last().expect("continue outside a loop");
                 let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
-                process(blocks, next, processing, &mut new_stack, collect);
+                process(
+                    blocks,
+                    next,
+                    processing,
+                    &mut new_stack,
+                    merge_stack,
+                    collect,
+                );
             }
             BlockFlowInstruction::Break => {
                 let &(_, next) = loop_stack.last().expect("break outside a loop");
                 let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
-                process(blocks, next, processing, &mut new_stack, collect);
+                process(
+                    blocks,
+                    next,
+                    processing,
+                    &mut new_stack,
+                    merge_stack,
+                    collect,
+                );
             }
             BlockFlowInstruction::Undetermined => (),
         }
@@ -238,35 +283,94 @@ pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<Bl
 
     let mut collect = HashMap::new();
     let mut loop_stack = Vec::new();
+    let mut merge_stack = Vec::new();
 
     match blocks[0].flow {
         BlockFlowInstruction::Goto(next) => {
-            process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect);
+            process(
+                blocks,
+                next,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
         }
         BlockFlowInstruction::StoreRef {
             after: Some(next), ..
-        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        } => process(
+            blocks,
+            next,
+            BlockRef(0),
+            &mut loop_stack,
+            &mut merge_stack,
+            &mut collect,
+        ),
         BlockFlowInstruction::StoreRef { after: None, .. } => (),
         BlockFlowInstruction::Funcall {
             after_return: Some(next),
             ..
-        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        } => process(
+            blocks,
+            next,
+            BlockRef(0),
+            &mut loop_stack,
+            &mut merge_stack,
+            &mut collect,
+        ),
         BlockFlowInstruction::Funcall {
             after_return: None, ..
         } => (),
         BlockFlowInstruction::IntrinsicImpureFuncall {
             after_return: Some(next),
             ..
-        } => process(blocks, next, BlockRef(0), &mut loop_stack, &mut collect),
+        } => process(
+            blocks,
+            next,
+            BlockRef(0),
+            &mut loop_stack,
+            &mut merge_stack,
+            &mut collect,
+        ),
         BlockFlowInstruction::IntrinsicImpureFuncall {
             after_return: None, ..
         } => (),
         BlockFlowInstruction::Return(_) => (),
         BlockFlowInstruction::Conditional {
-            r#true, r#false, ..
+            r#true,
+            r#false,
+            merge,
+            ..
         } => {
-            process(blocks, r#true, BlockRef(0), &mut loop_stack, &mut collect);
-            process(blocks, r#false, BlockRef(0), &mut loop_stack, &mut collect);
+            merge_stack.push(merge);
+            process(
+                blocks,
+                r#true,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack.clone(),
+                &mut collect,
+            );
+            process(
+                blocks,
+                r#false,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack.clone(),
+                &mut collect,
+            );
+            merge_stack.pop();
+        }
+        BlockFlowInstruction::ConditionalEnd => {
+            let m = merge_stack.pop().expect("not in conditional branch");
+            process(
+                blocks,
+                m,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
         }
         BlockFlowInstruction::ConditionalLoop {
             r#break,
@@ -275,20 +379,48 @@ pub fn collect_block_incomings(blocks: &[Block]) -> HashMap<BlockRef, HashSet<Bl
             ..
         } => {
             loop_stack.push((r#continue, r#break));
-            process(blocks, body, BlockRef(0), &mut loop_stack, &mut collect);
+            process(
+                blocks,
+                body,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
             loop_stack.pop();
 
-            process(blocks, r#break, BlockRef(0), &mut loop_stack, &mut collect);
+            process(
+                blocks,
+                r#break,
+                BlockRef(0),
+                &mut loop_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
         }
         BlockFlowInstruction::Continue => {
             let &(next, _) = loop_stack.last().expect("continue outside a loop");
             let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
-            process(blocks, next, BlockRef(0), &mut new_stack, &mut collect);
+            process(
+                blocks,
+                next,
+                BlockRef(0),
+                &mut new_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
         }
         BlockFlowInstruction::Break => {
             let &(_, next) = loop_stack.last().expect("break outside a loop");
             let mut new_stack = loop_stack[..loop_stack.len() - 1].to_vec();
-            process(blocks, next, BlockRef(0), &mut new_stack, &mut collect);
+            process(
+                blocks,
+                next,
+                BlockRef(0),
+                &mut new_stack,
+                &mut merge_stack,
+                &mut collect,
+            );
         }
         BlockFlowInstruction::Undetermined => (),
     }
@@ -351,6 +483,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
         incoming: BlockRef,
         meta: &mut HashMap<BlockRef, BlockMetadata<'a, 's>>,
         loop_stack: &mut Vec<(BlockRef, BlockRef)>,
+        merge_stack: &mut Vec<BlockRef>,
     ) {
         // 流入ブロックでの最終的なローカルメモリマップ（流入ブロックにおけるincoming state + 流入ブロックの変数代入操作）
         let incoming_stores = meta[&incoming]
@@ -449,6 +582,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         processing,
                         meta,
                         loop_stack,
+                        merge_stack,
                     ),
                     BlockFlowInstruction::StoreRef {
                         after: Some(next), ..
@@ -459,6 +593,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         processing,
                         meta,
                         loop_stack,
+                        merge_stack,
                     ),
                     BlockFlowInstruction::StoreRef { after: None, .. } => (),
                     BlockFlowInstruction::Funcall {
@@ -471,6 +606,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         processing,
                         meta,
                         loop_stack,
+                        merge_stack,
                     ),
                     BlockFlowInstruction::Funcall {
                         after_return: None, ..
@@ -485,13 +621,18 @@ pub fn propagate_local_memory_stores<'a, 's>(
                         processing,
                         meta,
                         loop_stack,
+                        merge_stack,
                     ),
                     BlockFlowInstruction::IntrinsicImpureFuncall {
                         after_return: None, ..
                     } => (),
                     BlockFlowInstruction::Conditional {
-                        r#true, r#false, ..
+                        r#true,
+                        r#false,
+                        merge,
+                        ..
                     } => {
+                        merge_stack.push(merge);
                         process(
                             prg,
                             block_local_memory_stores,
@@ -499,6 +640,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             loop_stack,
+                            &mut merge_stack.clone(),
                         );
                         process(
                             prg,
@@ -507,6 +649,20 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             loop_stack,
+                            &mut merge_stack.clone(),
+                        );
+                        merge_stack.pop();
+                    }
+                    BlockFlowInstruction::ConditionalEnd => {
+                        let m = merge_stack.pop().expect("not in conditional branch");
+                        process(
+                            prg,
+                            block_local_memory_stores,
+                            m,
+                            processing,
+                            meta,
+                            loop_stack,
+                            merge_stack,
                         );
                     }
                     BlockFlowInstruction::ConditionalLoop {
@@ -523,6 +679,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             loop_stack,
+                            merge_stack,
                         );
                         loop_stack.pop();
                         process(
@@ -532,6 +689,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             loop_stack,
+                            merge_stack,
                         );
                     }
                     BlockFlowInstruction::Continue => {
@@ -544,6 +702,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             &mut new_loop_stack,
+                            merge_stack,
                         );
                     }
                     BlockFlowInstruction::Break => {
@@ -556,6 +715,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                             processing,
                             meta,
                             &mut new_loop_stack,
+                            merge_stack,
                         );
                     }
                     BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
@@ -566,6 +726,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
 
     let mut meta = HashMap::new();
     let mut loop_stack = Vec::new();
+    let mut merge_stack = Vec::new();
 
     // b0 has empty state
     meta.insert(
@@ -583,6 +744,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             BlockRef(0),
             &mut meta,
             &mut loop_stack,
+            &mut merge_stack,
         ),
         BlockFlowInstruction::StoreRef {
             after: Some(next), ..
@@ -593,6 +755,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             BlockRef(0),
             &mut meta,
             &mut loop_stack,
+            &mut merge_stack,
         ),
         BlockFlowInstruction::StoreRef { after: None, .. } => (),
         BlockFlowInstruction::Funcall {
@@ -605,6 +768,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
             BlockRef(0),
             &mut meta,
             &mut loop_stack,
+            &mut merge_stack,
         ),
         BlockFlowInstruction::Funcall {
             after_return: None, ..
@@ -619,13 +783,18 @@ pub fn propagate_local_memory_stores<'a, 's>(
             BlockRef(0),
             &mut meta,
             &mut loop_stack,
+            &mut merge_stack,
         ),
         BlockFlowInstruction::IntrinsicImpureFuncall {
             after_return: None, ..
         } => (),
         BlockFlowInstruction::Conditional {
-            r#true, r#false, ..
+            r#true,
+            r#false,
+            merge,
+            ..
         } => {
+            merge_stack.push(merge);
             process(
                 prg,
                 block_local_memory_stores,
@@ -633,6 +802,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut loop_stack,
+                &mut merge_stack.clone(),
             );
             process(
                 prg,
@@ -641,6 +811,20 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut loop_stack,
+                &mut merge_stack.clone(),
+            );
+            merge_stack.pop();
+        }
+        BlockFlowInstruction::ConditionalEnd => {
+            let m = merge_stack.pop().expect("not in conditional branch");
+            process(
+                prg,
+                block_local_memory_stores,
+                m,
+                BlockRef(0),
+                &mut meta,
+                &mut loop_stack,
+                &mut merge_stack,
             );
         }
         BlockFlowInstruction::ConditionalLoop {
@@ -657,6 +841,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut loop_stack,
+                &mut merge_stack,
             );
             loop_stack.pop();
             process(
@@ -666,6 +851,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut loop_stack,
+                &mut merge_stack,
             );
         }
         BlockFlowInstruction::Continue => {
@@ -678,6 +864,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut new_loop_stack,
+                &mut merge_stack,
             );
         }
         BlockFlowInstruction::Break => {
@@ -690,6 +877,7 @@ pub fn propagate_local_memory_stores<'a, 's>(
                 BlockRef(0),
                 &mut meta,
                 &mut new_loop_stack,
+                &mut merge_stack,
             );
         }
         BlockFlowInstruction::Return(_) | BlockFlowInstruction::Undetermined => (),
@@ -875,6 +1063,7 @@ pub fn merge_simple_goto_blocks(prg: &mut BlockifiedProgram) -> bool {
 
             if !merged.has_block_dependent_instructions(&prg.impure_instructions)
                 && !merged.is_loop_term_block()
+                && !merged.is_branch_term_block()
             {
                 current
                     .eval_impure_registers
@@ -944,6 +1133,9 @@ pub fn merge_simple_goto_blocks(prg: &mut BlockifiedProgram) -> bool {
                     BlockFlowInstruction::Break | BlockFlowInstruction::Continue => {
                         unreachable!("break/continue cannot determine new_after")
                     }
+                    BlockFlowInstruction::ConditionalEnd => {
+                        unreachable!("ConditionalEnd marker cannot determine new_after")
+                    }
                     BlockFlowInstruction::Return(_)
                     | BlockFlowInstruction::Undetermined
                     | BlockFlowInstruction::StoreRef { after: None, .. }
@@ -973,6 +1165,7 @@ pub fn rechain_blocks(prg: &mut BlockifiedProgram) {
         current_block: BlockRef,
         sink_blocks: &mut Vec<Block>,
         block_relocate_map: &mut HashMap<BlockRef, BlockRef>,
+        merge_stack: &mut Vec<BlockRef>,
     ) {
         if block_relocate_map.contains_key(&current_block) {
             // すでに訪問済み
@@ -1008,18 +1201,57 @@ pub fn rechain_blocks(prg: &mut BlockifiedProgram) {
                 after_return: Some(next),
                 ..
             } => {
-                collect(old_blocks, next, sink_blocks, block_relocate_map);
+                collect(
+                    old_blocks,
+                    next,
+                    sink_blocks,
+                    block_relocate_map,
+                    merge_stack,
+                );
             }
             &BlockFlowInstruction::Conditional {
-                r#true, r#false, ..
+                r#true,
+                r#false,
+                merge,
+                ..
             } => {
-                collect(old_blocks, r#true, sink_blocks, block_relocate_map);
-                collect(old_blocks, r#false, sink_blocks, block_relocate_map);
+                merge_stack.push(merge);
+                collect(
+                    old_blocks,
+                    r#true,
+                    sink_blocks,
+                    block_relocate_map,
+                    &mut merge_stack.clone(),
+                );
+                collect(
+                    old_blocks,
+                    r#false,
+                    sink_blocks,
+                    block_relocate_map,
+                    &mut merge_stack.clone(),
+                );
+                merge_stack.pop();
+            }
+            BlockFlowInstruction::ConditionalEnd => {
+                let m = merge_stack.pop().expect("not in conditional branch");
+                collect(old_blocks, m, sink_blocks, block_relocate_map, merge_stack);
             }
             &BlockFlowInstruction::ConditionalLoop { r#break, body, .. } => {
                 // continueはみなくていい（他のブロックからの流入ですでに訪問済みのはず）
-                collect(old_blocks, body, sink_blocks, block_relocate_map);
-                collect(old_blocks, r#break, sink_blocks, block_relocate_map);
+                collect(
+                    old_blocks,
+                    body,
+                    sink_blocks,
+                    block_relocate_map,
+                    merge_stack,
+                );
+                collect(
+                    old_blocks,
+                    r#break,
+                    sink_blocks,
+                    block_relocate_map,
+                    merge_stack,
+                );
             }
         }
     }
@@ -1028,6 +1260,7 @@ pub fn rechain_blocks(prg: &mut BlockifiedProgram) {
         BlockRef(0),
         &mut prg.blocks,
         &mut block_relocate_map,
+        &mut Vec::new(),
     );
 
     for b in prg.blocks.iter_mut() {
@@ -1387,6 +1620,7 @@ pub fn inline_function1<'a, 's>(
                 prg.impure_instructions.extend(new_impure_instructions);
 
                 // インライン元の実行ブロックを全部インライン先の末尾につなげる
+                let mut return_phi_map = BTreeMap::new();
                 prg.blocks.extend(
                     user_function_body
                         .borrow()
@@ -1394,7 +1628,8 @@ pub fn inline_function1<'a, 's>(
                         .blocks
                         .iter()
                         .cloned()
-                        .map(|mut b| {
+                        .enumerate()
+                        .map(|(bx, mut b)| {
                             b.eval_impure_registers = b
                                 .eval_impure_registers
                                 .into_iter()
@@ -1408,11 +1643,13 @@ pub fn inline_function1<'a, 's>(
 
                             b.flow = match b.flow {
                                 BlockFlowInstruction::Return(v) => {
-                                    // インラインされた関数のReturnはresultへのStoreRefにする
-                                    BlockFlowInstruction::StoreRef {
-                                        ptr: result,
-                                        value: v,
-                                        after: after_return,
+                                    // インラインされた関数のReturnはresultへのAlias+Gotoにする
+                                    // 複数Returnがあり得るので、resultはPhiになる
+                                    return_phi_map.insert(BlockRef(bx + base_execution_block), v);
+
+                                    match after_return {
+                                        Some(a) => BlockFlowInstruction::Goto(a),
+                                        None => BlockFlowInstruction::Undetermined,
                                     }
                                 }
                                 x => x,
@@ -1421,6 +1658,17 @@ pub fn inline_function1<'a, 's>(
                             b
                         }),
                 );
+
+                // return先ブロックでresultをphiにして評価させる
+                if let Some(a) = after_return {
+                    let RegisterRef::Impure(r) = result else {
+                        unreachable!("impure funcall result must be impure register");
+                    };
+                    prg.impure_instructions.insert(r, BlockInstruction::Phi(return_phi_map));
+                    prg.blocks[a.0].eval_impure_registers.insert(r);
+                } else {
+                    eprintln!("warn: impure funcall destination block is unknown, return value may not be evaluated");
+                }
 
                 // 引数セットアップブロックと実行ブロックを繋げる
                 assert!(prg.blocks[arg_store_perform_block_range.end().0]

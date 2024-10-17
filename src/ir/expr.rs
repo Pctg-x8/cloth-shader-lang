@@ -1124,11 +1124,24 @@ pub fn simplify_expression<'a, 's>(
                 }
             };
 
+            let then_term_block =
+                block_ctx.add(Block::flow_only(BlockFlowInstruction::ConditionalEnd));
+            let else_term_block =
+                block_ctx.add(Block::flow_only(BlockFlowInstruction::ConditionalEnd));
+            assert!(
+                block_ctx.try_chain(then.end_block, then_term_block),
+                "then multiple out?"
+            );
+            assert!(
+                block_ctx.try_chain(r#else.end_block, else_term_block),
+                "else multiple out?"
+            );
+
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let result = inst.phi(
                 [
-                    (then.end_block, then.result),
-                    (r#else.end_block, r#else.result),
+                    (then_term_block, then.result),
+                    (r#else_term_block, r#else.result),
                 ]
                 .into_iter()
                 .collect(),
@@ -1140,17 +1153,10 @@ pub fn simplify_expression<'a, 's>(
                 block_ctx.block_mut(condition.end_block).try_set_branch(
                     condition.result,
                     then.start_block,
-                    r#else.start_block
+                    r#else.start_block,
+                    merge_block
                 ),
                 "already chained?"
-            );
-            assert!(
-                block_ctx.try_chain(then.end_block, merge_block),
-                "then multiple out?"
-            );
-            assert!(
-                block_ctx.try_chain(r#else.end_block, merge_block),
-                "else multiple out?"
             );
 
             SimplifyResult {
