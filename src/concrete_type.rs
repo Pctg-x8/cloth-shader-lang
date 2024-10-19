@@ -465,6 +465,10 @@ impl<'s> ConcreteType<'s> {
         }
     }
 
+    pub const fn is_unknown_type_class(&self) -> bool {
+        matches!(self, Self::UnknownIntClass | Self::UnknownNumberClass)
+    }
+
     pub fn make_spv_type(&self, scope: &SymbolScope<'_, 's>) -> spv::Type {
         match self {
             Self::Intrinsic(it) => it.make_spv_type(),

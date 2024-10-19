@@ -15,9 +15,9 @@ use ir::{
     expr::simplify_expression,
     opt::{
         collect_block_incomings, collect_block_local_memory_stores, deconstruct_effectless_phi,
-        fold_const_ops, inline_function1, merge_simple_goto_blocks, promote_instantiate_const,
-        propagate_local_memory_stores, rechain_blocks, replace_local_memory_load,
-        replace_shader_input_refs, resolve_intrinsic_funcalls,
+        distribute_instantiate, fold_const_ops, inline_function1, merge_simple_goto_blocks,
+        promote_instantiate_const, propagate_local_memory_stores, rechain_blocks,
+        replace_local_memory_load, replace_shader_input_refs, resolve_intrinsic_funcalls,
         strip_never_load_local_memory_stores, strip_unreferenced_const,
         strip_unreferenced_impure_instructions, strip_unreferenced_pure_instructions,
         transform_swizzle_component_store, unify_constants, unify_pure_instructions,
@@ -291,6 +291,31 @@ fn main() {
 
                         *last_irdoc = next_irdoc;
                     }
+                }
+
+                // constant promotion normalizations
+                let mut needs_reopt = true;
+                while needs_reopt {
+                    needs_reopt = false;
+
+                    let modified = distribute_instantiate(&mut prg);
+                    needs_reopt = needs_reopt || modified;
+                    perform_log(
+                        &f.fname_token,
+                        "DistributeInstantiate",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
+
+                    let modified = strip_unreferenced_pure_instructions(&mut prg);
+                    perform_log(
+                        &f.fname_token,
+                        "StripUnreferencedPureInstructions(DistributeInstantiate)",
+                        modified,
+                        &mut last_ir_document,
+                        &prg,
+                    );
                 }
 
                 // constant optimization
@@ -1417,6 +1442,31 @@ fn optimize<'a, 's>(
         &mut last_ir_document,
         &body,
     );
+
+    // constant promotion normalizations
+    let mut needs_reopt = true;
+    while needs_reopt {
+        needs_reopt = false;
+
+        let modified = distribute_instantiate(&mut body.program);
+        needs_reopt = needs_reopt || modified;
+        perform_log(
+            f,
+            "DistributeInstantiate",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+
+        let modified = strip_unreferenced_pure_instructions(&mut body.program);
+        perform_log(
+            f,
+            "StripUnreferencedPureInstructions(DistributeInstantiate)",
+            modified,
+            &mut last_ir_document,
+            body,
+        );
+    }
 
     // constant optimization
     let mut needs_reopt = true;

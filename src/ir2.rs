@@ -137,13 +137,15 @@ pub enum Inst<'s> {
         false_instruction_order: Vec<InstRef>,
     },
     LoopWhile {
-        condition: ConstOrInst<'s>,
+        incoming_block: BlockRef,
+        condition: HashMap<InstRef, Inst<'s>>,
+        condition_order: Vec<InstRef>,
         body: HashMap<InstRef, Inst<'s>>,
         body_order: Vec<InstRef>,
     },
     BlockValue(ConstOrInst<'s>),
-    ContinueLoop,
-    BreakLoop,
+    ContinueLoop(BlockRef),
+    BreakLoop(BlockRef),
     Return(ConstOrInst<'s>),
     LoopStateStorage(BTreeMap<BlockRef, RegisterRef>),
 }
@@ -242,18 +244,27 @@ impl<'s> Inst<'s> {
                     writeln!(sink, "{indent}}}")
                 }
                 Inst::LoopWhile {
+                    incoming_block,
                     condition,
+                    condition_order,
                     body,
                     body_order,
                 } => {
-                    writeln!(sink, "{indent}{ord:?}: Loop while {condition:?} {{")?;
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: Loop (Enter @ {incoming_block}) while {{"
+                    )?;
+                    for x in condition_order.iter() {
+                        dump(x, &condition[x], sink, depth + 1)?;
+                    }
+                    writeln!(sink, "{indent}}} do {{")?;
                     for x in body_order.iter() {
                         dump(x, &body[x], sink, depth + 1)?;
                     }
                     writeln!(sink, "{indent}}}")
                 }
-                Inst::ContinueLoop => writeln!(sink, "{indent}{ord:?}: continue"),
-                Inst::BreakLoop => writeln!(sink, "{indent}{ord:?}: break"),
+                Inst::ContinueLoop(b) => writeln!(sink, "{indent}{ord:?}: continue @ {b}"),
+                Inst::BreakLoop(b) => writeln!(sink, "{indent}{ord:?}: break @ {b}"),
                 Inst::Return(v) => writeln!(sink, "{indent}{ord:?}: return {v:?}"),
                 Inst::BlockValue(v) => writeln!(sink, "{indent}{ord:?}: block value = {v:?}"),
                 Inst::LoopStateStorage(v) => {
@@ -702,6 +713,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
             }
         }
 
+        let incoming_block = *last_block;
         *last_block = n;
 
         match prg.blocks[n.0].flow {
@@ -857,7 +869,17 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 r#continue,
                 body,
             } => {
-                let condition = emit_const_or_inst(prg, condition, fnctx, ctx, &HashSet::new());
+                // TODO: 本当はr#continue..=nのブロック列を演算してconditionを結果として抜ける演算ブロックを算出する必要がある これどうやる......？
+                let mut condition_local_ctx = LocalInstGenContext::new();
+                let mut condition_last_block = condition;
+                let condition = emit_const_or_inst(
+                    prg,
+                    condition,
+                    fnctx,
+                    &mut condition_local_ctx,
+                    &HashSet::new(),
+                );
+                condition_local_ctx.emit_inst(fnctx, Inst::BlockValue(condition));
 
                 let mut body_local_ctx = LocalInstGenContext::new();
                 let mut body_last_block = body;
@@ -873,7 +895,9 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 ctx.emit_inst(
                     fnctx,
                     Inst::LoopWhile {
-                        condition,
+                        incoming_block,
+                        condition: condition_local_ctx.instructions,
+                        condition_order: condition_local_ctx.instruction_order,
                         body: body_local_ctx.instructions,
                         body_order: body_local_ctx.instruction_order,
                     },
@@ -881,10 +905,10 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 process(prg, r#break, until, last_block, fnctx, ctx);
             }
             BlockFlowInstruction::Break => {
-                ctx.emit_inst(fnctx, Inst::BreakLoop);
+                ctx.emit_inst(fnctx, Inst::BreakLoop(n));
             }
             BlockFlowInstruction::Continue => {
-                ctx.emit_inst(fnctx, Inst::ContinueLoop);
+                ctx.emit_inst(fnctx, Inst::ContinueLoop(n));
             }
             BlockFlowInstruction::Return(v) => {
                 let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new());

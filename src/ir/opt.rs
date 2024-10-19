@@ -3,8 +3,8 @@ mod r#const;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    concrete_type::ConcreteType,
-    ir::block::BlockFlowInstruction,
+    concrete_type::{ConcreteType, IntrinsicType},
+    ir::block::{BlockFlowInstruction, IntrinsicUnaryOperation},
     ref_path::RefPath,
     scope::{SymbolScope, VarId},
     symbol::{
@@ -21,6 +21,120 @@ use super::block::{
     BlockifiedProgram, Constants, ImpureInstructionMap, PureInstructions, RegisterAliasMap,
     RegisterRef,
 };
+
+/// 演算/PhiのInstantiateIntrinsicTypeClassをそれぞれの項に分配
+pub fn distribute_instantiate(prg: &mut BlockifiedProgram) -> bool {
+    let mut modified = false;
+    let mut register_alias_map = HashMap::new();
+    let mut transformed = HashMap::new();
+
+    let max_pure_reg = prg.pure_instructions.len();
+    for r in 0..max_pure_reg {
+        match prg.pure_instructions[r].inst {
+            BlockPureInstruction::InstantiateIntrinsicTypeClass(RegisterRef::Pure(src), it) => {
+                if let Some(&replaced_reg) = transformed.get(&RegisterRef::Pure(src)) {
+                    // このステップで変換済み
+                    register_alias_map.insert(RegisterRef::Pure(r), replaced_reg);
+                    continue;
+                }
+
+                assert!(
+                    prg.pure_instructions[src].ty.is_unknown_type_class(),
+                    "instantiate src is not unknown type class: {:?}",
+                    prg.pure_instructions[src].ty
+                );
+
+                match prg.pure_instructions[src].inst {
+                    BlockPureInstruction::IntrinsicBinaryOp(left, op, right) => {
+                        let left1 = if left.ty(prg).is_unknown_type_class() {
+                            prg.add_pure_instruction(
+                                BlockPureInstruction::InstantiateIntrinsicTypeClass(left, it)
+                                    .typed(it.into()),
+                            )
+                        } else {
+                            // 変換済みっぽいので型が同じかどうかだけ見る（違ったらなにかがおかしい）
+                            assert_eq!(left.ty(prg), &it.into());
+                            left
+                        };
+                        let right1 = if right.ty(prg).is_unknown_type_class() {
+                            prg.add_pure_instruction(
+                                BlockPureInstruction::InstantiateIntrinsicTypeClass(right, it)
+                                    .typed(it.into()),
+                            )
+                        } else {
+                            // 変換済みっぽいので型が同じかどうかだけ見る（違ったらなにかがおかしい）
+                            assert_eq!(right.ty(prg), &it.into());
+                            right
+                        };
+                        let binop1 = prg.add_pure_instruction(
+                            BlockPureInstruction::IntrinsicBinaryOp(left1, op, right1)
+                                .typed(it.into()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), binop1);
+                        transformed.insert(RegisterRef::Pure(src), binop1);
+                        modified = true;
+                    }
+                    BlockPureInstruction::IntrinsicUnaryOp(value, op) => {
+                        let value1 = if value.ty(prg).is_unknown_type_class() {
+                            prg.add_pure_instruction(
+                                BlockPureInstruction::InstantiateIntrinsicTypeClass(value, it)
+                                    .typed(it.into()),
+                            )
+                        } else {
+                            // 変換済みっぽいので型が同じかどうかだけ見る（違ったらなにかがおかしい）
+                            assert_eq!(value.ty(prg), &it.into());
+                            value
+                        };
+                        let op1 = prg.add_pure_instruction(
+                            BlockPureInstruction::IntrinsicUnaryOp(value1, op).typed(it.into()),
+                        );
+                        register_alias_map.insert(RegisterRef::Pure(r), op1);
+                        transformed.insert(RegisterRef::Pure(src), op1);
+                        modified = true;
+                    }
+                    _ => (),
+                }
+            }
+            BlockPureInstruction::InstantiateIntrinsicTypeClass(RegisterRef::Impure(src), it) => {
+                if let Some(&replaced_reg) = transformed.get(&RegisterRef::Impure(src)) {
+                    // このステップで変換済み
+                    register_alias_map.insert(RegisterRef::Pure(r), replaced_reg);
+                    continue;
+                }
+
+                assert!(
+                    prg.impure_registers[src].is_unknown_type_class(),
+                    "instantiate src is not unknown type class: r{src}: {:?}",
+                    prg.impure_registers[src]
+                );
+
+                match prg.impure_instructions.get_mut(&src) {
+                    Some(&mut BlockInstruction::Phi(ref incomings)) => {
+                        let mut incomings = incomings.clone();
+                        for r in incomings.values_mut() {
+                            *r = prg.add_pure_instruction(
+                                BlockPureInstruction::InstantiateIntrinsicTypeClass(*r, it)
+                                    .typed(it.into()),
+                            );
+                        }
+
+                        prg.impure_instructions
+                            .insert(src, BlockInstruction::Phi(incomings));
+                        prg.impure_registers[src] = it.into();
+                        register_alias_map.insert(RegisterRef::Pure(r), RegisterRef::Impure(src));
+                        transformed.insert(RegisterRef::Impure(src), RegisterRef::Impure(src));
+                        modified = true;
+                    }
+                    _ => (),
+                }
+            }
+            _ => (),
+        }
+    }
+
+    prg.apply_register_alias(&register_alias_map);
+    modified
+}
 
 /// 同じPure命令を若い番号のregisterにまとめる
 pub fn unify_pure_instructions(prg: &BlockifiedProgram) -> RegisterAliasMap {
@@ -1664,7 +1778,8 @@ pub fn inline_function1<'a, 's>(
                     let RegisterRef::Impure(r) = result else {
                         unreachable!("impure funcall result must be impure register");
                     };
-                    prg.impure_instructions.insert(r, BlockInstruction::Phi(return_phi_map));
+                    prg.impure_instructions
+                        .insert(r, BlockInstruction::Phi(return_phi_map));
                     prg.blocks[a.0].eval_impure_registers.insert(r);
                 } else {
                     eprintln!("warn: impure funcall destination block is unknown, return value may not be evaluated");
