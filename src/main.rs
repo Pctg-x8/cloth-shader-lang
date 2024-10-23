@@ -1251,7 +1251,8 @@ fn main() {
                 .user_defined_function_body(ep.name)
                 .expect("cannot emit entry point without body");
             optimize(&ep, sym, &mut body.borrow_mut(), &symbol_scope_arena);
-            let ir2 = ir2::reconstruct(&body.borrow().program);
+            let cloop_to_condition_head = ir2::collect_condition_head_link(&body.borrow().program);
+            let ir2 = ir2::reconstruct(&body.borrow().program, &cloop_to_condition_head);
 
             println!("IR2({}):", ep.name);
             let mut o = std::io::stdout().lock();

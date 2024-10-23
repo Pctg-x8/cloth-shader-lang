@@ -1950,6 +1950,14 @@ impl<'a, 's> BlockifiedProgram<'a, 's> {
         RegisterRef::Const(self.constants.len() - 1)
     }
 
+    #[inline(always)]
+    pub fn iter_blocks_with_ref<'x>(&'x self) -> impl Iterator<Item = (BlockRef, &'x Block)> + 'x {
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(bx, b)| (BlockRef(bx), b))
+    }
+
     pub fn apply_parallel_register_alias(&mut self, alias_map: &RegisterAliasMap) {
         if alias_map.is_empty() {
             // レジスタエイリアスなし
