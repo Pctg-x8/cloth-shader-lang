@@ -57,7 +57,7 @@ pub struct IndentWriter(pub usize);
 impl core::fmt::Display for IndentWriter {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for x in 0..self.0 {
+        for _ in 0..self.0 {
             f.write_str("  ")?;
         }
 
@@ -148,6 +148,7 @@ pub enum Inst<'s> {
     BreakLoop(BlockRef),
     Return(ConstOrInst<'s>),
     TmpLoopStateStorage(BTreeMap<BlockRef, RegisterRef>),
+    LoopStateStorage(BTreeMap<BlockRef, ConstOrInst<'s>>),
 }
 impl<'s> Inst<'s> {
     pub fn dump_ordered(
@@ -270,6 +271,9 @@ impl<'s> Inst<'s> {
                 Inst::TmpLoopStateStorage(v) => {
                     writeln!(sink, "{indent}{ord:?}: (TmpLoopStateStorage) {v:?}")
                 }
+                Inst::LoopStateStorage(xs) => {
+                    writeln!(sink, "{indent}{ord:?}: LoopStateStorage {xs:?}")
+                }
             }
         }
 
@@ -278,6 +282,52 @@ impl<'s> Inst<'s> {
         }
 
         Ok(())
+    }
+
+    fn flat_iter_mut(&mut self, mut process: impl FnMut(&mut Self) + Copy) {
+        process(self);
+        match self {
+            Self::Branch {
+                true_instructions,
+                false_instructions,
+                ..
+            } => {
+                for x in true_instructions
+                    .iter_mut()
+                    .chain(false_instructions.iter_mut())
+                {
+                    x.1.flat_iter_mut(process);
+                }
+            }
+            Self::LoopWhile {
+                condition, body, ..
+            } => {
+                for x in condition.iter_mut().chain(body.iter_mut()) {
+                    x.1.flat_iter_mut(process);
+                }
+            }
+            Self::BuiltinIORef(_)
+            | Self::DescriptorRef { .. }
+            | Self::PushConstantRef(_)
+            | Self::WorkgroupSharedMemoryRef(_)
+            | Self::CompositeRef(_, _)
+            | Self::IntrinsicBinary(_, _, _)
+            | Self::IntrinsicUnary(_, _)
+            | Self::Cast(_, _)
+            | Self::ConstructIntrinsicType(_, _)
+            | Self::ConstructComposite(_)
+            | Self::Swizzle(_, _)
+            | Self::CompositeInsert { .. }
+            | Self::LoadRef(_)
+            | Self::StoreRef { .. }
+            | Self::IntrinsicCall { .. }
+            | Self::BlockValue(_)
+            | Self::ContinueLoop(_)
+            | Self::BreakLoop(_)
+            | Self::Return(_)
+            | Self::TmpLoopStateStorage(_)
+            | Self::LoopStateStorage(_) => (),
+        }
     }
 }
 
@@ -1205,6 +1255,29 @@ pub fn reconstruct<'a, 's>(
         &mut function_ctx,
         &mut function_local_ctx,
     );
+
+    // TmpLoopStateStorageをLoopStateStorageに変換する（仮置きしてたRegisterの消化）
+    for x in function_local_ctx.instructions.iter_mut() {
+        x.1.flat_iter_mut(|x| match x {
+            Inst::TmpLoopStateStorage(ref xs) => {
+                let new_xs = xs
+                    .iter()
+                    .map(|(b, r)| {
+                        (
+                            *b,
+                            function_ctx
+                                .try_get_for_register(r)
+                                .expect("no inst generated for register")
+                                .clone(),
+                        )
+                    })
+                    .collect();
+
+                *x = Inst::LoopStateStorage(new_xs);
+            }
+            _ => (),
+        });
+    }
 
     Function {
         instructions: function_local_ctx.instructions,
