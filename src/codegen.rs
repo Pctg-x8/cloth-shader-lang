@@ -1,29 +1,6 @@
-pub mod entrypoint;
-
-/*
 use std::collections::{HashMap, HashSet};
 
-use entrypoint::ShaderEntryPointDescription;
-
-use crate::{
-    concrete_type::{ConcreteType, IntrinsicType},
-    ir::{
-        block::{
-            Block, BlockFlowInstruction, BlockInstruction, BlockRef, IntrinsicBinaryOperation,
-            IntrinsicUnaryOperation, RegisterRef,
-        },
-        expr::{ConstModifiers, SimplifiedExpression},
-        ExprRef, FunctionBody,
-    },
-    ref_path::RefPath,
-    scope::SymbolScope,
-    spirv as spv,
-    symbol::{
-        meta::{BuiltinInputOutput, SymbolAttribute},
-        UserDefinedFunctionSymbol,
-    },
-    utils::roundup2,
-};
+use crate::spirv as spv;
 
 pub mod entrypoint;
 
@@ -1364,6 +1341,31 @@ impl CompareOperandClass {
         }
     }
 }
+
+/*
+use std::collections::{HashMap, HashSet};
+
+use entrypoint::ShaderEntryPointDescription;
+
+use crate::{
+    concrete_type::{ConcreteType, IntrinsicType},
+    ir::{
+        block::{
+            Block, BlockFlowInstruction, BlockInstruction, BlockRef, IntrinsicBinaryOperation,
+            IntrinsicUnaryOperation, RegisterRef,
+        },
+        expr::{ConstModifiers, SimplifiedExpression},
+        ExprRef, FunctionBody,
+    },
+    ref_path::RefPath,
+    scope::SymbolScope,
+    spirv as spv,
+    symbol::{
+        meta::{BuiltinInputOutput, SymbolAttribute},
+        UserDefinedFunctionSymbol,
+    },
+    utils::roundup2,
+};
 
 enum GlobalAccessType {
     Direct(SpvSectionLocalId, spv::Type, spv::asm::StorageClass),
