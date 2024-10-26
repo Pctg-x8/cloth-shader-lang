@@ -147,8 +147,14 @@ pub enum Inst<'s> {
     ContinueLoop(BlockRef),
     BreakLoop(BlockRef),
     Return(ConstOrInst<'s>),
-    TmpLoopStateStorage(BTreeMap<BlockRef, RegisterRef>),
-    LoopStateStorage(BTreeMap<BlockRef, ConstOrInst<'s>>),
+    TmpLoopStateStorage {
+        start: RegisterRef,
+        continued: BTreeMap<BlockRef, RegisterRef>,
+    },
+    LoopStateStorage {
+        start: ConstOrInst<'s>,
+        continued: HashMap<InstRef, ConstOrInst<'s>>,
+    },
 }
 impl<'s> Inst<'s> {
     pub fn dump_ordered(
@@ -268,11 +274,14 @@ impl<'s> Inst<'s> {
                 Inst::BreakLoop(b) => writeln!(sink, "{indent}{ord:?}: break @ {b}"),
                 Inst::Return(v) => writeln!(sink, "{indent}{ord:?}: return {v:?}"),
                 Inst::BlockValue(v) => writeln!(sink, "{indent}{ord:?}: block value = {v:?}"),
-                Inst::TmpLoopStateStorage(v) => {
-                    writeln!(sink, "{indent}{ord:?}: (TmpLoopStateStorage) {v:?}")
+                Inst::TmpLoopStateStorage { start, continued } => {
+                    writeln!(sink, "{indent}{ord:?}: (TmpLoopStateStorage) start={start:?} continued={continued:?}")
                 }
-                Inst::LoopStateStorage(xs) => {
-                    writeln!(sink, "{indent}{ord:?}: LoopStateStorage {xs:?}")
+                Inst::LoopStateStorage { start, continued } => {
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: LoopStateStorage start={start:?} continued={continued:?}"
+                    )
                 }
             }
         }
@@ -325,8 +334,8 @@ impl<'s> Inst<'s> {
             | Self::ContinueLoop(_)
             | Self::BreakLoop(_)
             | Self::Return(_)
-            | Self::TmpLoopStateStorage(_)
-            | Self::LoopStateStorage(_) => (),
+            | Self::TmpLoopStateStorage { .. }
+            | Self::LoopStateStorage { .. } => (),
         }
     }
 }
@@ -339,12 +348,14 @@ pub struct Function<'s> {
 struct FnInstGenContext<'s> {
     last_ref_id: usize,
     generated_inst_register_map: HashMap<RegisterRef, ConstOrInst<'s>>,
+    block_to_continue_inst: HashMap<BlockRef, InstRef>,
 }
 impl<'s> FnInstGenContext<'s> {
     fn new() -> Self {
         Self {
             last_ref_id: 0,
             generated_inst_register_map: HashMap::new(),
+            block_to_continue_inst: HashMap::new(),
         }
     }
 
@@ -365,6 +376,13 @@ impl<'s> FnInstGenContext<'s> {
     fn has_generated(&self, register: &RegisterRef) -> bool {
         self.generated_inst_register_map.contains_key(register)
     }
+
+    fn continue_inst_ref_for_block(&self, block: &BlockRef) -> InstRef {
+        self.block_to_continue_inst
+            .get(block)
+            .copied()
+            .expect("no continue executed in the block")
+    }
 }
 
 struct LocalInstGenContext<'s> {
@@ -383,6 +401,13 @@ impl<'s> LocalInstGenContext<'s> {
         let ir = fnctx.alloc_inst_ref();
         self.instructions.insert(ir, inst);
         self.instruction_order.push(ir);
+
+        ir
+    }
+
+    fn r#continue(&mut self, fnctx: &mut FnInstGenContext<'s>, execute_block: BlockRef) -> InstRef {
+        let ir = self.emit_inst(fnctx, Inst::ContinueLoop(execute_block));
+        fnctx.block_to_continue_inst.insert(execute_block, ir);
 
         ir
     }
@@ -416,6 +441,7 @@ pub fn reconstruct<'a, 's>(
         fnctx: &mut FnInstGenContext<'s>,
         ctx: &mut LocalInstGenContext<'s>,
         impure_allowlist: &HashSet<usize>,
+        loop_enter: Option<BlockRef>,
     ) -> ConstOrInst<'s> {
         if let Some(ir) = fnctx.try_get_for_register(&r) {
             // すでに生成済み
@@ -524,7 +550,7 @@ pub fn reconstruct<'a, 's>(
             RegisterRef::Pure(r) => match prg.pure_instructions[r].inst {
                 BlockPureInstruction::Cast(src, ref t) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, src, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, src, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot emit const cast(needs precomputed)");
                     };
@@ -542,7 +568,9 @@ pub fn reconstruct<'a, 's>(
                 BlockPureInstruction::ConstructIntrinsicComposite(it, ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst = ctx
@@ -554,7 +582,9 @@ pub fn reconstruct<'a, 's>(
                 BlockPureInstruction::ConstructTuple(ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst =
@@ -565,7 +595,9 @@ pub fn reconstruct<'a, 's>(
                 BlockPureInstruction::ConstructStruct(ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst =
@@ -575,11 +607,12 @@ pub fn reconstruct<'a, 's>(
                 }
                 BlockPureInstruction::ArrayRef { source, index } => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
-                    let index = emit_const_or_inst(prg, index, fnctx, ctx, impure_allowlist);
+                    let index =
+                        emit_const_or_inst(prg, index, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst =
                         ctx.emit_inst(fnctx, Inst::CompositeRef(src, index)).into();
@@ -588,7 +621,7 @@ pub fn reconstruct<'a, 's>(
                 }
                 BlockPureInstruction::TupleRef(source, index) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
@@ -609,7 +642,7 @@ pub fn reconstruct<'a, 's>(
                 }
                 BlockPureInstruction::MemberRef(source, ref name) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
@@ -640,7 +673,8 @@ pub fn reconstruct<'a, 's>(
                     ir
                 }
                 BlockPureInstruction::Swizzle(source, ref indices) => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::Swizzle(source, indices.clone()))
@@ -652,8 +686,10 @@ pub fn reconstruct<'a, 's>(
                     unreachable!("SwizzleRef must be desugared")
                 }
                 BlockPureInstruction::IntrinsicBinaryOp(left, op, right) => {
-                    let left = emit_const_or_inst(prg, left, fnctx, ctx, impure_allowlist);
-                    let right = emit_const_or_inst(prg, right, fnctx, ctx, impure_allowlist);
+                    let left =
+                        emit_const_or_inst(prg, left, fnctx, ctx, impure_allowlist, loop_enter);
+                    let right =
+                        emit_const_or_inst(prg, right, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::IntrinsicBinary(left, op, right))
@@ -662,7 +698,8 @@ pub fn reconstruct<'a, 's>(
                     ir
                 }
                 BlockPureInstruction::IntrinsicUnaryOp(source, op) => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::IntrinsicUnary(source, op))
@@ -675,8 +712,10 @@ pub fn reconstruct<'a, 's>(
                     value,
                     index,
                 } => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
-                    let value = emit_const_or_inst(prg, value, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
+                    let value =
+                        emit_const_or_inst(prg, value, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(
@@ -697,7 +736,9 @@ pub fn reconstruct<'a, 's>(
                 BlockPureInstruction::PureIntrinsicCall(id, ref args) => {
                     let args = args
                         .iter()
-                        .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, impure_allowlist))
+                        .map(|&a| {
+                            emit_const_or_inst(prg, a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst = ctx
@@ -718,7 +759,7 @@ pub fn reconstruct<'a, 's>(
                 match prg.impure_instructions[&r] {
                     BlockInstruction::LoadRef(ptr) => {
                         let ConstOrInst::Inst(ptr) =
-                            emit_const_or_inst(prg, ptr, fnctx, ctx, impure_allowlist)
+                            emit_const_or_inst(prg, ptr, fnctx, ctx, impure_allowlist, loop_enter)
                         else {
                             unreachable!("cannot load from const");
                         };
@@ -729,8 +770,17 @@ pub fn reconstruct<'a, 's>(
                     }
                     BlockInstruction::Phi(ref incomings) => {
                         // 一時的にそのままもってくる(あとで変換する)
+                        let loop_enter = loop_enter.expect("phi appeared out of loop condition");
+                        let mut incomings = incomings.clone();
+                        let start_reg = incomings.remove(&loop_enter).expect("no enter state?");
                         let ir: ConstOrInst = ctx
-                            .emit_inst(fnctx, Inst::TmpLoopStateStorage(incomings.clone()))
+                            .emit_inst(
+                                fnctx,
+                                Inst::TmpLoopStateStorage {
+                                    start: start_reg,
+                                    continued: incomings,
+                                },
+                            )
                             .into();
                         fnctx.map_register(RegisterRef::Impure(r), ir.clone());
                         ir
@@ -794,6 +844,7 @@ pub fn reconstruct<'a, 's>(
                             fnctx,
                             ctx,
                             &prg.blocks[n.0].eval_impure_registers,
+                            None,
                         ) else {
                             unreachable!("cannot load from const");
                         };
@@ -801,12 +852,13 @@ pub fn reconstruct<'a, 's>(
                         let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::LoadRef(ptr)).into();
                         fnctx.map_register(RegisterRef::Impure(*imr), ir);
                     }
-                    BlockInstruction::Phi(ref incomings) => {
+                    BlockInstruction::Phi(ref _incomings) => {
                         // 一時的にそのままもってくる(あとで変換する)
-                        let ir: ConstOrInst = ctx
-                            .emit_inst(fnctx, Inst::TmpLoopStateStorage(incomings.clone()))
-                            .into();
-                        fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                        // let ir: ConstOrInst = ctx
+                        //     .emit_inst(fnctx, Inst::TmpLoopStateStorage(incomings.clone()))
+                        //     .into();
+                        // fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                        unimplemented!("phi appeared outside of condition?");
                     }
                 }
             }
@@ -829,6 +881,7 @@ pub fn reconstruct<'a, 's>(
                                         fnctx,
                                         ctx,
                                         &prg.blocks[n.0].eval_impure_registers,
+                                        None,
                                     );
                                 }
                             }
@@ -852,11 +905,11 @@ pub fn reconstruct<'a, 's>(
             }
             BlockFlowInstruction::StoreRef { ptr, value, after } => {
                 let ConstOrInst::Inst(ptr) =
-                    emit_const_or_inst(prg, ptr, fnctx, ctx, &HashSet::new())
+                    emit_const_or_inst(prg, ptr, fnctx, ctx, &HashSet::new(), None)
                 else {
                     unreachable!("cannot store to const value");
                 };
-                let value = emit_const_or_inst(prg, value, fnctx, ctx, &HashSet::new());
+                let value = emit_const_or_inst(prg, value, fnctx, ctx, &HashSet::new(), None);
                 ctx.emit_inst(fnctx, Inst::StoreRef { ptr, value });
 
                 if !flow_only_process {
@@ -871,6 +924,7 @@ pub fn reconstruct<'a, 's>(
                                         fnctx,
                                         ctx,
                                         &prg.blocks[n.0].eval_impure_registers,
+                                        None,
                                     );
                                 }
                             }
@@ -908,7 +962,7 @@ pub fn reconstruct<'a, 's>(
             } => {
                 let arg_refs = args
                     .iter()
-                    .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, &HashSet::new()))
+                    .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, &HashSet::new(), None))
                     .collect::<Vec<_>>();
 
                 let ir: ConstOrInst = ctx
@@ -937,6 +991,7 @@ pub fn reconstruct<'a, 's>(
                                         fnctx,
                                         ctx,
                                         &prg.blocks[n.0].eval_impure_registers,
+                                        None,
                                     );
                                 }
                             }
@@ -964,7 +1019,7 @@ pub fn reconstruct<'a, 's>(
                 r#false,
                 merge,
             } => {
-                let source = emit_const_or_inst(prg, source, fnctx, ctx, &HashSet::new());
+                let source = emit_const_or_inst(prg, source, fnctx, ctx, &HashSet::new(), None);
 
                 let mut true_local_ctx = LocalInstGenContext::new();
                 let mut true_last_block = n;
@@ -1026,6 +1081,7 @@ pub fn reconstruct<'a, 's>(
                         fnctx,
                         &mut true_local_ctx,
                         &HashSet::new(),
+                        None,
                     );
                     let false_phi_value = emit_const_or_inst(
                         prg,
@@ -1033,6 +1089,7 @@ pub fn reconstruct<'a, 's>(
                         fnctx,
                         &mut false_local_ctx,
                         &HashSet::new(),
+                        None,
                     );
 
                     true_local_ctx.emit_inst(fnctx, Inst::BlockValue(true_phi_value.clone()));
@@ -1113,6 +1170,7 @@ pub fn reconstruct<'a, 's>(
                                 fnctx,
                                 &mut condition_local_ctx,
                                 &prg.blocks[n.0].eval_impure_registers,
+                                Some(incoming_block),
                             ) else {
                                 unreachable!("cannot load from const");
                             };
@@ -1124,8 +1182,17 @@ pub fn reconstruct<'a, 's>(
                         }
                         BlockInstruction::Phi(ref incomings) => {
                             // unimplemented!("phi decoding: {incomings:?}")
+                            let mut incomings = incomings.clone();
+                            let start_reg =
+                                incomings.remove(&incoming_block).expect("no enter state?");
                             let ir: ConstOrInst = condition_local_ctx
-                                .emit_inst(fnctx, Inst::TmpLoopStateStorage(incomings.clone()))
+                                .emit_inst(
+                                    fnctx,
+                                    Inst::TmpLoopStateStorage {
+                                        start: start_reg,
+                                        continued: incomings,
+                                    },
+                                )
                                 .into();
                             fnctx.map_register(RegisterRef::Impure(*imr), ir);
                         }
@@ -1139,6 +1206,7 @@ pub fn reconstruct<'a, 's>(
                     fnctx,
                     &mut condition_local_ctx,
                     &prg.blocks[n.0].eval_impure_registers,
+                    Some(incoming_block),
                 );
                 condition_local_ctx.emit_inst(fnctx, Inst::BlockValue(condition));
 
@@ -1197,6 +1265,7 @@ pub fn reconstruct<'a, 's>(
                                         fnctx,
                                         ctx,
                                         &prg.blocks[n.0].eval_impure_registers,
+                                        None,
                                     );
                                 }
                             }
@@ -1222,6 +1291,7 @@ pub fn reconstruct<'a, 's>(
                                         fnctx,
                                         ctx,
                                         &prg.blocks[n.0].eval_impure_registers,
+                                        None,
                                     );
                                 }
                             }
@@ -1230,10 +1300,10 @@ pub fn reconstruct<'a, 's>(
                     }
                 }
 
-                ctx.emit_inst(fnctx, Inst::ContinueLoop(n));
+                ctx.r#continue(fnctx, n);
             }
             BlockFlowInstruction::Return(v) => {
-                let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new());
+                let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new(), None);
                 ctx.emit_inst(fnctx, Inst::Return(v));
             }
             BlockFlowInstruction::Undetermined => unreachable!("undetermined destination"),
@@ -1259,12 +1329,19 @@ pub fn reconstruct<'a, 's>(
     // TmpLoopStateStorageをLoopStateStorageに変換する（仮置きしてたRegisterの消化）
     for x in function_local_ctx.instructions.iter_mut() {
         x.1.flat_iter_mut(|x| match x {
-            Inst::TmpLoopStateStorage(ref xs) => {
-                let new_xs = xs
+            Inst::TmpLoopStateStorage {
+                start,
+                ref continued,
+            } => {
+                let new_start = function_ctx
+                    .try_get_for_register(&start)
+                    .expect("no inst generated for start state register")
+                    .clone();
+                let new_continued = continued
                     .iter()
                     .map(|(b, r)| {
                         (
-                            *b,
+                            function_ctx.continue_inst_ref_for_block(b),
                             function_ctx
                                 .try_get_for_register(r)
                                 .expect("no inst generated for register")
@@ -1273,7 +1350,10 @@ pub fn reconstruct<'a, 's>(
                     })
                     .collect();
 
-                *x = Inst::LoopStateStorage(new_xs);
+                *x = Inst::LoopStateStorage {
+                    start: new_start,
+                    continued: new_continued,
+                };
             }
             _ => (),
         });
