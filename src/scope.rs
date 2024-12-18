@@ -1,7 +1,9 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember, UserDefinedType},
+    concrete_type::{
+        ConcreteType, IntrinsicScalarType, IntrinsicType, UserDefinedStructMember, UserDefinedType,
+    },
     ir::{ExprRef, FunctionBody},
     source_ref::SourceRef,
     symbol::{
@@ -59,7 +61,7 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.SubpassLoad",
                 args: vec![IntrinsicType::SubpassInput.into()],
-                output: IntrinsicType::Float4.into(),
+                output: IntrinsicType::vec(4).into(),
                 is_pure: true,
             }],
         );
@@ -68,20 +70,20 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Normalize#Float4",
-                    args: vec![IntrinsicType::Float4.into()],
-                    output: IntrinsicType::Float4.into(),
+                    args: vec![IntrinsicType::vec(4).into()],
+                    output: IntrinsicType::vec(4).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Normalize#Float3",
-                    args: vec![IntrinsicType::Float3.into()],
-                    output: IntrinsicType::Float3.into(),
+                    args: vec![IntrinsicType::vec(3).into()],
+                    output: IntrinsicType::vec(3).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Normalize#Float2",
-                    args: vec![IntrinsicType::Float2.into()],
-                    output: IntrinsicType::Float2.into(),
+                    args: vec![IntrinsicType::vec(2).into()],
+                    output: IntrinsicType::vec(2).into(),
                     is_pure: true,
                 },
             ],
@@ -91,20 +93,20 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Dot#Float4",
-                    args: vec![IntrinsicType::Float4.into(), IntrinsicType::Float4.into()],
-                    output: IntrinsicType::Float.into(),
+                    args: vec![IntrinsicType::vec(4).into(), IntrinsicType::vec(4).into()],
+                    output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Dot#Float3",
-                    args: vec![IntrinsicType::Float3.into(), IntrinsicType::Float3.into()],
-                    output: IntrinsicType::Float.into(),
+                    args: vec![IntrinsicType::vec(3).into(), IntrinsicType::vec(3).into()],
+                    output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Dot#Float2",
-                    args: vec![IntrinsicType::Float2.into(), IntrinsicType::Float2.into()],
-                    output: IntrinsicType::Float.into(),
+                    args: vec![IntrinsicType::vec(2).into(), IntrinsicType::vec(2).into()],
+                    output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                     is_pure: true,
                 },
             ],
@@ -114,20 +116,20 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Transpose#Float4x4",
-                    args: vec![IntrinsicType::Float4x4.into()],
-                    output: IntrinsicType::Float4x4.into(),
+                    args: vec![IntrinsicType::mat(4, 4).into()],
+                    output: IntrinsicType::mat(4, 4).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Transpose#Float3x3",
-                    args: vec![IntrinsicType::Float3x3.into()],
-                    output: IntrinsicType::Float3x3.into(),
+                    args: vec![IntrinsicType::mat(3, 3).into()],
+                    output: IntrinsicType::mat(3, 3).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Transpose#Float2x2",
-                    args: vec![IntrinsicType::Float2x2.into()],
-                    output: IntrinsicType::Float2x2.into(),
+                    args: vec![IntrinsicType::mat(2, 2).into()],
+                    output: IntrinsicType::mat(2, 2).into(),
                     is_pure: true,
                 },
             ],
@@ -137,26 +139,29 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture1D",
-                    args: vec![IntrinsicType::Texture1D.into(), IntrinsicType::Float.into()],
-                    output: IntrinsicType::Float4.into(),
+                    args: vec![
+                        IntrinsicType::Texture1D.into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                    ],
+                    output: IntrinsicType::vec(4).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture2D",
                     args: vec![
                         IntrinsicType::Texture2D.into(),
-                        IntrinsicType::Float2.into(),
+                        IntrinsicType::vec(2).into(),
                     ],
-                    output: IntrinsicType::Float4.into(),
+                    output: IntrinsicType::vec(4).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.SampleAt#Texture3D",
                     args: vec![
                         IntrinsicType::Texture3D.into(),
-                        IntrinsicType::Float3.into(),
+                        IntrinsicType::vec(3).into(),
                     ],
-                    output: IntrinsicType::Float4.into(),
+                    output: IntrinsicType::vec(4).into(),
                     is_pure: true,
                 },
             ],
@@ -165,8 +170,8 @@ impl<'a, 's> SymbolScope<'a, 's> {
             "log2",
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Math.Log2",
-                args: vec![IntrinsicType::Float.into()],
-                output: IntrinsicType::Float.into(),
+                args: vec![IntrinsicType::Scalar(IntrinsicScalarType::Float).into()],
+                output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                 is_pure: true,
             }],
         );
@@ -174,8 +179,8 @@ impl<'a, 's> SymbolScope<'a, 's> {
             "exp2",
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Math.Exp2",
-                args: vec![IntrinsicType::Float.into()],
-                output: IntrinsicType::Float.into(),
+                args: vec![IntrinsicType::Scalar(IntrinsicScalarType::Float).into()],
+                output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                 is_pure: true,
             }],
         );
@@ -183,8 +188,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
             "max",
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Max#UInt",
-                args: vec![IntrinsicType::UInt.into(), IntrinsicType::UInt.into()],
-                output: IntrinsicType::UInt.into(),
+                args: vec![
+                    IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                    IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                ],
+                output: IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
                 is_pure: true,
             }],
         );
@@ -193,14 +201,20 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Min#UInt",
-                    args: vec![IntrinsicType::UInt.into(), IntrinsicType::UInt.into()],
-                    output: IntrinsicType::UInt.into(),
+                    args: vec![
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                    ],
+                    output: IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
                     is_pure: true,
                 },
                 IntrinsicFunctionSymbol {
                     name: "Cloth.Intrinsic.Min#Float",
-                    args: vec![IntrinsicType::Float.into(), IntrinsicType::Float.into()],
-                    output: IntrinsicType::Float.into(),
+                    args: vec![
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                    ],
+                    output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                     is_pure: true,
                 },
             ],
@@ -210,11 +224,11 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Clamp",
                 args: vec![
-                    IntrinsicType::Float.into(),
-                    IntrinsicType::Float.into(),
-                    IntrinsicType::Float.into(),
+                    IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                    IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                    IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                 ],
-                output: IntrinsicType::Float.into(),
+                output: IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                 is_pure: true,
             }],
         );
@@ -223,7 +237,7 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.ExecutionBarrier",
                 args: vec![],
-                output: IntrinsicType::Unit.into(),
+                output: IntrinsicType::UNIT.into(),
                 is_pure: false,
             }],
         );
@@ -231,8 +245,8 @@ impl<'a, 's> SymbolScope<'a, 's> {
             "loadPixelAt",
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Image.Load#Image2D",
-                args: vec![IntrinsicType::Image2D.into(), IntrinsicType::UInt2.into()],
-                output: IntrinsicType::Float4.into(),
+                args: vec![IntrinsicType::Image2D.into(), IntrinsicType::uvec(2).into()],
+                output: IntrinsicType::vec(4).into(),
                 is_pure: true,
             }],
         );
@@ -241,29 +255,33 @@ impl<'a, 's> SymbolScope<'a, 's> {
             vec![IntrinsicFunctionSymbol {
                 name: "Cloth.Intrinsic.Atomic.Add#UInt",
                 args: vec![
-                    ConcreteType::from(IntrinsicType::UInt).mutable_ref(),
-                    IntrinsicType::UInt.into(),
+                    ConcreteType::from(IntrinsicType::Scalar(IntrinsicScalarType::UInt))
+                        .mutable_ref(),
+                    IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
                 ],
-                output: IntrinsicType::Unit.into(),
+                output: IntrinsicType::UNIT.into(),
                 is_pure: false,
             }],
         );
         var_id_by_name.insert(
             "Float4",
-            VarId::IntrinsicTypeConstructor(IntrinsicType::Float4),
+            VarId::IntrinsicTypeConstructor(IntrinsicType::vec(4)),
         );
         var_id_by_name.insert(
             "Float3",
-            VarId::IntrinsicTypeConstructor(IntrinsicType::Float3),
+            VarId::IntrinsicTypeConstructor(IntrinsicType::vec(3)),
         );
         var_id_by_name.insert(
             "Float2",
-            VarId::IntrinsicTypeConstructor(IntrinsicType::Float2),
+            VarId::IntrinsicTypeConstructor(IntrinsicType::vec(2)),
         );
-        var_id_by_name.insert("UInt", VarId::IntrinsicTypeConstructor(IntrinsicType::UInt));
+        var_id_by_name.insert(
+            "UInt",
+            VarId::IntrinsicTypeConstructor(IntrinsicType::Scalar(IntrinsicScalarType::UInt)),
+        );
         var_id_by_name.insert(
             "UInt2",
-            VarId::IntrinsicTypeConstructor(IntrinsicType::UInt2),
+            VarId::IntrinsicTypeConstructor(IntrinsicType::uvec(2)),
         );
 
         Self {

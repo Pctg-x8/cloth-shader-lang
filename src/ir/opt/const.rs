@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType},
+    concrete_type::{ConcreteType, IntrinsicScalarType, IntrinsicType},
     ir::{
         block::{
             Block, BlockConstInstruction, BlockPureInstruction, BlockifiedProgram, Constants,
@@ -29,37 +29,38 @@ pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) ->
             BlockPureInstruction::InstantiateIntrinsicTypeClass(RegisterRef::Const(src), ty) => {
                 match prg.constants[src].inst {
                     BlockConstInstruction::LitInt(ref l) => match ty {
-                        IntrinsicType::UInt => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt) => Some(
                             BlockConstInstruction::LitUInt(ConstUIntLiteral(l.0.clone(), l.1))
                                 .typed(ty.into()),
                         ),
-                        IntrinsicType::SInt => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt) => Some(
                             BlockConstInstruction::LitSInt(ConstSIntLiteral(l.0.clone(), l.1))
                                 .typed(ty.into()),
                         ),
-                        IntrinsicType::Float => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float) => Some(
                             BlockConstInstruction::LitFloat(ConstFloatLiteral(l.0.clone(), l.1))
                                 .typed(ty.into()),
                         ),
                         _ => None,
                     },
                     BlockConstInstruction::LitNum(ref l) => match ty {
-                        IntrinsicType::Float => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float) => Some(
                             BlockConstInstruction::LitFloat(ConstFloatLiteral(l.0.clone(), l.1))
                                 .typed(ty.into()),
                         ),
-                        IntrinsicType::UInt | IntrinsicType::SInt => {
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt)
+                        | IntrinsicType::Scalar(IntrinsicScalarType::SInt) => {
                             eprintln!("not promoted: number -> int can cause unintended precision dropping");
                             None
                         }
                         _ => None,
                     },
                     BlockConstInstruction::ImmInt(v) => match ty {
-                        IntrinsicType::UInt => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt) => Some(
                             BlockConstInstruction::ImmUInt(v.try_into().expect("cannot promote"))
                                 .typed(ty.into()),
                         ),
-                        IntrinsicType::SInt => Some(
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt) => Some(
                             BlockConstInstruction::ImmSInt(v.try_into().expect("cannot promote"))
                                 .typed(ty.into()),
                         ),
@@ -71,8 +72,11 @@ pub fn promote_instantiate_const<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) ->
             BlockPureInstruction::PromoteIntToNumber(RegisterRef::Const(value)) => {
                 match prg.constants[value].inst {
                     BlockConstInstruction::LitInt(ref l) => Some(
-                        BlockConstInstruction::LitNum(ConstNumberLiteral(l.0.clone(), l.1))
-                            .typed(ConcreteType::UnknownNumberClass),
+                        BlockConstInstruction::LitNum(ConstNumberLiteral(l.0.clone(), l.1)).typed(
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownNumberClass,
+                            )),
+                        ),
                     ),
                     _ => None,
                 }
@@ -151,272 +155,307 @@ pub fn fold_const_ops<'a, 's>(prg: &mut BlockifiedProgram<'a, 's>) -> bool {
                 let reduced = match op {
                     IntrinsicBinaryOperation::Add => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l + r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l + r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l + r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l + r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l + r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l + r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Sub => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l - r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l - r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l - r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l - r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l - r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l - r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Mul => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l * r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l * r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l * r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l * r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l * r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l * r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Div => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l / r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l / r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l / r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l / r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l / r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l / r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Rem => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l % r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l % r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l % r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l % r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l % r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l % r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Pow => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l.pow(r.try_into().unwrap()))
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l.pow(r.try_into().unwrap())).typed(
+                                ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                    IntrinsicScalarType::UnknownIntClass,
+                                )),
+                            ),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmSInt(l.pow(r.try_into().unwrap()))
-                                .typed(IntrinsicType::SInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmUInt(l.pow(r))
-                                .typed(IntrinsicType::UInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::BitAnd => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l & r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l & r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l & r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l & r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l & r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l & r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::BitOr => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l | r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l | r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l | r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l | r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l | r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l | r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::BitXor => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l ^ r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l ^ r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmSInt(l ^ r).typed(IntrinsicType::SInt.into()),
+                            BlockConstInstruction::ImmSInt(l ^ r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmUInt(l ^ r).typed(IntrinsicType::UInt.into()),
+                            BlockConstInstruction::ImmUInt(l ^ r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::LeftShift => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l << r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l << r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmSInt(l << r)
-                                .typed(IntrinsicType::SInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmUInt(l << r)
-                                .typed(IntrinsicType::UInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::RightShift => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmInt(l >> r)
-                                .typed(ConcreteType::UnknownIntClass),
+                            BlockConstInstruction::ImmInt(l >> r).typed(ConcreteType::Intrinsic(
+                                IntrinsicType::Scalar(IntrinsicScalarType::UnknownIntClass),
+                            )),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmSInt(l >> r)
-                                .typed(IntrinsicType::SInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmUInt(l >> r)
-                                .typed(IntrinsicType::UInt.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Eq => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l == r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l == r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l == r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Ne => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l != r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Lt => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmBool(l < r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l < r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmBool(l < r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l < r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmBool(l < r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l < r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Gt => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
-                            BlockConstInstruction::ImmBool(l > r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l > r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
-                            BlockConstInstruction::ImmBool(l > r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l > r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
-                            BlockConstInstruction::ImmBool(l > r).typed(IntrinsicType::Bool.into()),
+                            BlockConstInstruction::ImmBool(l > r)
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Le => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l <= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l <= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l <= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::Ge => match (left, right) {
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l >= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l >= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l >= r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::LogAnd => match (left, right) {
                         (LosslessConst::Bool(l), LosslessConst::Bool(r)) => Some(
                             BlockConstInstruction::ImmBool(l && r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 && r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 && r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 && r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },
                     IntrinsicBinaryOperation::LogOr => match (left, right) {
                         (LosslessConst::Bool(l), LosslessConst::Bool(r)) => Some(
                             BlockConstInstruction::ImmBool(l || r)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::Int(l), LosslessConst::Int(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 || r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::SInt(l), LosslessConst::SInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 || r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         (LosslessConst::UInt(l), LosslessConst::UInt(r)) => Some(
                             BlockConstInstruction::ImmBool(l != 0 || r != 0)
-                                .typed(IntrinsicType::Bool.into()),
+                                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Bool).into()),
                         ),
                         _ => None,
                     },

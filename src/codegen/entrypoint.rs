@@ -1,5 +1,5 @@
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType},
+    concrete_type::{ConcreteType, IntrinsicScalarType, IntrinsicType},
     ref_path::RefPath,
     scope::SymbolScope,
     spirv as spv,
@@ -96,7 +96,7 @@ impl<'s> ShaderEntryPointDescription<'s> {
                 &mut global_vars,
             );
         }
-        if func.output.len() > 1 || func.output[0].1 != IntrinsicType::Unit.into() {
+        if func.output.len() > 1 || func.output[0].1 != IntrinsicType::Scalar(IntrinsicScalarType::Unit).into() {
             for (attr, ty) in func.output.iter() {
                 process_entry_point_outputs(attr, ty, scope, &mut global_vars.outputs);
             }

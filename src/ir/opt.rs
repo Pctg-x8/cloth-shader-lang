@@ -39,14 +39,21 @@ pub fn distribute_instantiate(prg: &mut BlockifiedProgram) -> bool {
                 }
 
                 assert!(
-                    prg.pure_instructions[src].ty.is_unknown_type_class(),
+                    prg.pure_instructions[src]
+                        .ty
+                        .scalar_type()
+                        .is_some_and(|it| it.is_unknown_type()),
                     "instantiate src is not unknown type class: {:?}",
                     prg.pure_instructions[src].ty
                 );
 
                 match prg.pure_instructions[src].inst {
                     BlockPureInstruction::IntrinsicBinaryOp(left, op, right) => {
-                        let left1 = if left.ty(prg).is_unknown_type_class() {
+                        let left1 = if left
+                            .ty(prg)
+                            .scalar_type()
+                            .is_some_and(|it| it.is_unknown_type())
+                        {
                             prg.add_pure_instruction(
                                 BlockPureInstruction::InstantiateIntrinsicTypeClass(left, it)
                                     .typed(it.into()),
@@ -56,7 +63,11 @@ pub fn distribute_instantiate(prg: &mut BlockifiedProgram) -> bool {
                             assert_eq!(left.ty(prg), &it.into());
                             left
                         };
-                        let right1 = if right.ty(prg).is_unknown_type_class() {
+                        let right1 = if right
+                            .ty(prg)
+                            .scalar_type()
+                            .is_some_and(|it| it.is_unknown_type())
+                        {
                             prg.add_pure_instruction(
                                 BlockPureInstruction::InstantiateIntrinsicTypeClass(right, it)
                                     .typed(it.into()),
@@ -75,7 +86,11 @@ pub fn distribute_instantiate(prg: &mut BlockifiedProgram) -> bool {
                         modified = true;
                     }
                     BlockPureInstruction::IntrinsicUnaryOp(value, op) => {
-                        let value1 = if value.ty(prg).is_unknown_type_class() {
+                        let value1 = if value
+                            .ty(prg)
+                            .scalar_type()
+                            .is_some_and(|it| it.is_unknown_type())
+                        {
                             prg.add_pure_instruction(
                                 BlockPureInstruction::InstantiateIntrinsicTypeClass(value, it)
                                     .typed(it.into()),
@@ -103,7 +118,9 @@ pub fn distribute_instantiate(prg: &mut BlockifiedProgram) -> bool {
                 }
 
                 assert!(
-                    prg.impure_registers[src].is_unknown_type_class(),
+                    prg.impure_registers[src]
+                        .scalar_type()
+                        .is_some_and(|it| it.is_unknown_type()),
                     "instantiate src is not unknown type class: r{src}: {:?}",
                     prg.impure_registers[src]
                 );

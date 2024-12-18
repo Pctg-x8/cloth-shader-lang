@@ -354,6 +354,17 @@ impl Type {
     }
 
     #[inline(always)]
+    pub fn vector_to_matrix(self, column_count: u32) -> Self {
+        match (self, column_count) {
+            (x, 1) => x,
+            (Self::Vector(x, r), 2) => Self::Matrix(VectorType(x, r), MatrixColumnCount::Two),
+            (Self::Vector(x, r), 3) => Self::Matrix(VectorType(x, r), MatrixColumnCount::Three),
+            (Self::Vector(x, r), 4) => Self::Matrix(VectorType(x, r), MatrixColumnCount::Four),
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(always)]
     pub fn of_matrix(self, row_count: u32, column_count: u32) -> Self {
         match (self, row_count, column_count) {
             (x, 1, 1) => x,

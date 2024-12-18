@@ -7,7 +7,7 @@ use std::{
 use typed_arena::Arena;
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType},
+    concrete_type::{ConcreteType, IntrinsicScalarType, IntrinsicType},
     parser::StatementNode,
     ref_path::RefPath,
     scope::{SymbolScope, VarId},
@@ -1105,7 +1105,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
 
     pub fn promote_int_to_number(&mut self, r: RegisterRef) -> RegisterRef {
         RegisterRef::Pure(self.instruction_emission_context.add_pure_instruction(
-            BlockPureInstruction::PromoteIntToNumber(r).typed(ConcreteType::UnknownNumberClass),
+            BlockPureInstruction::PromoteIntToNumber(r).typed(ConcreteType::Intrinsic(
+                IntrinsicType::Scalar(IntrinsicScalarType::UnknownNumberClass),
+            )),
         ))
     }
 
@@ -1236,14 +1238,13 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     }
 
     pub fn swizzle(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
-        let ty = ConcreteType::from(
+        let ty = ConcreteType::from(IntrinsicType::Vector(
             source
                 .ty(self)
                 .scalar_type()
                 .unwrap()
-                .of_vector(elements.len().try_into().unwrap())
-                .unwrap(),
-        );
+                .vec(elements.len().try_into().unwrap()),
+        ));
 
         RegisterRef::Pure(
             self.instruction_emission_context
@@ -1252,16 +1253,15 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     }
 
     pub fn swizzle_ref(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
-        let ty = ConcreteType::from(
+        let ty = ConcreteType::from(IntrinsicType::Vector(
             source
                 .ty(self)
                 .as_dereferenced()
                 .unwrap()
                 .scalar_type()
                 .unwrap()
-                .of_vector(elements.len().try_into().unwrap())
-                .unwrap(),
-        )
+                .vec(elements.len().try_into().unwrap()),
+        ))
         .imm_ref();
 
         RegisterRef::Pure(
@@ -1275,16 +1275,15 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         source: RegisterRef,
         elements: Vec<usize>,
     ) -> RegisterRef {
-        let ty = ConcreteType::from(
+        let ty = ConcreteType::from(IntrinsicType::Vector(
             source
                 .ty(self)
                 .as_dereferenced()
                 .unwrap()
                 .scalar_type()
                 .unwrap()
-                .of_vector(elements.len().try_into().unwrap())
-                .unwrap(),
-        )
+                .vec(elements.len().try_into().unwrap()),
+        ))
         .mutable_ref();
 
         RegisterRef::Pure(
@@ -1372,7 +1371,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                     SourceRefSliceEq(repr),
                     ConstModifiers::empty(),
                 ))
-                .typed(ConcreteType::UnknownIntClass),
+                .typed(ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                    IntrinsicScalarType::UnknownIntClass,
+                ))),
             ),
         )
     }
@@ -1384,7 +1385,9 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                     SourceRefSliceEq(repr),
                     ConstModifiers::empty(),
                 ))
-                .typed(ConcreteType::UnknownNumberClass),
+                .typed(ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                    IntrinsicScalarType::UnknownIntClass,
+                ))),
             ),
         )
     }
@@ -1396,7 +1399,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                     SourceRefSliceEq(repr),
                     ConstModifiers::empty(),
                 ))
-                .typed(IntrinsicType::UInt.into()),
+                .typed(IntrinsicType::Scalar(IntrinsicScalarType::UInt).into()),
             ),
         )
     }
@@ -1408,7 +1411,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                     SourceRefSliceEq(repr),
                     ConstModifiers::empty(),
                 ))
-                .typed(IntrinsicType::SInt.into()),
+                .typed(IntrinsicType::Scalar(IntrinsicScalarType::SInt).into()),
             ),
         )
     }
@@ -1420,7 +1423,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
                     SourceRefSliceEq(repr),
                     ConstModifiers::empty(),
                 ))
-                .typed(IntrinsicType::Float.into()),
+                .typed(IntrinsicType::Scalar(IntrinsicScalarType::Float).into()),
             ),
         )
     }
@@ -1494,7 +1497,10 @@ impl<'a, 's> BlockInstructionEmissionContext<'a, 's> {
     #[inline]
     pub fn const_unit(&mut self) -> RegisterRef {
         RegisterRef::Const(
-            self.add_constant(BlockConstInstruction::ImmUnit.typed(IntrinsicType::Unit.into())),
+            self.add_constant(
+                BlockConstInstruction::ImmUnit
+                    .typed(IntrinsicType::Scalar(IntrinsicScalarType::Unit).into()),
+            ),
         )
     }
 }
@@ -1774,29 +1780,49 @@ pub fn transform_statement<'a, 's>(
                     ) {
                         (a, b) if a == b => right_value,
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::SInt),
-                        ) => {
-                            inst.instantiate_intrinsic_type_class(right_value, IntrinsicType::SInt)
-                        }
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::SInt,
+                            )),
+                        ) => inst.instantiate_intrinsic_type_class(
+                            right_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::SInt),
+                        ),
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::UInt),
-                        ) => {
-                            inst.instantiate_intrinsic_type_class(right_value, IntrinsicType::UInt)
-                        }
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UInt,
+                            )),
+                        ) => inst.instantiate_intrinsic_type_class(
+                            right_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                        ),
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::Float),
-                        ) => {
-                            inst.instantiate_intrinsic_type_class(right_value, IntrinsicType::Float)
-                        }
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::Float,
+                            )),
+                        ) => inst.instantiate_intrinsic_type_class(
+                            right_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        ),
                         (
-                            ConcreteType::UnknownNumberClass,
-                            ConcreteType::Intrinsic(IntrinsicType::Float),
-                        ) => {
-                            inst.instantiate_intrinsic_type_class(right_value, IntrinsicType::Float)
-                        }
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownNumberClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::Float,
+                            )),
+                        ) => inst.instantiate_intrinsic_type_class(
+                            right_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        ),
                         (res_ty, dest_ty) => {
                             panic!("Error: cannot assign: src={res_ty:?}, dest={dest_ty:?}")
                         }

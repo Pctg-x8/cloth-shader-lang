@@ -5,64 +5,184 @@ use crate::{
     source_ref::SourceRefSliceEq, spirv as spv, symbol::meta::SymbolAttribute, utils::roundup2,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 組み込みスカラ型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicScalarType {
+    /// void
     Unit,
+    /// ブール
     Bool,
+    /// 符号なし32bit整数
     UInt,
+    /// 符号付き32bit整数
     SInt,
+    /// 32bit浮動小数点数
     Float,
+    /// 型が明示されていない整数（リテラルなど）
     UnknownIntClass,
+    /// 型が明示されていない実数（リテラルなど）
     UnknownNumberClass,
 }
 impl IntrinsicScalarType {
-    #[inline(always)]
-    pub const fn of_vector(self, count: u8) -> Option<IntrinsicType> {
-        match (self, count) {
-            (Self::Unit, 0) => Some(IntrinsicType::Unit),
-            (Self::Bool, 1) => Some(IntrinsicType::Bool),
-            (Self::UInt, 1) => Some(IntrinsicType::UInt),
-            (Self::SInt, 1) => Some(IntrinsicType::SInt),
-            (Self::Float, 1) => Some(IntrinsicType::Float),
-            (Self::UInt, 2) => Some(IntrinsicType::UInt2),
-            (Self::SInt, 2) => Some(IntrinsicType::SInt2),
-            (Self::Float, 2) => Some(IntrinsicType::Float2),
-            (Self::UInt, 3) => Some(IntrinsicType::UInt3),
-            (Self::SInt, 3) => Some(IntrinsicType::SInt3),
-            (Self::Float, 3) => Some(IntrinsicType::Float3),
-            (Self::UInt, 4) => Some(IntrinsicType::UInt4),
-            (Self::SInt, 4) => Some(IntrinsicType::SInt4),
-            (Self::Float, 4) => Some(IntrinsicType::Float4),
+    pub const fn vec(self, count: u8) -> IntrinsicVectorType {
+        IntrinsicVectorType(self, count)
+    }
+
+    #[inline]
+    pub fn make_spv_type(&self) -> spv::Type {
+        match self {
+            Self::Unit => spv::Type::Void,
+            Self::Bool => spv::ScalarType::Bool.into(),
+            Self::UInt => spv::ScalarType::Int(32, false).into(),
+            Self::SInt => spv::ScalarType::Int(32, true).into(),
+            Self::Float => spv::ScalarType::Float(32).into(),
+            Self::UnknownIntClass | Self::UnknownNumberClass => {
+                unreachable!("unknown type classes left unresolved")
+            }
+        }
+    }
+
+    pub const fn std140_alignment(&self) -> Option<usize> {
+        match self {
+            // unit(void) cannot be a member of uniform struct
+            Self::Unit => None,
+            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(4),
+            // Unknown Value Classes are treated as sint/float
+            Self::UnknownIntClass | Self::UnknownNumberClass => Some(4),
+        }
+    }
+
+    pub const fn std140_size(&self) -> Option<usize> {
+        match self {
+            // unit(void) cannot be a member of uniform struct
+            Self::Unit => None,
+            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(4),
+            // Unknown Value Classes are treated as sint/float
+            Self::UnknownIntClass | Self::UnknownNumberClass => Some(4),
+        }
+    }
+
+    pub const fn is_unknown_type(&self) -> bool {
+        matches!(self, Self::UnknownIntClass | Self::UnknownNumberClass)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IntrinsicVectorType(pub IntrinsicScalarType, pub u8);
+impl IntrinsicVectorType {
+    pub const fn with_type(self, ty: IntrinsicScalarType) -> Self {
+        Self(ty, self.1)
+    }
+
+    pub const fn with_len(self, len: u8) -> Self {
+        Self(self.0, len)
+    }
+
+    pub const fn scalar(&self) -> IntrinsicScalarType {
+        self.0
+    }
+
+    pub const fn len(&self) -> u8 {
+        self.1
+    }
+
+    #[inline]
+    pub fn make_spv_type(&self) -> spv::Type {
+        if self.1 < 2 {
+            unreachable!("too short vector generated");
+        }
+
+        if self.1 > 4 {
+            unreachable!("too big vector generated");
+        }
+
+        self.0.make_spv_type().of_vector(self.1 as _)
+    }
+
+    pub const fn std140_alignment(&self) -> Option<usize> {
+        match self {
+            // unit(void) cannot be a member of uniform struct
+            Self(IntrinsicScalarType::Unit, _) => None,
+            Self(s, 1) => s.std140_alignment(),
+            Self(_, 2) => Some(8),
+            // vec3 has same alignment as vec4
+            Self(_, 3) | Self(_, 4) => Some(16),
+            _ => None,
+        }
+    }
+
+    pub const fn std140_size(&self) -> Option<usize> {
+        match self {
+            // unit(void) cannot be a member of uniform struct
+            Self(IntrinsicScalarType::Unit, _) => None,
+            Self(s, 1) => s.std140_alignment(),
+            Self(_, 2) => Some(8),
+            Self(_, 3) => Some(12),
+            Self(_, 4) => Some(16),
             _ => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IntrinsicMatrixType(pub IntrinsicVectorType, pub u8);
+impl IntrinsicMatrixType {
+    pub const fn with_scalar_type(self, new_st: IntrinsicScalarType) -> Self {
+        Self(self.0.with_type(new_st), self.1)
+    }
+
+    pub fn make_spv_type(&self) -> spv::Type {
+        if self.1 < 2 {
+            unreachable!("too short matrix type");
+        }
+
+        if self.1 > 4 {
+            unreachable!("too big matrix type");
+        }
+
+        self.0.make_spv_type().vector_to_matrix(self.1 as _)
+    }
+
+    pub const fn std140_alignment(&self) -> Option<usize> {
+        match self {
+            Self(IntrinsicVectorType(IntrinsicScalarType::Float, 2), _) => Some(8),
+            Self(IntrinsicVectorType(IntrinsicScalarType::Float, _), _) => Some(16),
+            _ => None,
+        }
+    }
+
+    pub const fn std140_size(&self) -> Option<usize> {
+        Some(16)
+    }
+}
+
+/// 組み込みの複合データ型のクラス分類
+pub enum IntrinsicCompositeTypeClass {
+    /// スカラ
+    Scalar,
+    /// ベクトル
+    Vector(u8),
+    /// 行列
+    Matrix(u8, u8),
+}
+impl IntrinsicCompositeTypeClass {
+    /// スカラ型と組み合わせて具体的な型を作る
+    pub const fn combine_scalar(self, scalar: IntrinsicScalarType) -> IntrinsicType {
+        match self {
+            Self::Scalar => IntrinsicType::Scalar(scalar),
+            Self::Vector(c) => IntrinsicType::Vector(IntrinsicVectorType(scalar, c)),
+            Self::Matrix(c, r) => {
+                IntrinsicType::Matrix(IntrinsicMatrixType(IntrinsicVectorType(scalar, c), r))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicType {
-    Unit,
-    Bool,
-    UInt,
-    UInt2,
-    UInt3,
-    UInt4,
-    SInt,
-    SInt2,
-    SInt3,
-    SInt4,
-    Float,
-    Float2,
-    Float3,
-    Float4,
-    Float2x2,
-    Float2x3,
-    Float2x4,
-    Float3x2,
-    Float3x3,
-    Float3x4,
-    Float4x2,
-    Float4x3,
-    Float4x4,
+    Scalar(IntrinsicScalarType),
+    Vector(IntrinsicVectorType),
+    Matrix(IntrinsicMatrixType),
     Texture1D,
     Texture2D,
     Texture3D,
@@ -72,46 +192,64 @@ pub enum IntrinsicType {
     SubpassInput,
 }
 impl IntrinsicType {
-    pub const fn of_vector(self, component_count: u8) -> Option<Self> {
-        match (self, component_count) {
-            (_, 1) => Some(self),
-            (Self::SInt, 2) => Some(Self::SInt2),
-            (Self::SInt, 3) => Some(Self::SInt3),
-            (Self::SInt, 4) => Some(Self::SInt4),
-            (Self::UInt, 2) => Some(Self::UInt2),
-            (Self::UInt, 3) => Some(Self::UInt3),
-            (Self::UInt, 4) => Some(Self::UInt4),
-            (Self::Float, 2) => Some(Self::Float2),
-            (Self::Float, 3) => Some(Self::Float3),
-            (Self::Float, 4) => Some(Self::Float4),
+    pub const UNIT: Self = Self::Scalar(IntrinsicScalarType::Unit);
+
+    pub const fn bvec(component_count: u8) -> Self {
+        Self::Vector(IntrinsicScalarType::Bool.vec(component_count))
+    }
+
+    pub const fn uvec(component_count: u8) -> Self {
+        Self::Vector(IntrinsicScalarType::UInt.vec(component_count))
+    }
+
+    pub const fn ivec(component_count: u8) -> Self {
+        Self::Vector(IntrinsicScalarType::SInt.vec(component_count))
+    }
+
+    pub const fn vec(component_count: u8) -> Self {
+        Self::Vector(IntrinsicScalarType::Float.vec(component_count))
+    }
+
+    pub const fn mat(row_count: u8, column_count: u8) -> Self {
+        Self::Matrix(IntrinsicMatrixType(
+            IntrinsicVectorType(IntrinsicScalarType::Float, row_count),
+            column_count,
+        ))
+    }
+
+    pub const fn try_cast_scalar(self, target: IntrinsicScalarType) -> Option<Self> {
+        match self {
+            Self::Scalar(_) => Some(Self::Scalar(target)),
+            Self::Vector(v) => Some(Self::Vector(v.with_type(target))),
+            Self::Matrix(m) => Some(Self::Matrix(m.with_scalar_type(target))),
             _ => None,
         }
     }
 
-    pub const fn bvec(component_count: u8) -> Option<Self> {
-        Self::Bool.of_vector(component_count)
-    }
-
-    pub const fn uvec(component_count: u8) -> Option<Self> {
-        Self::UInt.of_vector(component_count)
-    }
-
-    pub const fn ivec(component_count: u8) -> Option<Self> {
-        Self::SInt.of_vector(component_count)
-    }
-
-    pub const fn vec(component_count: u8) -> Option<Self> {
-        Self::Float.of_vector(component_count)
+    pub const fn only_scalar_type(&self) -> Option<IntrinsicScalarType> {
+        match self {
+            &Self::Scalar(s) => Some(s),
+            _ => None,
+        }
     }
 
     pub const fn scalar_type(&self) -> Option<IntrinsicScalarType> {
         match self {
-            Self::Unit => Some(IntrinsicScalarType::Unit),
-            Self::Bool => Some(IntrinsicScalarType::Bool),
-            Self::UInt | Self::UInt2 | Self::UInt3 | Self::UInt4 => Some(IntrinsicScalarType::UInt),
-            Self::SInt | Self::SInt2 | Self::SInt3 | Self::SInt4 => Some(IntrinsicScalarType::SInt),
-            Self::Float | Self::Float2 | Self::Float3 | Self::Float4 => {
-                Some(IntrinsicScalarType::Float)
+            &Self::Scalar(s) => Some(s),
+            &Self::Vector(IntrinsicVectorType(s, _)) => Some(s),
+            &Self::Matrix(IntrinsicMatrixType(IntrinsicVectorType(s, _), _)) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub const fn composite_type_class(&self) -> Option<IntrinsicCompositeTypeClass> {
+        match self {
+            Self::Scalar(_) => Some(IntrinsicCompositeTypeClass::Scalar),
+            Self::Vector(IntrinsicVectorType(_, c)) => {
+                Some(IntrinsicCompositeTypeClass::Vector(*c))
+            }
+            Self::Matrix(IntrinsicMatrixType(IntrinsicVectorType(_, c), r)) => {
+                Some(IntrinsicCompositeTypeClass::Matrix(*c, *r))
             }
             _ => None,
         }
@@ -119,11 +257,8 @@ impl IntrinsicType {
 
     pub const fn vector_elements(&self) -> Option<u8> {
         match self {
-            Self::Unit => Some(0),
-            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(1),
-            Self::UInt2 | Self::SInt2 | Self::Float2 => Some(2),
-            Self::UInt3 | Self::SInt3 | Self::Float3 => Some(3),
-            Self::UInt4 | Self::SInt4 | Self::Float4 => Some(4),
+            &Self::Scalar(_) => Some(1),
+            &Self::Vector(IntrinsicVectorType(_, e)) => Some(e),
             _ => None,
         }
     }
@@ -131,7 +266,7 @@ impl IntrinsicType {
     pub const fn can_uniform_struct_member(&self) -> bool {
         match self {
             // unit(void) cannot be a member of uniform struct
-            Self::Unit => false,
+            Self::Scalar(IntrinsicScalarType::Unit) => false,
             // samplers/image refs cannot be a member of uniform struct
             Self::Image1D
             | Self::Image2D
@@ -146,20 +281,9 @@ impl IntrinsicType {
 
     pub const fn std140_alignment(&self) -> Option<usize> {
         match self {
-            // unit(void) cannot be a member of uniform struct
-            Self::Unit => None,
-            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(4),
-            Self::UInt2 | Self::SInt2 | Self::Float2 => Some(8),
-            Self::UInt3 | Self::SInt3 | Self::Float3 | Self::UInt4 | Self::SInt4 | Self::Float4 => {
-                Some(16)
-            }
-            Self::Float2x2 | Self::Float2x3 | Self::Float2x4 => Some(8),
-            Self::Float3x2
-            | Self::Float3x3
-            | Self::Float3x4
-            | Self::Float4x2
-            | Self::Float4x3
-            | Self::Float4x4 => Some(16),
+            Self::Scalar(s) => s.std140_alignment(),
+            Self::Vector(s) => s.std140_alignment(),
+            Self::Matrix(s) => s.std140_alignment(),
             // samplers/image refs cannot be a member of uniform struct
             Self::Image1D
             | Self::Image2D
@@ -173,19 +297,9 @@ impl IntrinsicType {
 
     pub const fn std140_size(&self) -> Option<usize> {
         match self {
-            // unit(void) cannot be a member of uniform struct
-            Self::Unit => None,
-            Self::Bool | Self::UInt | Self::SInt | Self::Float => Some(4),
-            Self::UInt2 | Self::SInt2 | Self::Float2 => Some(8),
-            Self::UInt3 | Self::SInt3 | Self::Float3 => Some(12),
-            Self::UInt4 | Self::SInt4 | Self::Float4 => Some(16),
-            Self::Float2x2 | Self::Float2x3 | Self::Float2x4 => Some(16),
-            Self::Float3x2
-            | Self::Float3x3
-            | Self::Float3x4
-            | Self::Float4x2
-            | Self::Float4x3
-            | Self::Float4x4 => Some(16),
+            Self::Scalar(s) => s.std140_size(),
+            Self::Vector(s) => s.std140_size(),
+            Self::Matrix(s) => s.std140_size(),
             // samplers/image refs cannot be a member of uniform struct
             Self::Image1D
             | Self::Image2D
@@ -198,59 +312,22 @@ impl IntrinsicType {
     }
 
     pub const fn is_scalar_type(&self) -> bool {
-        match self {
-            Self::Bool | Self::UInt | Self::SInt | Self::Float => true,
-            _ => false,
-        }
+        matches!(self, Self::Scalar(_))
     }
 
     pub const fn is_vector_type(&self) -> bool {
-        match self {
-            Self::Float2 | Self::Float3 | Self::Float4 => true,
-            _ => false,
-        }
+        matches!(self, Self::Vector(_))
     }
 
     pub const fn is_matrix_type(&self) -> bool {
-        match self {
-            Self::Float2x2
-            | Self::Float2x3
-            | Self::Float2x4
-            | Self::Float3x2
-            | Self::Float3x3
-            | Self::Float3x4
-            | Self::Float4x2
-            | Self::Float4x3
-            | Self::Float4x4 => true,
-            _ => false,
-        }
+        matches!(self, Self::Matrix(_))
     }
 
     pub fn make_spv_type(&self) -> spv::Type {
         match self {
-            Self::Unit => spv::Type::Void,
-            Self::Bool => spv::ScalarType::Bool.into(),
-            Self::UInt => spv::ScalarType::Int(32, false).into(),
-            Self::SInt => spv::ScalarType::Int(32, true).into(),
-            Self::Float => spv::ScalarType::Float(32).into(),
-            Self::UInt2 => Self::UInt.make_spv_type().of_vector(2),
-            Self::UInt3 => Self::UInt.make_spv_type().of_vector(3),
-            Self::UInt4 => Self::UInt.make_spv_type().of_vector(4),
-            Self::SInt2 => Self::SInt.make_spv_type().of_vector(2),
-            Self::SInt3 => Self::SInt.make_spv_type().of_vector(3),
-            Self::SInt4 => Self::SInt.make_spv_type().of_vector(4),
-            Self::Float2 => Self::Float.make_spv_type().of_vector(2),
-            Self::Float3 => Self::Float.make_spv_type().of_vector(3),
-            Self::Float4 => Self::Float.make_spv_type().of_vector(4),
-            Self::Float2x2 => Self::Float.make_spv_type().of_matrix(2, 2),
-            Self::Float2x3 => Self::Float.make_spv_type().of_matrix(2, 3),
-            Self::Float2x4 => Self::Float.make_spv_type().of_matrix(2, 4),
-            Self::Float3x2 => Self::Float.make_spv_type().of_matrix(3, 2),
-            Self::Float3x3 => Self::Float.make_spv_type().of_matrix(3, 3),
-            Self::Float3x4 => Self::Float.make_spv_type().of_matrix(3, 4),
-            Self::Float4x2 => Self::Float.make_spv_type().of_matrix(4, 2),
-            Self::Float4x3 => Self::Float.make_spv_type().of_matrix(4, 3),
-            Self::Float4x4 => Self::Float.make_spv_type().of_matrix(4, 4),
+            Self::Scalar(s) => s.make_spv_type(),
+            Self::Vector(s) => s.make_spv_type(),
+            Self::Matrix(s) => s.make_spv_type(),
             Self::Image1D => unimplemented!(),
             Self::Image2D => unimplemented!(),
             Self::Image3D => unimplemented!(),
@@ -267,8 +344,6 @@ pub enum ConcreteType<'s> {
     Generic(Vec<usize>, Box<ConcreteType<'s>>),
     GenericVar(usize),
     Intrinsic(IntrinsicType),
-    UnknownIntClass,
-    UnknownNumberClass,
     UserDefined {
         name: &'s str,
         generic_args: Vec<ConcreteType<'s>>,
@@ -297,27 +372,27 @@ impl<'s> ConcreteType<'s> {
                 name_token,
                 generic_args,
             } => match name_token.slice {
-                "UInt" => Self::Intrinsic(IntrinsicType::UInt),
-                "UInt2" => Self::Intrinsic(IntrinsicType::UInt2),
-                "UInt3" => Self::Intrinsic(IntrinsicType::UInt3),
-                "UInt4" => Self::Intrinsic(IntrinsicType::UInt4),
-                "SInt" | "Int" => Self::Intrinsic(IntrinsicType::SInt),
-                "SInt2" | "Int2" => Self::Intrinsic(IntrinsicType::SInt2),
-                "SInt3" | "Int3" => Self::Intrinsic(IntrinsicType::SInt3),
-                "SInt4" | "Int4" => Self::Intrinsic(IntrinsicType::SInt4),
-                "Float" => Self::Intrinsic(IntrinsicType::Float),
-                "Float2" => Self::Intrinsic(IntrinsicType::Float2),
-                "Float3" => Self::Intrinsic(IntrinsicType::Float3),
-                "Float4" => Self::Intrinsic(IntrinsicType::Float4),
-                "Float2x2" => Self::Intrinsic(IntrinsicType::Float2x2),
-                "Float2x3" => Self::Intrinsic(IntrinsicType::Float2x3),
-                "Float2x4" => Self::Intrinsic(IntrinsicType::Float2x4),
-                "Float3x2" => Self::Intrinsic(IntrinsicType::Float3x2),
-                "Float3x3" => Self::Intrinsic(IntrinsicType::Float3x3),
-                "Float3x4" => Self::Intrinsic(IntrinsicType::Float3x4),
-                "Float4x2" => Self::Intrinsic(IntrinsicType::Float4x2),
-                "Float4x3" => Self::Intrinsic(IntrinsicType::Float4x3),
-                "Float4x4" => Self::Intrinsic(IntrinsicType::Float4x4),
+                "UInt" => Self::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::UInt)),
+                "UInt2" => Self::Intrinsic(IntrinsicType::uvec(2)),
+                "UInt3" => Self::Intrinsic(IntrinsicType::uvec(3)),
+                "UInt4" => Self::Intrinsic(IntrinsicType::uvec(4)),
+                "SInt" | "Int" => Self::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::SInt)),
+                "SInt2" | "Int2" => Self::Intrinsic(IntrinsicType::ivec(2)),
+                "SInt3" | "Int3" => Self::Intrinsic(IntrinsicType::ivec(3)),
+                "SInt4" | "Int4" => Self::Intrinsic(IntrinsicType::ivec(4)),
+                "Float" => Self::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                "Float2" => Self::Intrinsic(IntrinsicType::vec(2)),
+                "Float3" => Self::Intrinsic(IntrinsicType::vec(3)),
+                "Float4" => Self::Intrinsic(IntrinsicType::vec(4)),
+                "Float2x2" => Self::Intrinsic(IntrinsicType::mat(2, 2)),
+                "Float2x3" => Self::Intrinsic(IntrinsicType::mat(2, 3)),
+                "Float2x4" => Self::Intrinsic(IntrinsicType::mat(2, 4)),
+                "Float3x2" => Self::Intrinsic(IntrinsicType::mat(3, 2)),
+                "Float3x3" => Self::Intrinsic(IntrinsicType::mat(3, 3)),
+                "Float3x4" => Self::Intrinsic(IntrinsicType::mat(3, 4)),
+                "Float4x2" => Self::Intrinsic(IntrinsicType::mat(4, 2)),
+                "Float4x3" => Self::Intrinsic(IntrinsicType::mat(4, 3)),
+                "Float4x4" => Self::Intrinsic(IntrinsicType::mat(4, 4)),
                 "Image1D" => Self::Intrinsic(IntrinsicType::Image1D),
                 "Image2D" => Self::Intrinsic(IntrinsicType::Image2D),
                 "Image3D" => Self::Intrinsic(IntrinsicType::Image3D),
@@ -372,6 +447,25 @@ impl<'s> ConcreteType<'s> {
                 )),
                 reduce_const_expr(&length).into_u32(),
             ),
+            // TODO: decoratorでポインティングデータの所属クラスを引いてくる
+            TypeSyntax::Ref {
+                pointee_type,
+                mut_token: None,
+                ..
+            } => Self::Ref(Box::new(Self::build(
+                symbol_scope,
+                sibling_scope_opaque_symbols,
+                *pointee_type,
+            ))),
+            TypeSyntax::Ref {
+                pointee_type,
+                mut_token: Some(_),
+                ..
+            } => Self::MutableRef(Box::new(Self::build(
+                symbol_scope,
+                sibling_scope_opaque_symbols,
+                *pointee_type,
+            ))),
         }
     }
 
@@ -401,11 +495,34 @@ impl<'s> ConcreteType<'s> {
         }
     }
 
+    pub const fn intrinsic_type(&self) -> Option<&IntrinsicType> {
+        match self {
+            Self::Intrinsic(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn try_cast_intrinsic_scalar(self, target: IntrinsicScalarType) -> Option<Self> {
+        match self {
+            Self::Intrinsic(it) => match it.try_cast_scalar(target) {
+                Some(it) => Some(Self::Intrinsic(it)),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
     pub const fn scalar_type(&self) -> Option<IntrinsicScalarType> {
         match self {
             Self::Intrinsic(x) => x.scalar_type(),
-            Self::UnknownIntClass => Some(IntrinsicScalarType::UnknownIntClass),
-            Self::UnknownNumberClass => Some(IntrinsicScalarType::UnknownNumberClass),
+            _ => None,
+        }
+    }
+
+    pub const fn intrinsic_composite_type_class(&self) -> Option<IntrinsicCompositeTypeClass> {
+        match self {
+            Self::Intrinsic(x) => x.composite_type_class(),
             _ => None,
         }
     }
@@ -413,7 +530,6 @@ impl<'s> ConcreteType<'s> {
     pub const fn vector_elements(&self) -> Option<u8> {
         match self {
             Self::Intrinsic(x) => x.vector_elements(),
-            Self::UnknownIntClass | Self::UnknownNumberClass => Some(1),
             _ => None,
         }
     }
@@ -446,7 +562,6 @@ impl<'s> ConcreteType<'s> {
     pub const fn is_scalar_type(&self) -> bool {
         match self {
             Self::Intrinsic(it) => it.is_scalar_type(),
-            Self::UnknownIntClass | Self::UnknownNumberClass => true,
             _ => false,
         }
     }
@@ -463,10 +578,6 @@ impl<'s> ConcreteType<'s> {
             Self::Intrinsic(it) => it.is_matrix_type(),
             _ => false,
         }
-    }
-
-    pub const fn is_unknown_type_class(&self) -> bool {
-        matches!(self, Self::UnknownIntClass | Self::UnknownNumberClass)
     }
 
     pub fn make_spv_type(&self, scope: &SymbolScope<'_, 's>) -> spv::Type {
@@ -570,8 +681,6 @@ impl<'s> ConcreteType<'s> {
             Self::Never => unreachable!("type inference has error"),
             Self::Generic { .. } => unreachable!("uninstantiated generic type"),
             Self::GenericVar(_) => unreachable!("uninstantiated generic var"),
-            Self::UnknownIntClass => unreachable!("left UnknownIntClass"),
-            Self::UnknownNumberClass => unreachable!("left UnknownNumberClass"),
             Self::OverloadedFunctions(_) => unreachable!("unresolved overloads"),
         }
     }
@@ -609,19 +718,17 @@ impl From<IntrinsicType> for ConcreteType<'_> {
         Self::Intrinsic(value)
     }
 }
-impl From<IntrinsicScalarType> for ConcreteType<'_> {
-    #[inline(always)]
-    fn from(value: IntrinsicScalarType) -> Self {
-        match value {
-            IntrinsicScalarType::Unit => Self::Intrinsic(IntrinsicType::Unit),
-            IntrinsicScalarType::Bool => Self::Intrinsic(IntrinsicType::Bool),
-            IntrinsicScalarType::UInt => Self::Intrinsic(IntrinsicType::UInt),
-            IntrinsicScalarType::SInt => Self::Intrinsic(IntrinsicType::SInt),
-            IntrinsicScalarType::Float => Self::Intrinsic(IntrinsicType::Float),
-            IntrinsicScalarType::UnknownIntClass => Self::UnknownIntClass,
-            IntrinsicScalarType::UnknownNumberClass => Self::UnknownNumberClass,
-        }
-    }
+
+/// 演算子の項の値変換指示
+pub enum BinaryOpScalarConversion {
+    /// 変換なし
+    None,
+    /// UnknownNumberClassに昇格（主にUnknownIntNumberに対して）
+    PromoteUnknownNumber,
+    /// 指定した型にキャスト
+    Cast(IntrinsicScalarType),
+    /// 指定した型にUnknownHogehogeClassの値を実体化する
+    Instantiate(IntrinsicScalarType),
 }
 
 pub enum BinaryOpTermConversion {
@@ -649,1520 +756,733 @@ impl BinaryOpTermConversion {
     }
 }
 
-pub enum BinaryOpTypeConversion {
-    NoConversion,
-    CastLeftHand(IntrinsicType),
-    CastRightHand(IntrinsicType),
-    InstantiateAndCastLeftHand(IntrinsicType),
-    InstantiateAndCastRightHand(IntrinsicType),
-    InstantiateRightAndCastLeftHand(IntrinsicType),
-    InstantiateLeftAndCastRightHand(IntrinsicType),
-    InstantiateLeftHand(IntrinsicType),
-    InstantiateRightHand(IntrinsicType),
+/// 分配オペレーションの必要性を表す
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOpValueDistributionRequirements {
+    /// 左の項の分配が必要
+    LeftTerm,
+    /// 右の項の分配が必要
+    RightTerm,
 }
-impl<'s> ConcreteType<'s> {
-    pub fn multiply_op_type_conversion(self, rhs: Self) -> Option<(BinaryOpTypeConversion, Self)> {
-        match (&self, &rhs) {
-            // between same type
-            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, self)),
-            // vector times scalar
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float2), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (ConcreteType::Intrinsic(IntrinsicType::Float2), ConcreteType::UnknownNumberClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float3), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (ConcreteType::Intrinsic(IntrinsicType::Float3), ConcreteType::UnknownNumberClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float4), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (ConcreteType::Intrinsic(IntrinsicType::Float4), ConcreteType::UnknownNumberClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            // matrix times scalar
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float2x2), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float3x2), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float4x2), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float2x3), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float3x3), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float4x3), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float2x4), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float3x4), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::Intrinsic(IntrinsicType::Bool),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::Intrinsic(IntrinsicType::UInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::Intrinsic(IntrinsicType::SInt),
-            ) => Some((
-                BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                self,
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float),
-            ) => Some((BinaryOpTypeConversion::NoConversion, self)),
-            (ConcreteType::Intrinsic(IntrinsicType::Float4x4), ConcreteType::UnknownIntClass) => {
-                Some((
-                    BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                    self,
-                ))
-            }
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::UnknownNumberClass,
-            ) => Some((
-                BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                self,
-            )),
-            // vector times matrix
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            // matrix times vector
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x2),
-                ConcreteType::Intrinsic(IntrinsicType::Float2),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x3),
-                ConcreteType::Intrinsic(IntrinsicType::Float3),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float2x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float2.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float3x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float3.into(),
-            )),
-            (
-                ConcreteType::Intrinsic(IntrinsicType::Float4x4),
-                ConcreteType::Intrinsic(IntrinsicType::Float4),
-            ) => Some((
-                BinaryOpTypeConversion::NoConversion,
-                IntrinsicType::Float4.into(),
-            )),
-            // between same length vectors
-            (a, b) if a.vector_elements()? == b.vector_elements()? => {
-                match (a.scalar_type()?, b.scalar_type()?) {
-                    // simple casting
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::Float) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Float),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Float) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Float),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Float) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Float),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::UInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::SInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::Float, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                        self,
-                    )),
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::SInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::CastLeftHand(IntrinsicType::SInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::Float, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                        self,
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::UInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::SInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::Float, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::Float),
-                        self,
-                    )),
-                    // instantiate left
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
-                            IntrinsicType::UInt,
-                        ),
-                        IntrinsicType::UInt.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::SInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::UInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Float) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::SInt),
-                        rhs,
-                    )),
-                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Float) => {
-                        Some((
-                            BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::Float),
-                            rhs,
-                        ))
-                    }
-                    // instantiate right
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
-                            IntrinsicType::UInt,
-                        ),
-                        IntrinsicType::UInt.into(),
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::SInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::UInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::SInt),
-                        self,
-                    )),
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownNumberClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownNumberClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
-                            IntrinsicType::Float,
-                        ),
-                        IntrinsicType::Float.into(),
-                    )),
-                    (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownNumberClass) => {
-                        Some((
-                            BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::Float),
-                            self,
-                        ))
-                    }
-                    // never
-                    _ => None,
-                }
-            }
-            // never
-            _ => None,
+
+/// 二項演算の型変換/分配指示データ
+pub struct BinaryOpTypeConversion2<'s> {
+    /// 演算子の左の項の変換指示
+    pub left_op: BinaryOpScalarConversion,
+    /// 演算子の右の項の変換指示
+    pub right_op: BinaryOpScalarConversion,
+    /// どちらの項の値の分配すべきか Noneの場合は分配処理はなし
+    pub dist: Option<BinaryOpValueDistributionRequirements>,
+    /// この演算の最終的な型
+    pub result_type: ConcreteType<'s>,
+}
+
+/// （乗算以外の）組み込み算術演算の自動型変換ルールの定義
+///
+/// ベクトル/行列との乗算に特殊なルールが存在するので、乗算は別で定義
+pub fn arithmetic_compare_op_type_conversion<'s>(
+    lhs: &ConcreteType<'s>,
+    rhs: &ConcreteType<'s>,
+) -> Option<BinaryOpTypeConversion2<'s>> {
+    if lhs == rhs {
+        // 同じ型
+
+        if (lhs.scalar_type(), rhs.scalar_type())
+            == (
+                Some(IntrinsicScalarType::Bool),
+                Some(IntrinsicScalarType::Bool),
+            )
+        {
+            // Bool型どうしの算術演算はSIntに上げる
+            return Some(BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+                right_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+                dist: None,
+                result_type: ConcreteType::Intrinsic(
+                    lhs.intrinsic_composite_type_class()
+                        .expect("no intrinsic type?")
+                        .combine_scalar(IntrinsicScalarType::SInt),
+                ),
+            });
         }
+
+        return Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: lhs.clone(),
+        });
     }
 
-    pub fn arithmetic_compare_op_type_conversion(
-        self,
-        rhs: Self,
-    ) -> Option<(BinaryOpTermConversion, BinaryOpTermConversion, Self)> {
-        match (self, rhs) {
-            // between same type
-            (a, b) if a == b => Some((
-                BinaryOpTermConversion::NoConversion,
-                BinaryOpTermConversion::NoConversion,
-                a,
-            )),
-            // between same length vectors
-            (a, b) if a.vector_elements()? == b.vector_elements()? => {
-                let element_count = a.vector_elements()?;
+    // 小ディメンションの値をより広いディメンションの値へと自動変換する（1.0 -> Float4(1.0, 1.0, 1.0, 1.0)みたいに値を分配する（distribute）操作）
+    let (dist, composite_type_class) = match (lhs, rhs) {
+        // 右がでかいので右に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::LeftTerm),
+            rhs.intrinsic_composite_type_class()?,
+        ),
+        // 左がでかいので左に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::RightTerm),
+            lhs.intrinsic_composite_type_class()?,
+        ),
+        // 同じサイズ
+        _ => (None, lhs.intrinsic_composite_type_class()?),
+    };
 
-                match a.scalar_type()? {
-                    IntrinsicScalarType::Unit => None,
-                    IntrinsicScalarType::Bool => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::SInt),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::SInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::NoConversion,
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::SInt),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::UInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::NoConversion,
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::UInt),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::Float => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool
-                        | IntrinsicScalarType::SInt
-                        | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::NoConversion,
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            a.clone(),
-                        )),
-                    },
-                    IntrinsicScalarType::UnknownIntClass => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::SInt),
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::SInt),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::UInt),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::NoConversion,
-                            ConcreteType::UnknownIntClass,
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::PromoteUnknownNumber,
-                            BinaryOpTermConversion::NoConversion,
-                            ConcreteType::UnknownNumberClass,
-                        )),
-                    },
-                    IntrinsicScalarType::UnknownNumberClass => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool
-                        | IntrinsicScalarType::SInt
-                        | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::PromoteUnknownNumber,
-                            ConcreteType::UnknownNumberClass,
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::NoConversion,
-                            ConcreteType::UnknownNumberClass,
-                        )),
-                    },
-                }
-            }
-            // extend one side
-            (a, b) if a.is_vector_type() && b.is_scalar_type() => {
-                let element_count = a.vector_elements().unwrap();
+    // 自動型変換ルール
+    let (l, r) = (lhs.scalar_type()?, rhs.scalar_type()?);
+    let (left_conv, right_conv, result_type) = match (l, r) {
+        // 片方でもUnitの場合は変換なし（他のところで形マッチエラーにさせる）
+        (IntrinsicScalarType::Unit, _) | (_, IntrinsicScalarType::Unit) => return None,
+        // boolの算術演算はSIntとして行う（型一致時の特殊ルール）
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+            IntrinsicScalarType::SInt,
+        ),
+        // 同じ型だったら変換なし（この場合はDistributionだけが走る）
+        (IntrinsicScalarType::UInt, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::None,
+            l,
+        ),
+        // UnknownHogehogeClassは適当にInstantiateさせて、あとはBoolとの演算ルールに従う
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => (
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::SInt),
+            IntrinsicScalarType::SInt,
+        ),
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::SInt),
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::SInt),
+            IntrinsicScalarType::SInt,
+        ),
+        // 左の型に合わせるパターン
+        (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::UInt) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Cast(l),
+            l,
+        ),
+        // 左の型に合わせるパターン（Instantiate）
+        (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Instantiate(l),
+            l,
+        ),
+        // 左の型に合わせるパターン（昇格）
+        (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UnknownIntClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::PromoteUnknownNumber,
+            l,
+        ),
+        // 右の型に合わせるパターン
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::Bool, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::Float) => (
+            BinaryOpScalarConversion::Cast(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 右の型に合わせるパターン（Instantiate）
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Float) => (
+            BinaryOpScalarConversion::Instantiate(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 右の型に合わせるパターン（昇格）
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::PromoteUnknownNumber,
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 右をInstantiateしたうえで、すべての演算をFloatで行うパターン
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownNumberClass)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float),
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+            IntrinsicScalarType::Float,
+        ),
+        // 左をInstantiateしたうえで、すべての演算をFloatで行うパターン
+        (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UInt) => (
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float),
+            IntrinsicScalarType::Float,
+        ),
+    };
 
-                match a.scalar_type()? {
-                    IntrinsicScalarType::Unit => None,
-                    IntrinsicScalarType::Bool => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
-                            IntrinsicType::uvec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::SInt,
-                                element_count as _,
-                            ),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::SInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::SInt,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::UInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::UInt,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                    },
-                    IntrinsicScalarType::Float => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool
-                        | IntrinsicScalarType::SInt
-                        | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            a.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => Some((
-                            BinaryOpTermConversion::NoConversion,
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            a.clone(),
-                        )),
-                    },
-                    IntrinsicScalarType::UnknownIntClass
-                    | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                }
-            }
-            (a, b) if a.is_scalar_type() && b.is_vector_type() => {
-                let element_count = b.vector_elements().unwrap();
+    Some(BinaryOpTypeConversion2 {
+        left_op: left_conv,
+        right_op: right_conv,
+        dist,
+        result_type: ConcreteType::Intrinsic(composite_type_class.combine_scalar(result_type)),
+    })
+}
 
-                match a.scalar_type()? {
-                    IntrinsicScalarType::Unit => None,
-                    IntrinsicScalarType::Bool => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::uvec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                    IntrinsicScalarType::SInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::ivec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                    IntrinsicScalarType::UInt => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
-                            BinaryOpTermConversion::Cast(IntrinsicType::uvec(element_count)?),
-                            IntrinsicType::uvec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::ivec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::uvec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::CastAndDistribute(
-                                IntrinsicType::vec(element_count)?,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                    IntrinsicScalarType::Float => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool
-                        | IntrinsicScalarType::SInt
-                        | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::vec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::Distribute(IntrinsicType::vec(element_count)?),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                    IntrinsicScalarType::UnknownIntClass => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::SInt,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::Cast(IntrinsicType::ivec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::SInt => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::SInt,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::UInt,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                    IntrinsicScalarType::UnknownNumberClass => match b.scalar_type()? {
-                        IntrinsicScalarType::Unit => None,
-                        IntrinsicScalarType::Bool
-                        | IntrinsicScalarType::SInt
-                        | IntrinsicScalarType::UInt => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::Cast(IntrinsicType::vec(element_count)?),
-                            IntrinsicType::ivec(element_count)?.into(),
-                        )),
-                        IntrinsicScalarType::Float => Some((
-                            BinaryOpTermConversion::InstantiateAndDistribute(
-                                IntrinsicType::Float,
-                                element_count as _,
-                            ),
-                            BinaryOpTermConversion::NoConversion,
-                            b.clone(),
-                        )),
-                        IntrinsicScalarType::UnknownIntClass
-                        | IntrinsicScalarType::UnknownNumberClass => unreachable!(),
-                    },
-                }
-            }
-            // never
-            _ => None,
-        }
+/// 組み込みビット演算の自動型変換ルールの定義
+pub fn bitwise_op_type_conversion<'s>(
+    lhs: &ConcreteType<'s>,
+    rhs: &ConcreteType<'s>,
+) -> Option<BinaryOpTypeConversion2<'s>> {
+    if lhs == rhs {
+        // 同じ型
+
+        return Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: lhs.clone(),
+        });
     }
 
-    pub fn bitwise_op_type_conversion(self, rhs: Self) -> Option<(BinaryOpTypeConversion, Self)> {
-        match (self, rhs) {
-            // between same type
-            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
-            // between same length vectors
-            (a, b) if a.vector_elements()? == b.vector_elements()? => {
-                match (a.scalar_type()?, b.scalar_type()?) {
-                    // simple casting
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt) => {
-                        Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::UInt), b))
-                    }
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt) => {
-                        Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::UInt), b))
-                    }
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt) => {
-                        Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::SInt), b))
-                    }
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::UInt),
-                        a,
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::UInt),
-                        a,
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::SInt),
-                        a,
-                    )),
-                    // instantiate left
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(
-                            IntrinsicType::UInt,
-                        ),
-                        IntrinsicType::UInt.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::SInt),
-                        IntrinsicType::SInt.into(),
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt) => Some((
-                        BinaryOpTypeConversion::InstantiateLeftHand(IntrinsicType::UInt),
-                        b,
-                    )),
-                    // instantiate right
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(
-                            IntrinsicType::UInt,
-                        ),
-                        IntrinsicType::UInt.into(),
-                    )),
-                    (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::SInt),
-                        IntrinsicType::SInt.into(),
-                    )),
-                    (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateRightHand(IntrinsicType::UInt),
-                        a,
-                    )),
-                    // never
-                    _ => None,
+    // 小ディメンションの値をより広いディメンションの値へと自動変換する（1.0 -> Float4(1.0, 1.0, 1.0, 1.0)みたいに値を分配する（distribute）操作）
+    let (dist, composite_type_class) = match (lhs, rhs) {
+        // 右がでかいので右に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::LeftTerm),
+            rhs.intrinsic_composite_type_class()
+                .expect("no intrinsic type"),
+        ),
+        // 左がでかいので左に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::RightTerm),
+            lhs.intrinsic_composite_type_class()?,
+        ),
+        // 同じサイズ
+        _ => (None, lhs.intrinsic_composite_type_class()?),
+    };
+
+    // 自動型変換ルール
+    let (l, r) = (lhs.scalar_type()?, rhs.scalar_type()?);
+    let (left_conv, right_conv, result_type) = match (l, r) {
+        // 片方でもUnitの場合は変換なし（他のところで形マッチエラーにさせる）
+        (IntrinsicScalarType::Unit, _) | (_, IntrinsicScalarType::Unit) => return None,
+        // 片方でもFloatの場合は演算不可 UnknownNumberClassも同様
+        (IntrinsicScalarType::Float, _)
+        | (_, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::UnknownNumberClass, _)
+        | (_, IntrinsicScalarType::UnknownNumberClass) => return None,
+        // 同じ型だったら変換なし（この場合はDistributionだけが走る）
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UnknownIntClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::None,
+            l,
+        ),
+        // UnknownHogehogeClassは適当にInstantiateさせて、あとはBoolとの演算ルールに従う
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => (
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::UInt),
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::UInt),
+            IntrinsicScalarType::UInt,
+        ),
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::UInt),
+            BinaryOpScalarConversion::Cast(IntrinsicScalarType::UInt),
+            IntrinsicScalarType::UInt,
+        ),
+        // 右に合わせるパターン
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt)
+        | (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt) => (
+            BinaryOpScalarConversion::Cast(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 左に合わせるパターン
+        (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Cast(l),
+            l,
+        ),
+        // 左をInstantiateするパターン
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt)
+        | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt) => (
+            BinaryOpScalarConversion::Instantiate(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 右をInstantiateするパターン
+        (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Instantiate(l),
+            l,
+        ),
+    };
+
+    Some(BinaryOpTypeConversion2 {
+        left_op: left_conv,
+        right_op: right_conv,
+        dist,
+        result_type: ConcreteType::Intrinsic(composite_type_class.combine_scalar(result_type)),
+    })
+}
+
+pub fn logical_op_type_conversion<'s>(
+    lhs: &ConcreteType<'s>,
+    rhs: &ConcreteType<'s>,
+) -> Option<BinaryOpTypeConversion2<'s>> {
+    todo!("練り直し");
+    /*match (lhs, rhs) {
+        // between same type
+        (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
+        // between same length vectors
+        (a, b) if a.vector_elements()? == b.vector_elements()? => {
+            match (a.scalar_type()?, b.scalar_type()?) {
+                // instantiate and cast
+                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
+                    BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::UInt),
+                    a,
+                )),
+                (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
+                    BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::UInt),
+                    a,
+                )),
+                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
+                    BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::Float),
+                    a,
+                )),
+                (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
+                    BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::Float),
+                    a,
+                )),
+                // simple casting
+                (IntrinsicScalarType::Bool, _) => Some((
+                    BinaryOpTypeConversion::CastRightHand(IntrinsicType::Bool),
+                    a,
+                )),
+                (_, IntrinsicScalarType::Bool) => {
+                    Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Bool), b))
                 }
+                // never
+                _ => None,
             }
-            // never
-            _ => None,
         }
-    }
+        // never
+        _ => None,
+    }*/
+}
 
-    pub fn logical_op_type_conversion(self, rhs: Self) -> Option<(BinaryOpTypeConversion, Self)> {
-        match (self, rhs) {
-            // between same type
-            (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
-            // between same length vectors
-            (a, b) if a.vector_elements()? == b.vector_elements()? => {
-                match (a.scalar_type()?, b.scalar_type()?) {
-                    // instantiate and cast
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::UInt),
-                        a,
-                    )),
-                    (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::UInt),
-                        a,
-                    )),
-                    (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::Float),
-                        a,
-                    )),
-                    (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
-                        BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::Float),
-                        a,
-                    )),
-                    // simple casting
-                    (IntrinsicScalarType::Bool, _) => Some((
-                        BinaryOpTypeConversion::CastRightHand(IntrinsicType::Bool),
-                        a,
-                    )),
-                    (_, IntrinsicScalarType::Bool) => {
-                        Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Bool), b))
-                    }
-                    // never
-                    _ => None,
+pub fn pow_op_type_conversion<'s>(
+    lhs: &ConcreteType<'s>,
+    rhs: &ConcreteType<'s>,
+) -> Option<BinaryOpTypeConversion2<'s>> {
+    todo!("練り直し");
+    /*let (left_conversion, resulting_left_ty) = match self {
+        Self::Intrinsic(IntrinsicType::Bool) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::UInt) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::Float) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
+        }
+        Self::Intrinsic(IntrinsicType::UInt2) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
+            IntrinsicType::Float2,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt2) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
+            IntrinsicType::Float2,
+        ),
+        Self::Intrinsic(IntrinsicType::Float2) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
+        }
+        Self::Intrinsic(IntrinsicType::UInt3) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
+            IntrinsicType::Float3,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt3) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
+            IntrinsicType::Float3,
+        ),
+        Self::Intrinsic(IntrinsicType::Float3) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
+        }
+        Self::Intrinsic(IntrinsicType::UInt4) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
+            IntrinsicType::Float4,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt4) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
+            IntrinsicType::Float4,
+        ),
+        Self::Intrinsic(IntrinsicType::Float4) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
+        }
+        Self::UnknownIntClass | Self::UnknownNumberClass => (
+            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        _ => return None,
+    };
+    let (right_conversion, resulting_right_ty) = match rhs {
+        Self::Intrinsic(IntrinsicType::Bool) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::UInt) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        Self::Intrinsic(IntrinsicType::Float) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
+        }
+        Self::Intrinsic(IntrinsicType::UInt2) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
+            IntrinsicType::Float2,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt2) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
+            IntrinsicType::Float2,
+        ),
+        Self::Intrinsic(IntrinsicType::Float2) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
+        }
+        Self::Intrinsic(IntrinsicType::UInt3) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
+            IntrinsicType::Float3,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt3) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
+            IntrinsicType::Float3,
+        ),
+        Self::Intrinsic(IntrinsicType::Float3) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
+        }
+        Self::Intrinsic(IntrinsicType::UInt4) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
+            IntrinsicType::Float4,
+        ),
+        Self::Intrinsic(IntrinsicType::SInt4) => (
+            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
+            IntrinsicType::Float4,
+        ),
+        Self::Intrinsic(IntrinsicType::Float4) => {
+            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
+        }
+        Self::UnknownIntClass | Self::UnknownNumberClass => (
+            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
+            IntrinsicType::Float,
+        ),
+        _ => return None,
+    };
+
+    match (resulting_left_ty, resulting_right_ty) {
+        (a, b) if a == b => Some((left_conversion, right_conversion, resulting_left_ty.into())),
+        (a, b) if a.is_scalar_type() && b.is_vector_type() => Some((
+            left_conversion.distribute(b, b.vector_elements().unwrap() as _),
+            right_conversion,
+            resulting_right_ty.into(),
+        )),
+        (a, b) if a.is_vector_type() && b.is_scalar_type() => Some((
+            left_conversion,
+            right_conversion.distribute(a, a.vector_elements().unwrap() as _),
+            resulting_left_ty.into(),
+        )),
+        _ => None,
+    }*/
+}
+
+/// 乗算の自動型変換ルールの定義
+pub fn multiply_op_type_conversion<'s>(
+    lhs: &ConcreteType<'s>,
+    rhs: &ConcreteType<'s>,
+) -> Option<BinaryOpTypeConversion2<'s>> {
+    match (lhs, rhs) {
+        // between same type
+        (a, b) if a == b => Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: lhs.clone(),
+        }),
+        // vector times scalar
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(IntrinsicVectorType(a, _))),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(b)),
+        ) if a == b => {
+            // both same element type and scalar type
+            Some(BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::None,
+                right_op: BinaryOpScalarConversion::None,
+                dist: None,
+                result_type: lhs.clone(),
+            })
+        }
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(IntrinsicVectorType(
+                IntrinsicScalarType::Float,
+                _,
+            ))),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(r)),
+        ) => {
+            // force casting/instantiating right hand to float
+            Some(BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::None,
+                right_op: if r.is_unknown_type() {
+                    BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float)
+                } else {
+                    BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float)
+                },
+                dist: None,
+                result_type: lhs.clone(),
+            })
+        }
+        // matrix times scalar
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(IntrinsicMatrixType(
+                IntrinsicVectorType(a, _),
+                _,
+            ))),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(b)),
+        ) if a == b => {
+            // both same element type and scalar type
+            Some(BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::None,
+                right_op: BinaryOpScalarConversion::None,
+                dist: None,
+                result_type: lhs.clone(),
+            })
+        }
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(IntrinsicMatrixType(
+                IntrinsicVectorType(IntrinsicScalarType::Float, _),
+                _,
+            ))),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(r)),
+        ) => {
+            // force casting/instantiating right hand to float
+            Some(BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::None,
+                right_op: if r.is_unknown_type() {
+                    BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float)
+                } else {
+                    BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float)
+                },
+                dist: None,
+                result_type: lhs.clone(),
+            })
+        }
+        // vector times matrix
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(rl)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(IntrinsicMatrixType(rr, c))),
+        ) if rl == rr => Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: IntrinsicType::Vector(IntrinsicVectorType(rl.0, *c)).into(),
+        }),
+        // matrix times vector
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(IntrinsicMatrixType(
+                IntrinsicVectorType(IntrinsicScalarType::Float, r),
+                cl,
+            ))),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(IntrinsicVectorType(
+                IntrinsicScalarType::Float,
+                rr,
+            ))),
+        ) if cl == rr => Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: IntrinsicType::vec(*r).into(),
+        }),
+        // between same length vectors
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(vl)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(vr)),
+        ) if vl.1 == vr.1 => {
+            match (vl.0, vr.0) {
+                // simple casting
+                // empowered right hand
+                (IntrinsicScalarType::Bool, IntrinsicScalarType::UInt)
+                | (IntrinsicScalarType::Bool, IntrinsicScalarType::SInt)
+                | (IntrinsicScalarType::Bool, IntrinsicScalarType::Float)
+                | (IntrinsicScalarType::UInt, IntrinsicScalarType::SInt)
+                | (IntrinsicScalarType::UInt, IntrinsicScalarType::Float)
+                | (IntrinsicScalarType::SInt, IntrinsicScalarType::Float) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Cast(vr.0),
+                        right_op: BinaryOpScalarConversion::None,
+                        dist: None,
+                        result_type: rhs.clone(),
+                    })
                 }
+                // empowered left hand
+                (IntrinsicScalarType::Float, IntrinsicScalarType::SInt)
+                | (IntrinsicScalarType::Float, IntrinsicScalarType::UInt)
+                | (IntrinsicScalarType::SInt, IntrinsicScalarType::UInt)
+                | (IntrinsicScalarType::Float, IntrinsicScalarType::Bool)
+                | (IntrinsicScalarType::SInt, IntrinsicScalarType::Bool)
+                | (IntrinsicScalarType::UInt, IntrinsicScalarType::Bool) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::None,
+                        right_op: BinaryOpScalarConversion::Cast(vl.0),
+                        dist: None,
+                        result_type: lhs.clone(),
+                    })
+                }
+                // instantiate lhs, cast rhs, operate on uint type
+                (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::UInt),
+                        right_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::UInt),
+                        dist: None,
+                        result_type: IntrinsicType::Vector(vl.with_type(IntrinsicScalarType::UInt))
+                            .into(),
+                    })
+                }
+                // instantiate rhs, cast lhs, operate on uint type
+                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::UInt),
+                        right_op: BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::UInt),
+                        dist: None,
+                        result_type: IntrinsicType::Vector(vl.with_type(IntrinsicScalarType::UInt))
+                            .into(),
+                    })
+                }
+                // simply instantiate to rhs type
+                (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::SInt)
+                | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UInt)
+                | (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Float)
+                | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Float) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Instantiate(vr.0),
+                        right_op: BinaryOpScalarConversion::None,
+                        dist: None,
+                        result_type: rhs.clone(),
+                    })
+                }
+                // simply instantiate to lhs type
+                (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownIntClass)
+                | (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownIntClass)
+                | (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownIntClass)
+                | (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownNumberClass) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::None,
+                        right_op: BinaryOpScalarConversion::Instantiate(vl.0),
+                        dist: None,
+                        result_type: lhs.clone(),
+                    })
+                }
+                // instantiate lhs to float, cast rhs to float
+                (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool)
+                | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::SInt)
+                | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UInt) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+                        right_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float),
+                        dist: None,
+                        result_type: IntrinsicType::Vector(
+                            vl.with_type(IntrinsicScalarType::Float),
+                        )
+                        .into(),
+                    })
+                }
+                // instantiate rhs to float, cast lhs to float
+                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass)
+                | (IntrinsicScalarType::SInt, IntrinsicScalarType::UnknownNumberClass)
+                | (IntrinsicScalarType::UInt, IntrinsicScalarType::UnknownNumberClass) => {
+                    Some(BinaryOpTypeConversion2 {
+                        left_op: BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float),
+                        right_op: BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+                        dist: None,
+                        result_type: IntrinsicType::Vector(
+                            vl.with_type(IntrinsicScalarType::Float),
+                        )
+                        .into(),
+                    })
+                }
+                // never
+                _ => None,
             }
-            // never
-            _ => None,
         }
-    }
-
-    pub fn pow_op_type_conversion(
-        self,
-        rhs: Self,
-    ) -> Option<(BinaryOpTermConversion, BinaryOpTermConversion, Self)> {
-        let (left_conversion, resulting_left_ty) = match self {
-            Self::Intrinsic(IntrinsicType::Bool) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::UInt) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::Float) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
-            }
-            Self::Intrinsic(IntrinsicType::UInt2) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-                IntrinsicType::Float2,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt2) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-                IntrinsicType::Float2,
-            ),
-            Self::Intrinsic(IntrinsicType::Float2) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
-            }
-            Self::Intrinsic(IntrinsicType::UInt3) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-                IntrinsicType::Float3,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt3) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-                IntrinsicType::Float3,
-            ),
-            Self::Intrinsic(IntrinsicType::Float3) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
-            }
-            Self::Intrinsic(IntrinsicType::UInt4) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-                IntrinsicType::Float4,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt4) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-                IntrinsicType::Float4,
-            ),
-            Self::Intrinsic(IntrinsicType::Float4) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
-            }
-            Self::UnknownIntClass | Self::UnknownNumberClass => (
-                BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            _ => return None,
-        };
-        let (right_conversion, resulting_right_ty) = match rhs {
-            Self::Intrinsic(IntrinsicType::Bool) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::UInt) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            Self::Intrinsic(IntrinsicType::Float) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
-            }
-            Self::Intrinsic(IntrinsicType::UInt2) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-                IntrinsicType::Float2,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt2) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-                IntrinsicType::Float2,
-            ),
-            Self::Intrinsic(IntrinsicType::Float2) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
-            }
-            Self::Intrinsic(IntrinsicType::UInt3) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-                IntrinsicType::Float3,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt3) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-                IntrinsicType::Float3,
-            ),
-            Self::Intrinsic(IntrinsicType::Float3) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
-            }
-            Self::Intrinsic(IntrinsicType::UInt4) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-                IntrinsicType::Float4,
-            ),
-            Self::Intrinsic(IntrinsicType::SInt4) => (
-                BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-                IntrinsicType::Float4,
-            ),
-            Self::Intrinsic(IntrinsicType::Float4) => {
-                (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
-            }
-            Self::UnknownIntClass | Self::UnknownNumberClass => (
-                BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-                IntrinsicType::Float,
-            ),
-            _ => return None,
-        };
-
-        match (resulting_left_ty, resulting_right_ty) {
-            (a, b) if a == b => Some((left_conversion, right_conversion, resulting_left_ty.into())),
-            (a, b) if a.is_scalar_type() && b.is_vector_type() => Some((
-                left_conversion.distribute(b, b.vector_elements().unwrap() as _),
-                right_conversion,
-                resulting_right_ty.into(),
-            )),
-            (a, b) if a.is_vector_type() && b.is_scalar_type() => Some((
-                left_conversion,
-                right_conversion.distribute(a, a.vector_elements().unwrap() as _),
-                resulting_left_ty.into(),
-            )),
-            _ => None,
-        }
+        // never
+        _ => None,
     }
 }
 

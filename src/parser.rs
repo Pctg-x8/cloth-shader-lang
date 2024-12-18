@@ -325,8 +325,41 @@ pub enum TypeSyntax<'s> {
         ExpressionNode<'s>,
         Token<'s>,
     ),
+    Ref {
+        ampasand_token: Token<'s>,
+        mut_token: Option<Token<'s>>,
+        decorator_token: Option<Token<'s>>,
+        pointee_type: Box<TypeSyntax<'s>>,
+    },
 }
 fn parse_type<'s>(state: &mut ParseState<'s>) -> ParseResult<TypeSyntax<'s>> {
+    if let Some(t) = state
+        .current_token()
+        .filter(|t| t.kind == TokenKind::Op && t.slice == "&")
+    {
+        // ref
+        let ampasand_token = t.clone();
+        state.consume_token();
+
+        let mut_token = state.consume_keyword("mut").ok().cloned();
+        let decorator_token = match state.current_token_in_block() {
+            Some(t) if t.kind == TokenKind::Keyword && t.slice == "uniform" => {
+                let tok = t.clone();
+                state.consume_token();
+                Some(tok)
+            }
+            _ => None,
+        };
+        let pointee_type = parse_type(state)?;
+
+        return Ok(TypeSyntax::Ref {
+            ampasand_token,
+            mut_token,
+            decorator_token,
+            pointee_type: Box::new(pointee_type),
+        });
+    }
+
     let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
     let generic_args = match state.current_token() {
         Some(t) if t.kind == TokenKind::OpenAngleBracket => Some(parse_type_generic_args(state)?),
@@ -1715,7 +1748,7 @@ impl<'s> Tokenizer<'s> {
             slice: &self.source[..ident_byte_count],
             kind: match &self.source[..ident_byte_count] {
                 "struct" | "with" | "if" | "else" | "then" | "do" | "does" | "let" | "mut"
-                | "module" | "while" => TokenKind::Keyword,
+                | "module" | "while" | "uniform" => TokenKind::Keyword,
                 _ => TokenKind::Identifier,
             },
             line: self.line,

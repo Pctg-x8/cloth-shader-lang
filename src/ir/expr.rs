@@ -4,8 +4,11 @@ use typed_arena::Arena;
 
 use crate::{
     concrete_type::{
-        BinaryOpTermConversion, BinaryOpTypeConversion, ConcreteType, IntrinsicScalarType,
-        IntrinsicType, UserDefinedType,
+        arithmetic_compare_op_type_conversion, bitwise_op_type_conversion,
+        logical_op_type_conversion, multiply_op_type_conversion, pow_op_type_conversion,
+        BinaryOpScalarConversion, BinaryOpTermConversion, BinaryOpTypeConversion2,
+        BinaryOpValueDistributionRequirements, ConcreteType, IntrinsicScalarType, IntrinsicType,
+        UserDefinedType,
     },
     parser::ExpressionNode,
     ref_path::RefPath,
@@ -318,32 +321,37 @@ pub fn simplify_expression<'a, 's>(
                 "+" if expr_value.ty(&inst).is_scalar_type() => expr_value,
                 "-" => match expr_value.ty(&inst).scalar_type() {
                     Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::UInt) => {
-                        let target_type: ConcreteType = IntrinsicScalarType::SInt
-                            .of_vector(expr_value.ty(&inst).vector_elements().unwrap())
-                            .unwrap()
-                            .into();
+                        let target_type: ConcreteType = IntrinsicType::Vector(
+                            IntrinsicScalarType::SInt
+                                .vec(expr_value.ty(&inst).vector_elements().unwrap()),
+                        )
+                        .into();
                         let expr = inst.cast(expr_value, target_type.clone());
 
                         inst.intrinsic_unary_op(expr, IntrinsicUnaryOperation::Neg, target_type)
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let expr =
-                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::SInt);
+                        let expr = inst.instantiate_intrinsic_type_class(
+                            expr_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::SInt),
+                        );
 
                         inst.intrinsic_unary_op(
                             expr,
                             IntrinsicUnaryOperation::Neg,
-                            IntrinsicType::SInt.into(),
+                            IntrinsicType::Scalar(IntrinsicScalarType::SInt).into(),
                         )
                     }
                     Some(IntrinsicScalarType::UnknownNumberClass) => {
-                        let expr =
-                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::Float);
+                        let expr = inst.instantiate_intrinsic_type_class(
+                            expr_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        );
 
                         inst.intrinsic_unary_op(
                             expr,
                             IntrinsicUnaryOperation::Neg,
-                            IntrinsicType::Float.into(),
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                         )
                     }
                     Some(_) => inst.intrinsic_unary_op(
@@ -357,10 +365,11 @@ pub fn simplify_expression<'a, 's>(
                     Some(IntrinsicScalarType::SInt)
                     | Some(IntrinsicScalarType::UInt)
                     | Some(IntrinsicScalarType::Float) => {
-                        let target_type: ConcreteType = IntrinsicScalarType::Bool
-                            .of_vector(expr_value.ty(&inst).vector_elements().unwrap())
-                            .unwrap()
-                            .into();
+                        let target_type: ConcreteType = IntrinsicType::Vector(
+                            IntrinsicScalarType::Bool
+                                .vec(expr_value.ty(&inst).vector_elements().unwrap()),
+                        )
+                        .into();
                         let expr = inst.cast(expr_value, target_type.clone());
 
                         inst.intrinsic_unary_op(
@@ -370,25 +379,35 @@ pub fn simplify_expression<'a, 's>(
                         )
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let expr =
-                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::UInt);
-                        let expr = inst.cast(expr, IntrinsicType::Bool.into());
+                        let expr = inst.instantiate_intrinsic_type_class(
+                            expr_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                        );
+                        let expr = inst.cast(
+                            expr,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Bool).into(),
+                        );
 
                         inst.intrinsic_unary_op(
                             expr,
                             IntrinsicUnaryOperation::LogNot,
-                            IntrinsicType::Bool.into(),
+                            IntrinsicType::Scalar(IntrinsicScalarType::Bool).into(),
                         )
                     }
                     Some(IntrinsicScalarType::UnknownNumberClass) => {
-                        let expr =
-                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::Float);
-                        let expr = inst.cast(expr, IntrinsicType::Bool.into());
+                        let expr = inst.instantiate_intrinsic_type_class(
+                            expr_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        );
+                        let expr = inst.cast(
+                            expr,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Bool).into(),
+                        );
 
                         inst.intrinsic_unary_op(
                             expr,
                             IntrinsicUnaryOperation::LogNot,
-                            IntrinsicType::Bool.into(),
+                            IntrinsicType::Scalar(IntrinsicScalarType::Bool).into(),
                         )
                     }
                     Some(_) => inst.intrinsic_unary_op(
@@ -400,22 +419,25 @@ pub fn simplify_expression<'a, 's>(
                 },
                 "~" => match expr_value.ty(&inst).scalar_type() {
                     Some(IntrinsicScalarType::Bool) | Some(IntrinsicScalarType::SInt) => {
-                        let target_type: ConcreteType = IntrinsicScalarType::UInt
-                            .of_vector(expr_value.ty(&inst).vector_elements().unwrap())
-                            .unwrap()
-                            .into();
+                        let target_type: ConcreteType = IntrinsicType::Vector(
+                            IntrinsicScalarType::UInt
+                                .vec(expr_value.ty(&inst).vector_elements().unwrap()),
+                        )
+                        .into();
                         let expr = inst.cast(expr_value, target_type.clone());
 
                         inst.intrinsic_unary_op(expr, IntrinsicUnaryOperation::BitNot, target_type)
                     }
                     Some(IntrinsicScalarType::UnknownIntClass) => {
-                        let expr =
-                            inst.instantiate_intrinsic_type_class(expr_value, IntrinsicType::UInt);
+                        let expr = inst.instantiate_intrinsic_type_class(
+                            expr_value,
+                            IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                        );
 
                         inst.intrinsic_unary_op(
                             expr,
                             IntrinsicUnaryOperation::BitNot,
-                            IntrinsicType::UInt.into(),
+                            IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
                         )
                     }
                     Some(IntrinsicScalarType::UInt) => inst.intrinsic_unary_op(
@@ -923,10 +945,15 @@ pub fn simplify_expression<'a, 's>(
             };
 
             let condition = match *condition.result.ty(inst_ctx) {
-                ConcreteType::Intrinsic(IntrinsicType::Bool) => condition,
+                ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Bool)) => {
+                    condition
+                }
                 _ => {
                     let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let result = inst.cast(condition.result, IntrinsicType::Bool.into());
+                    let result = inst.cast(
+                        condition.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::Bool).into(),
+                    );
                     let cast_block = inst.create_block(BlockFlowInstruction::Undetermined);
                     assert!(
                         block_ctx.try_chain(condition.end_block, cast_block),
@@ -946,17 +973,28 @@ pub fn simplify_expression<'a, 's>(
                 &*else_expr.result.ty(inst_ctx),
             ) {
                 (a, b) if a == b => (a.clone(), then_expr, else_expr),
-                (ConcreteType::Intrinsic(IntrinsicType::Unit), _) => {
-                    (IntrinsicType::Unit.into(), then_expr, else_expr)
-                }
-                (_, ConcreteType::Intrinsic(IntrinsicType::Unit)) => {
-                    (IntrinsicType::Unit.into(), then_expr, else_expr)
-                }
+                (ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Unit)), _) => (
+                    IntrinsicType::Scalar(IntrinsicScalarType::Unit).into(),
+                    then_expr,
+                    else_expr,
+                ),
+                (_, ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Unit))) => (
+                    IntrinsicType::Scalar(IntrinsicScalarType::Unit).into(),
+                    then_expr,
+                    else_expr,
+                ),
                 // TODO: 他の変換は必要になったら書く
-                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::SInt)) => {
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::SInt)),
+                ) => {
                     let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_then = inst
-                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::SInt);
+                    let new_then = inst.instantiate_intrinsic_type_class(
+                        then_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt),
+                    );
                     let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
                     assert!(
                         block_ctx.try_chain(then_expr.end_block, new_then_blk),
@@ -964,87 +1002,7 @@ pub fn simplify_expression<'a, 's>(
                     );
 
                     (
-                        IntrinsicType::SInt.into(),
-                        SimplifyResult {
-                            result: new_then,
-                            start_block: then_expr.start_block,
-                            end_block: new_then_blk,
-                        },
-                        else_expr,
-                    )
-                }
-                (ConcreteType::Intrinsic(IntrinsicType::SInt), ConcreteType::UnknownIntClass) => {
-                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_else = inst
-                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::SInt);
-                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                    assert!(
-                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                        "else multiple out?"
-                    );
-
-                    (
-                        IntrinsicType::SInt.into(),
-                        then_expr,
-                        SimplifyResult {
-                            result: new_else,
-                            start_block: else_expr.start_block,
-                            end_block: new_else_blk,
-                        },
-                    )
-                }
-                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::UInt)) => {
-                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_then = inst
-                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::UInt);
-                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                    assert!(
-                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                        "then multiple out?"
-                    );
-
-                    (
-                        IntrinsicType::UInt.into(),
-                        SimplifyResult {
-                            result: new_then,
-                            start_block: then_expr.start_block,
-                            end_block: new_then_blk,
-                        },
-                        else_expr,
-                    )
-                }
-                (ConcreteType::Intrinsic(IntrinsicType::UInt), ConcreteType::UnknownIntClass) => {
-                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_else = inst
-                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::UInt);
-                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                    assert!(
-                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
-                        "else multiple out?"
-                    );
-
-                    (
-                        IntrinsicType::UInt.into(),
-                        then_expr,
-                        SimplifyResult {
-                            result: new_else,
-                            start_block: else_expr.start_block,
-                            end_block: new_else_blk,
-                        },
-                    )
-                }
-                (ConcreteType::UnknownIntClass, ConcreteType::Intrinsic(IntrinsicType::Float)) => {
-                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_then = inst
-                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
-                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                    assert!(
-                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                        "then multiple out?"
-                    );
-
-                    (
-                        IntrinsicType::Float.into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt).into(),
                         SimplifyResult {
                             result: new_then,
                             start_block: then_expr.start_block,
@@ -1054,32 +1012,16 @@ pub fn simplify_expression<'a, 's>(
                     )
                 }
                 (
-                    ConcreteType::UnknownNumberClass,
-                    ConcreteType::Intrinsic(IntrinsicType::Float),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::SInt)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
                 ) => {
                     let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_then = inst
-                        .instantiate_intrinsic_type_class(then_expr.result, IntrinsicType::Float);
-                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
-                    assert!(
-                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
-                        "then multiple out?"
+                    let new_else = inst.instantiate_intrinsic_type_class(
+                        else_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt),
                     );
-
-                    (
-                        IntrinsicType::Float.into(),
-                        SimplifyResult {
-                            result: new_then,
-                            start_block: then_expr.start_block,
-                            end_block: new_then_blk,
-                        },
-                        else_expr,
-                    )
-                }
-                (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
-                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_else = inst
-                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
                     let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
                     assert!(
                         block_ctx.try_chain(else_expr.end_block, new_else_blk),
@@ -1087,7 +1029,7 @@ pub fn simplify_expression<'a, 's>(
                     );
 
                     (
-                        IntrinsicType::Float.into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt).into(),
                         then_expr,
                         SimplifyResult {
                             result: new_else,
@@ -1097,12 +1039,43 @@ pub fn simplify_expression<'a, 's>(
                     )
                 }
                 (
-                    ConcreteType::Intrinsic(IntrinsicType::Float),
-                    ConcreteType::UnknownNumberClass,
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::UInt)),
                 ) => {
                     let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
-                    let new_else = inst
-                        .instantiate_intrinsic_type_class(else_expr.result, IntrinsicType::Float);
+                    let new_then = inst.instantiate_intrinsic_type_class(
+                        then_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                    );
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::UInt)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst.instantiate_intrinsic_type_class(
+                        else_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                    );
                     let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
                     assert!(
                         block_ctx.try_chain(else_expr.end_block, new_else_blk),
@@ -1110,7 +1083,115 @@ pub fn simplify_expression<'a, 's>(
                     );
 
                     (
-                        IntrinsicType::Float.into(),
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst.instantiate_intrinsic_type_class(
+                        then_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                    );
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownNumberClass,
+                    )),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_then = inst.instantiate_intrinsic_type_class(
+                        then_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                    );
+                    let new_then_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(then_expr.end_block, new_then_blk),
+                        "then multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                        SimplifyResult {
+                            result: new_then,
+                            start_block: then_expr.start_block,
+                            end_block: new_then_blk,
+                        },
+                        else_expr,
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst.instantiate_intrinsic_type_class(
+                        else_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                    );
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
+                        then_expr,
+                        SimplifyResult {
+                            result: new_else,
+                            start_block: else_expr.start_block,
+                            end_block: new_else_blk,
+                        },
+                    )
+                }
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownNumberClass,
+                    )),
+                ) => {
+                    let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
+                    let new_else = inst.instantiate_intrinsic_type_class(
+                        else_expr.result,
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                    );
+                    let new_else_blk = inst.create_block(BlockFlowInstruction::Undetermined);
+                    assert!(
+                        block_ctx.try_chain(else_expr.end_block, new_else_blk),
+                        "else multiple out?"
+                    );
+
+                    (
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float).into(),
                         then_expr,
                         SimplifyResult {
                             result: new_else,
@@ -1203,38 +1284,32 @@ pub fn binary_op<'a, 's>(
     right: RegisterRef,
     inst: &mut BlockInstructionEmitter<'_, 'a, 's>,
 ) -> RegisterRef {
+    let left = inst.loaded(left);
+    let right = inst.loaded(right);
+
     if matches!(
         op.slice,
         "^^" | "+" | "-" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">"
     ) {
         // gen2 conversion
         let conv = match op.slice {
-            "^^" => left
-                .ty(inst)
-                .clone()
-                .pow_op_type_conversion(right.ty(inst).clone()),
-            "+" | "-" | "/" | "%" => left
-                .ty(inst)
-                .clone()
-                .arithmetic_compare_op_type_conversion(right.ty(inst).clone()),
+            "^^" => pow_op_type_conversion(left.ty(inst), right.ty(inst)),
+            "+" | "-" | "/" | "%" => {
+                arithmetic_compare_op_type_conversion(left.ty(inst), right.ty(inst))
+            }
             // 比較演算の出力は必ずBoolになる
-            "==" | "!=" | "<=" | ">=" | "<" | ">" => left
-                .ty(inst)
-                .clone()
-                .arithmetic_compare_op_type_conversion(right.ty(inst).clone())
-                .map(|(conv_left, conv_right, t)| {
-                    (
-                        conv_left,
-                        conv_right,
-                        IntrinsicType::Bool
-                            .of_vector(t.vector_elements().unwrap())
-                            .unwrap()
+            "==" | "!=" | "<=" | ">=" | "<" | ">" => {
+                arithmetic_compare_op_type_conversion(left.ty(inst), right.ty(inst)).map(|c| {
+                    BinaryOpTypeConversion2 {
+                        result_type: IntrinsicType::bvec(c.result_type.vector_elements().unwrap())
                             .into(),
-                    )
-                }),
+                        ..c
+                    }
+                })
+            }
             _ => unreachable!(),
         };
-        let (left_conv, right_conv, result_ty) = match conv {
+        let conv = match conv {
             Some(x) => x,
             None => {
                 eprintln!(
@@ -1244,55 +1319,78 @@ pub fn binary_op<'a, 's>(
                     *right.ty(inst)
                 );
 
-                (
-                    BinaryOpTermConversion::NoConversion,
-                    BinaryOpTermConversion::NoConversion,
-                    ConcreteType::Never,
-                )
+                BinaryOpTypeConversion2 {
+                    left_op: BinaryOpScalarConversion::None,
+                    right_op: BinaryOpScalarConversion::None,
+                    dist: None,
+                    result_type: ConcreteType::Never,
+                }
             }
         };
 
-        let left = match left_conv {
-            BinaryOpTermConversion::NoConversion => left,
-            BinaryOpTermConversion::Cast(to) => inst.cast(left, to.into()),
-            BinaryOpTermConversion::Instantiate(it) => {
-                inst.instantiate_intrinsic_type_class(left, it)
-            }
-            BinaryOpTermConversion::Distribute(to) => {
-                inst.construct_intrinsic_composite(to, vec![left])
-            }
-            BinaryOpTermConversion::CastAndDistribute(elm_type, count) => {
-                let vec_type = elm_type.of_vector(count as _).unwrap();
-                let left = inst.cast(left, elm_type.into());
-                inst.construct_intrinsic_composite(vec_type, vec![left])
-            }
-            BinaryOpTermConversion::InstantiateAndDistribute(elm_type, count) => {
-                let vec_type = elm_type.of_vector(count as _).unwrap();
-                let left = inst.instantiate_intrinsic_type_class(left, elm_type);
-                inst.construct_intrinsic_composite(vec_type, vec![left])
-            }
-            BinaryOpTermConversion::PromoteUnknownNumber => inst.promote_int_to_number(left),
+        let left = match conv.left_op {
+            BinaryOpScalarConversion::None => left,
+            BinaryOpScalarConversion::Cast(to) => inst.cast(
+                left,
+                left.ty(inst)
+                    .clone()
+                    .try_cast_intrinsic_scalar(to)
+                    .expect("not a castable intrinsic type"),
+            ),
+            BinaryOpScalarConversion::Instantiate(it) => inst.instantiate_intrinsic_type_class(
+                left,
+                left.ty(inst)
+                    .intrinsic_type()
+                    .expect("not a intrinsic type?")
+                    .clone()
+                    .try_cast_scalar(it)
+                    .expect("not a castable intrinsic type"),
+            ),
+            BinaryOpScalarConversion::PromoteUnknownNumber => inst.promote_int_to_number(left),
         };
-        let right = match right_conv {
-            BinaryOpTermConversion::NoConversion => right,
-            BinaryOpTermConversion::Cast(to) => inst.cast(right, to.into()),
-            BinaryOpTermConversion::Instantiate(it) => {
-                inst.instantiate_intrinsic_type_class(right, it)
-            }
-            BinaryOpTermConversion::Distribute(to) => {
-                inst.construct_intrinsic_composite(to, vec![right])
-            }
-            BinaryOpTermConversion::CastAndDistribute(elm_type, count) => {
-                let vec_type = elm_type.of_vector(count as _).unwrap();
-                let right = inst.cast(right, elm_type.into());
-                inst.construct_intrinsic_composite(vec_type, vec![right])
-            }
-            BinaryOpTermConversion::InstantiateAndDistribute(elm_type, count) => {
-                let vec_type = elm_type.of_vector(count as _).unwrap();
-                let right = inst.instantiate_intrinsic_type_class(right, elm_type);
-                inst.construct_intrinsic_composite(vec_type, vec![right])
-            }
-            BinaryOpTermConversion::PromoteUnknownNumber => inst.promote_int_to_number(right),
+        let left = if conv.dist == Some(BinaryOpValueDistributionRequirements::LeftTerm) {
+            inst.construct_intrinsic_composite(
+                conv.result_type
+                    .intrinsic_type()
+                    .expect("not a intrinsic type output?")
+                    .clone(),
+                vec![left],
+            )
+        } else {
+            left
+        };
+        let right = match conv.right_op {
+            BinaryOpScalarConversion::None => right,
+            BinaryOpScalarConversion::Cast(to) => inst.cast(
+                right,
+                right
+                    .ty(inst)
+                    .clone()
+                    .try_cast_intrinsic_scalar(to)
+                    .expect("not a castable intrinsic type"),
+            ),
+            BinaryOpScalarConversion::Instantiate(it) => inst.instantiate_intrinsic_type_class(
+                right,
+                right
+                    .ty(inst)
+                    .intrinsic_type()
+                    .expect("not a intrinsic type?")
+                    .clone()
+                    .try_cast_scalar(it)
+                    .expect("not a castable intrinsic type"),
+            ),
+            BinaryOpScalarConversion::PromoteUnknownNumber => inst.promote_int_to_number(right),
+        };
+        let right = if conv.dist == Some(BinaryOpValueDistributionRequirements::RightTerm) {
+            inst.construct_intrinsic_composite(
+                conv.result_type
+                    .intrinsic_type()
+                    .expect("not a intrinsic type output?")
+                    .clone(),
+                vec![right],
+            )
+        } else {
+            right
         };
 
         let op = match op.slice {
@@ -1318,7 +1416,7 @@ pub fn binary_op<'a, 's>(
             _ => unreachable!("unknown binary op"),
         };
 
-        return inst.intrinsic_binary_op(left, op, right, result_ty);
+        return inst.intrinsic_binary_op(left, op, right, conv.result_type);
     }
 
     let (left, right) =
@@ -1331,21 +1429,12 @@ pub fn binary_op<'a, 's>(
 
     let r = match op.slice {
         // 行列とかの掛け算があるので特別扱い
-        "*" => left
-            .ty(inst)
-            .clone()
-            .multiply_op_type_conversion(right.ty(inst).clone()),
-        "&" | "|" | "^" | ">>" | "<<" => left
-            .ty(inst)
-            .clone()
-            .bitwise_op_type_conversion(right.ty(inst).clone()),
-        "&&" | "||" => left
-            .ty(inst)
-            .clone()
-            .logical_op_type_conversion(right.ty(inst).clone()),
+        "*" => multiply_op_type_conversion(left.ty(inst), right.ty(inst)),
+        "&" | "|" | "^" | ">>" | "<<" => bitwise_op_type_conversion(left.ty(inst), right.ty(inst)),
+        "&&" | "||" => logical_op_type_conversion(left.ty(inst), right.ty(inst)),
         _ => None,
     };
-    let (conv, res) = match r {
+    let conv = match r {
         Some(x) => x,
         None => {
             eprintln!(
@@ -1354,56 +1443,79 @@ pub fn binary_op<'a, 's>(
                 *left.ty(inst),
                 *right.ty(inst)
             );
-            (BinaryOpTypeConversion::NoConversion, ConcreteType::Never)
+
+            BinaryOpTypeConversion2 {
+                left_op: BinaryOpScalarConversion::None,
+                right_op: BinaryOpScalarConversion::None,
+                dist: None,
+                result_type: ConcreteType::Never,
+            }
         }
     };
 
-    let (left, right) = match conv {
-        BinaryOpTypeConversion::NoConversion => (left, right),
-        BinaryOpTypeConversion::CastLeftHand(to) => {
-            let left = inst.cast(left, to.into());
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::CastRightHand(to) => {
-            let right = inst.cast(right, to.into());
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateAndCastLeftHand(it) => {
-            let left = inst.instantiate_intrinsic_type_class(left, it);
-            let left = inst.cast(left, res.clone());
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateAndCastRightHand(it) => {
-            let right = inst.instantiate_intrinsic_type_class(right, it);
-            let right = inst.cast(right, res.clone());
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateLeftHand(it) => {
-            let left = inst.instantiate_intrinsic_type_class(left, it);
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateRightHand(it) => {
-            let right = inst.instantiate_intrinsic_type_class(right, it);
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateLeftAndCastRightHand(it) => {
-            let left = inst.instantiate_intrinsic_type_class(left, it);
-            let right = inst.cast(right, res.clone());
-
-            (left, right)
-        }
-        BinaryOpTypeConversion::InstantiateRightAndCastLeftHand(it) => {
-            let right = inst.instantiate_intrinsic_type_class(right, it);
-            let left = inst.cast(left, res.clone());
-
-            (left, right)
-        }
+    let left = match conv.left_op {
+        BinaryOpScalarConversion::None => left,
+        BinaryOpScalarConversion::Cast(to) => inst.cast(
+            left,
+            left.ty(inst)
+                .clone()
+                .try_cast_intrinsic_scalar(to)
+                .expect("not a castable intrinsic type"),
+        ),
+        BinaryOpScalarConversion::Instantiate(it) => inst.instantiate_intrinsic_type_class(
+            left,
+            left.ty(inst)
+                .intrinsic_type()
+                .expect("not a intrinsic type?")
+                .clone()
+                .try_cast_scalar(it)
+                .expect("not a castable intrinsic type"),
+        ),
+        BinaryOpScalarConversion::PromoteUnknownNumber => inst.promote_int_to_number(left),
+    };
+    let left = if conv.dist == Some(BinaryOpValueDistributionRequirements::LeftTerm) {
+        inst.construct_intrinsic_composite(
+            conv.result_type
+                .intrinsic_type()
+                .expect("not a intrinsic type output?")
+                .clone(),
+            vec![left],
+        )
+    } else {
+        left
+    };
+    let right = match conv.right_op {
+        BinaryOpScalarConversion::None => right,
+        BinaryOpScalarConversion::Cast(to) => inst.cast(
+            right,
+            right
+                .ty(inst)
+                .clone()
+                .try_cast_intrinsic_scalar(to)
+                .expect("not a castable intrinsic type"),
+        ),
+        BinaryOpScalarConversion::Instantiate(it) => inst.instantiate_intrinsic_type_class(
+            right,
+            right
+                .ty(inst)
+                .intrinsic_type()
+                .expect("not a intrinsic type?")
+                .clone()
+                .try_cast_scalar(it)
+                .expect("not a castable intrinsic type"),
+        ),
+        BinaryOpScalarConversion::PromoteUnknownNumber => inst.promote_int_to_number(right),
+    };
+    let right = if conv.dist == Some(BinaryOpValueDistributionRequirements::RightTerm) {
+        inst.construct_intrinsic_composite(
+            conv.result_type
+                .intrinsic_type()
+                .expect("not a intrinsic type output?")
+                .clone(),
+            vec![right],
+        )
+    } else {
+        right
     };
 
     let op = match op.slice {
@@ -1429,7 +1541,7 @@ pub fn binary_op<'a, 's>(
         _ => unreachable!("unknown binary op"),
     };
 
-    inst.intrinsic_binary_op(left, op, right, res)
+    inst.intrinsic_binary_op(left, op, right, conv.result_type)
 }
 
 fn funcall<'a, 's>(
@@ -1446,11 +1558,27 @@ fn funcall<'a, 's>(
                 *a = inst.loaded(*a);
                 match (&*a.ty(&inst), &element_ty) {
                     // TODO: 他の変換は必要になったら書く
-                    (ConcreteType::UnknownIntClass, IntrinsicScalarType::Float) => {
-                        *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
+                    (
+                        ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                            IntrinsicScalarType::UnknownIntClass,
+                        )),
+                        IntrinsicScalarType::Float,
+                    ) => {
+                        *a = inst.instantiate_intrinsic_type_class(
+                            *a,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        );
                     }
-                    (ConcreteType::UnknownNumberClass, IntrinsicScalarType::Float) => {
-                        *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
+                    (
+                        ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                            IntrinsicScalarType::UnknownNumberClass,
+                        )),
+                        IntrinsicScalarType::Float,
+                    ) => {
+                        *a = inst.instantiate_intrinsic_type_class(
+                            *a,
+                            IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                        );
                     }
                     _ => (),
                 }
@@ -1482,31 +1610,59 @@ fn funcall<'a, 's>(
                 matches = matches
                     && match (&*a.ty(&inst), dt) {
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::SInt),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::SInt,
+                            )),
                         ) => {
-                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::SInt);
+                            *a = inst.instantiate_intrinsic_type_class(
+                                *a,
+                                IntrinsicType::Scalar(IntrinsicScalarType::SInt),
+                            );
                             true
                         }
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::UInt),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UInt,
+                            )),
                         ) => {
-                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::UInt);
+                            *a = inst.instantiate_intrinsic_type_class(
+                                *a,
+                                IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                            );
                             true
                         }
                         (
-                            ConcreteType::UnknownIntClass,
-                            ConcreteType::Intrinsic(IntrinsicType::Float),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownIntClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::Float,
+                            )),
                         ) => {
-                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
+                            *a = inst.instantiate_intrinsic_type_class(
+                                *a,
+                                IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                            );
                             true
                         }
                         (
-                            ConcreteType::UnknownNumberClass,
-                            ConcreteType::Intrinsic(IntrinsicType::Float),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::UnknownNumberClass,
+                            )),
+                            ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                                IntrinsicScalarType::Float,
+                            )),
                         ) => {
-                            *a = inst.instantiate_intrinsic_type_class(*a, IntrinsicType::Float);
+                            *a = inst.instantiate_intrinsic_type_class(
+                                *a,
+                                IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                            );
                             true
                         }
                         (ConcreteType::Ref(ref c), c2) if **c == *c2 => {
@@ -1526,13 +1682,11 @@ fn funcall<'a, 's>(
             }
 
             let eval_registers = inst.into_eval_impure_registers();
-            let result_register = RegisterRef::Impure(
-                inst_ctx.alloc_impure_register(
-                    output
-                        .as_ref()
-                        .map_or_else(|| IntrinsicType::Unit.into(), |x| *x.clone()),
-                ),
-            );
+            let result_register =
+                RegisterRef::Impure(inst_ctx.alloc_impure_register(output.as_ref().map_or_else(
+                    || IntrinsicType::Scalar(IntrinsicScalarType::Unit).into(),
+                    |x| *x.clone(),
+                )));
             let eval_block = block_ctx.add(Block {
                 eval_impure_registers: eval_registers,
                 flow: BlockFlowInstruction::Funcall {
@@ -1641,33 +1795,44 @@ fn resolve_overload<'v, 's>(
         for (a, i) in args.iter().zip(inputs.iter()) {
             match (a, i) {
                 (x, y) if x == y => args_promotion.push(None),
-                (ConcreteType::Intrinsic(IntrinsicType::UInt), ConcreteType::UnknownIntClass) => {
-                    args_promotion.push(Some(
-                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
-                            IntrinsicType::UInt,
-                        ),
-                    ))
-                }
-                (ConcreteType::Intrinsic(IntrinsicType::SInt), ConcreteType::UnknownIntClass) => {
-                    args_promotion.push(Some(
-                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
-                            IntrinsicType::SInt,
-                        ),
-                    ))
-                }
-                (ConcreteType::Intrinsic(IntrinsicType::Float), ConcreteType::UnknownIntClass) => {
-                    args_promotion.push(Some(
-                        OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
-                            IntrinsicType::Float,
-                        ),
-                    ))
-                }
                 (
-                    ConcreteType::Intrinsic(IntrinsicType::Float),
-                    ConcreteType::UnknownNumberClass,
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::UInt)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
                 ) => args_promotion.push(Some(
                     OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
-                        IntrinsicType::Float,
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt),
+                    ),
+                )),
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::SInt)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                ) => args_promotion.push(Some(
+                    OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                        IntrinsicType::Scalar(IntrinsicScalarType::SInt),
+                    ),
+                )),
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownIntClass,
+                    )),
+                ) => args_promotion.push(Some(
+                    OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
+                    ),
+                )),
+                (
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(IntrinsicScalarType::Float)),
+                    ConcreteType::Intrinsic(IntrinsicType::Scalar(
+                        IntrinsicScalarType::UnknownNumberClass,
+                    )),
+                ) => args_promotion.push(Some(
+                    OverloadArgumentPromotionType::InstantiateIntrinsicTypeClass(
+                        IntrinsicType::Scalar(IntrinsicScalarType::Float),
                     ),
                 )),
                 (c, ConcreteType::Ref(c2)) if c == &**c2 => {

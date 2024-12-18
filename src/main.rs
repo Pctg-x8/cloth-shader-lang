@@ -194,7 +194,7 @@ fn main() {
                         )
                     })
                     .collect(),
-                None => vec![(SymbolAttribute::default(), IntrinsicType::Unit.into())],
+                None => vec![(SymbolAttribute::default(), IntrinsicType::UNIT.into())],
             },
         })
     }
@@ -1135,7 +1135,7 @@ fn main() {
                         ShaderModel::ComputeShader => {
                             assert_eq!(
                                 fn_symbol.output,
-                                vec![(SymbolAttribute::default(), IntrinsicType::Unit.into())]
+                                vec![(SymbolAttribute::default(), IntrinsicType::UNIT.into())]
                             );
                         }
                         _ => {
