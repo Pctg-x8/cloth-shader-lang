@@ -1144,8 +1144,13 @@ pub fn deconstruct_effectless_phi(prg: &mut BlockifiedProgram) -> bool {
             BlockInstruction::Phi(xs) => {
                 let unique_registers = xs
                     .values()
-                    .fold(HashSet::new(), |mut h, &r| {
-                        h.insert(r);
+                    .fold(HashSet::new(), |mut h, &r1| {
+                        if r1 == RegisterRef::Impure(r) {
+                            // 自己回帰は除いてユニークを取る（x = phi [b1 -> a, b2 -> x] のときはb2から来てもどのみちaで固定になる）
+                            return h;
+                        }
+
+                        h.insert(r1);
                         h
                     })
                     .into_iter()

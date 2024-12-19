@@ -57,7 +57,7 @@ pub struct IndentWriter(pub usize);
 impl core::fmt::Display for IndentWriter {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for x in 0..self.0 {
+        for _ in 0..self.0 {
             f.write_str("  ")?;
         }
 
@@ -147,7 +147,14 @@ pub enum Inst<'s> {
     ContinueLoop(BlockRef),
     BreakLoop(BlockRef),
     Return(ConstOrInst<'s>),
-    LoopStateStorage(BTreeMap<BlockRef, RegisterRef>),
+    TmpLoopStateStorage {
+        start: RegisterRef,
+        continued: BTreeMap<BlockRef, RegisterRef>,
+    },
+    LoopStateStorage {
+        start: ConstOrInst<'s>,
+        continued: HashMap<InstRef, ConstOrInst<'s>>,
+    },
 }
 impl<'s> Inst<'s> {
     pub fn dump_ordered(
@@ -267,8 +274,14 @@ impl<'s> Inst<'s> {
                 Inst::BreakLoop(b) => writeln!(sink, "{indent}{ord:?}: break @ {b}"),
                 Inst::Return(v) => writeln!(sink, "{indent}{ord:?}: return {v:?}"),
                 Inst::BlockValue(v) => writeln!(sink, "{indent}{ord:?}: block value = {v:?}"),
-                Inst::LoopStateStorage(v) => {
-                    writeln!(sink, "{indent}{ord:?}: (LoopStateStorage) {v:?}")
+                Inst::TmpLoopStateStorage { start, continued } => {
+                    writeln!(sink, "{indent}{ord:?}: (TmpLoopStateStorage) start={start:?} continued={continued:?}")
+                }
+                Inst::LoopStateStorage { start, continued } => {
+                    writeln!(
+                        sink,
+                        "{indent}{ord:?}: LoopStateStorage start={start:?} continued={continued:?}"
+                    )
                 }
             }
         }
@@ -278,6 +291,52 @@ impl<'s> Inst<'s> {
         }
 
         Ok(())
+    }
+
+    fn flat_iter_mut(&mut self, mut process: impl FnMut(&mut Self) + Copy) {
+        process(self);
+        match self {
+            Self::Branch {
+                true_instructions,
+                false_instructions,
+                ..
+            } => {
+                for x in true_instructions
+                    .iter_mut()
+                    .chain(false_instructions.iter_mut())
+                {
+                    x.1.flat_iter_mut(process);
+                }
+            }
+            Self::LoopWhile {
+                condition, body, ..
+            } => {
+                for x in condition.iter_mut().chain(body.iter_mut()) {
+                    x.1.flat_iter_mut(process);
+                }
+            }
+            Self::BuiltinIORef(_)
+            | Self::DescriptorRef { .. }
+            | Self::PushConstantRef(_)
+            | Self::WorkgroupSharedMemoryRef(_)
+            | Self::CompositeRef(_, _)
+            | Self::IntrinsicBinary(_, _, _)
+            | Self::IntrinsicUnary(_, _)
+            | Self::Cast(_, _)
+            | Self::ConstructIntrinsicType(_, _)
+            | Self::ConstructComposite(_)
+            | Self::Swizzle(_, _)
+            | Self::CompositeInsert { .. }
+            | Self::LoadRef(_)
+            | Self::StoreRef { .. }
+            | Self::IntrinsicCall { .. }
+            | Self::BlockValue(_)
+            | Self::ContinueLoop(_)
+            | Self::BreakLoop(_)
+            | Self::Return(_)
+            | Self::TmpLoopStateStorage { .. }
+            | Self::LoopStateStorage { .. } => (),
+        }
     }
 }
 
@@ -289,12 +348,14 @@ pub struct Function<'s> {
 struct FnInstGenContext<'s> {
     last_ref_id: usize,
     generated_inst_register_map: HashMap<RegisterRef, ConstOrInst<'s>>,
+    block_to_continue_inst: HashMap<BlockRef, InstRef>,
 }
 impl<'s> FnInstGenContext<'s> {
     fn new() -> Self {
         Self {
             last_ref_id: 0,
             generated_inst_register_map: HashMap::new(),
+            block_to_continue_inst: HashMap::new(),
         }
     }
 
@@ -314,6 +375,13 @@ impl<'s> FnInstGenContext<'s> {
 
     fn has_generated(&self, register: &RegisterRef) -> bool {
         self.generated_inst_register_map.contains_key(register)
+    }
+
+    fn continue_inst_ref_for_block(&self, block: &BlockRef) -> InstRef {
+        self.block_to_continue_inst
+            .get(block)
+            .copied()
+            .expect("no continue executed in the block")
     }
 }
 
@@ -336,15 +404,44 @@ impl<'s> LocalInstGenContext<'s> {
 
         ir
     }
+
+    fn r#continue(&mut self, fnctx: &mut FnInstGenContext<'s>, execute_block: BlockRef) -> InstRef {
+        let ir = self.emit_inst(fnctx, Inst::ContinueLoop(execute_block));
+        fnctx.block_to_continue_inst.insert(execute_block, ir);
+
+        ir
+    }
 }
 
-pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
+/// Loop WhileのConditionの評価開始ブロック -> Loop Whileの実際のブロック を収集する
+pub fn collect_condition_head_link(prg: &BlockifiedProgram) -> HashMap<BlockRef, BlockRef> {
+    let mut map = HashMap::new();
+
+    for (bx, b) in prg.iter_blocks_with_ref() {
+        match b.flow {
+            BlockFlowInstruction::ConditionalLoop { r#continue, .. } => {
+                // 一旦ちゃんとつながるかとかは考えない(たぶん繋がってくれているはず)
+                map.insert(r#continue, bx);
+            }
+            _ => (),
+        }
+    }
+
+    map
+}
+
+/// IR2を構成する
+pub fn reconstruct<'a, 's>(
+    prg: &BlockifiedProgram<'a, 's>,
+    chead_to_cloop: &HashMap<BlockRef, BlockRef>,
+) -> Function<'s> {
     fn emit_const_or_inst<'a, 's>(
         prg: &BlockifiedProgram<'a, 's>,
         r: RegisterRef,
         fnctx: &mut FnInstGenContext<'s>,
         ctx: &mut LocalInstGenContext<'s>,
         impure_allowlist: &HashSet<usize>,
+        loop_enter: Option<BlockRef>,
     ) -> ConstOrInst<'s> {
         if let Some(ir) = fnctx.try_get_for_register(&r) {
             // すでに生成済み
@@ -453,7 +550,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
             RegisterRef::Pure(r) => match prg.pure_instructions[r].inst {
                 BlockPureInstruction::Cast(src, ref t) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, src, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, src, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot emit const cast(needs precomputed)");
                     };
@@ -471,7 +568,9 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 BlockPureInstruction::ConstructIntrinsicComposite(it, ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst = ctx
@@ -483,7 +582,9 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 BlockPureInstruction::ConstructTuple(ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst =
@@ -494,7 +595,9 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 BlockPureInstruction::ConstructStruct(ref args) => {
                     let args = args
                         .iter()
-                        .map(|a| emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist))
+                        .map(|a| {
+                            emit_const_or_inst(prg, *a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst =
@@ -504,11 +607,12 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 }
                 BlockPureInstruction::ArrayRef { source, index } => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
-                    let index = emit_const_or_inst(prg, index, fnctx, ctx, impure_allowlist);
+                    let index =
+                        emit_const_or_inst(prg, index, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst =
                         ctx.emit_inst(fnctx, Inst::CompositeRef(src, index)).into();
@@ -517,7 +621,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 }
                 BlockPureInstruction::TupleRef(source, index) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
@@ -538,7 +642,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 }
                 BlockPureInstruction::MemberRef(source, ref name) => {
                     let ConstOrInst::Inst(src) =
-                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist)
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter)
                     else {
                         unreachable!("cannot CompositeRef for const value");
                     };
@@ -569,7 +673,8 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     ir
                 }
                 BlockPureInstruction::Swizzle(source, ref indices) => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::Swizzle(source, indices.clone()))
@@ -581,8 +686,10 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     unreachable!("SwizzleRef must be desugared")
                 }
                 BlockPureInstruction::IntrinsicBinaryOp(left, op, right) => {
-                    let left = emit_const_or_inst(prg, left, fnctx, ctx, impure_allowlist);
-                    let right = emit_const_or_inst(prg, right, fnctx, ctx, impure_allowlist);
+                    let left =
+                        emit_const_or_inst(prg, left, fnctx, ctx, impure_allowlist, loop_enter);
+                    let right =
+                        emit_const_or_inst(prg, right, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::IntrinsicBinary(left, op, right))
@@ -591,7 +698,8 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     ir
                 }
                 BlockPureInstruction::IntrinsicUnaryOp(source, op) => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(fnctx, Inst::IntrinsicUnary(source, op))
@@ -604,8 +712,10 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     value,
                     index,
                 } => {
-                    let source = emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist);
-                    let value = emit_const_or_inst(prg, value, fnctx, ctx, impure_allowlist);
+                    let source =
+                        emit_const_or_inst(prg, source, fnctx, ctx, impure_allowlist, loop_enter);
+                    let value =
+                        emit_const_or_inst(prg, value, fnctx, ctx, impure_allowlist, loop_enter);
 
                     let ir: ConstOrInst = ctx
                         .emit_inst(
@@ -626,7 +736,9 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 BlockPureInstruction::PureIntrinsicCall(id, ref args) => {
                     let args = args
                         .iter()
-                        .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, impure_allowlist))
+                        .map(|&a| {
+                            emit_const_or_inst(prg, a, fnctx, ctx, impure_allowlist, loop_enter)
+                        })
                         .collect::<Vec<_>>();
 
                     let ir: ConstOrInst = ctx
@@ -647,7 +759,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 match prg.impure_instructions[&r] {
                     BlockInstruction::LoadRef(ptr) => {
                         let ConstOrInst::Inst(ptr) =
-                            emit_const_or_inst(prg, ptr, fnctx, ctx, impure_allowlist)
+                            emit_const_or_inst(prg, ptr, fnctx, ctx, impure_allowlist, loop_enter)
                         else {
                             unreachable!("cannot load from const");
                         };
@@ -657,9 +769,18 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                         ir
                     }
                     BlockInstruction::Phi(ref incomings) => {
-                        // unimplemented!("phi decoding: {incomings:?}")
+                        // 一時的にそのままもってくる(あとで変換する)
+                        let loop_enter = loop_enter.expect("phi appeared out of loop condition");
+                        let mut incomings = incomings.clone();
+                        let start_reg = incomings.remove(&loop_enter).expect("no enter state?");
                         let ir: ConstOrInst = ctx
-                            .emit_inst(fnctx, Inst::LoopStateStorage(incomings.clone()))
+                            .emit_inst(
+                                fnctx,
+                                Inst::TmpLoopStateStorage {
+                                    start: start_reg,
+                                    continued: incomings,
+                                },
+                            )
                             .into();
                         fnctx.map_register(RegisterRef::Impure(r), ir.clone());
                         ir
@@ -669,46 +790,76 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
             RegisterRef::Impure(r) => todo!("impure to const_or_inst: r{r}"),
         }
     }
+
     fn process<'a, 's>(
         prg: &BlockifiedProgram<'a, 's>,
         n: crate::ir::block::BlockRef,
         until: Option<crate::ir::block::BlockRef>,
         last_block: &mut crate::ir::block::BlockRef,
+        chead_to_cloop: &HashMap<BlockRef, BlockRef>,
+        allow_condition_head: bool,
+        flow_only_process: bool,
+        loop_stack: &mut Vec<(BlockRef, BlockRef)>,
         fnctx: &mut FnInstGenContext<'s>,
         ctx: &mut LocalInstGenContext<'s>,
     ) {
-        if until.is_some_and(|x| x == n) {
-            // ここまで
-            return;
-        }
-
-        for imr in prg.blocks[n.0].eval_impure_registers.iter() {
-            if fnctx.has_generated(&RegisterRef::Impure(*imr)) {
-                // すでに生成済み
-                continue;
+        eprintln!("process: {n:?} {flow_only_process}");
+        if !flow_only_process {
+            if until.is_some_and(|x| x == n) {
+                // ここまで
+                return;
             }
 
-            match prg.impure_instructions[imr] {
-                BlockInstruction::LoadRef(ptr) => {
-                    let ConstOrInst::Inst(ptr) = emit_const_or_inst(
+            if !allow_condition_head {
+                if let Some(&clp) = chead_to_cloop.get(&n) {
+                    // このブロックはCondition Head: Loop Whileの解釈にまかせる
+                    eprintln!("chead jmp {n:?} -> {clp:?}");
+                    process(
                         prg,
-                        ptr,
+                        clp,
+                        until,
+                        last_block,
+                        chead_to_cloop,
+                        false,
+                        true,
+                        loop_stack,
                         fnctx,
                         ctx,
-                        &prg.blocks[n.0].eval_impure_registers,
-                    ) else {
-                        unreachable!("cannot load from const");
-                    };
-
-                    let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::LoadRef(ptr)).into();
-                    fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                    );
+                    return;
                 }
-                BlockInstruction::Phi(ref incomings) => {
-                    // unimplemented!("phi decoding: {incomings:?}")
-                    let ir: ConstOrInst = ctx
-                        .emit_inst(fnctx, Inst::LoopStateStorage(incomings.clone()))
-                        .into();
-                    fnctx.map_register(RegisterRef::Impure(*imr), ir);
+            }
+
+            for imr in prg.blocks[n.0].eval_impure_registers.iter() {
+                if fnctx.has_generated(&RegisterRef::Impure(*imr)) {
+                    // すでに生成済み
+                    continue;
+                }
+
+                match prg.impure_instructions[imr] {
+                    BlockInstruction::LoadRef(ptr) => {
+                        let ConstOrInst::Inst(ptr) = emit_const_or_inst(
+                            prg,
+                            ptr,
+                            fnctx,
+                            ctx,
+                            &prg.blocks[n.0].eval_impure_registers,
+                            None,
+                        ) else {
+                            unreachable!("cannot load from const");
+                        };
+
+                        let ir: ConstOrInst = ctx.emit_inst(fnctx, Inst::LoadRef(ptr)).into();
+                        fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                    }
+                    BlockInstruction::Phi(ref _incomings) => {
+                        // 一時的にそのままもってくる(あとで変換する)
+                        // let ir: ConstOrInst = ctx
+                        //     .emit_inst(fnctx, Inst::TmpLoopStateStorage(incomings.clone()))
+                        //     .into();
+                        // fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                        unimplemented!("phi appeared outside of condition?");
+                    }
                 }
             }
         }
@@ -718,18 +869,82 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
 
         match prg.blocks[n.0].flow {
             BlockFlowInstruction::Goto(next) => {
-                process(prg, next, until, last_block, fnctx, ctx);
+                if !flow_only_process {
+                    // 次の実行ブロックにPhiがあったらそのレジスタをここで評価する
+                    for ir in prg.blocks[next.0].eval_impure_registers.iter() {
+                        match prg.impure_instructions[ir] {
+                            BlockInstruction::Phi(ref incomings) => {
+                                if let Some(&r) = incomings.get(&n) {
+                                    emit_const_or_inst(
+                                        prg,
+                                        r,
+                                        fnctx,
+                                        ctx,
+                                        &prg.blocks[n.0].eval_impure_registers,
+                                        None,
+                                    );
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                process(
+                    prg,
+                    next,
+                    until,
+                    last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    ctx,
+                );
             }
             BlockFlowInstruction::StoreRef { ptr, value, after } => {
                 let ConstOrInst::Inst(ptr) =
-                    emit_const_or_inst(prg, ptr, fnctx, ctx, &HashSet::new())
+                    emit_const_or_inst(prg, ptr, fnctx, ctx, &HashSet::new(), None)
                 else {
                     unreachable!("cannot store to const value");
                 };
-                let value = emit_const_or_inst(prg, value, fnctx, ctx, &HashSet::new());
+                let value = emit_const_or_inst(prg, value, fnctx, ctx, &HashSet::new(), None);
                 ctx.emit_inst(fnctx, Inst::StoreRef { ptr, value });
 
-                process(prg, after.unwrap(), until, last_block, fnctx, ctx);
+                if !flow_only_process {
+                    // 次の実行ブロックにPhiがあったらそのレジスタをここで評価する
+                    for ir in prg.blocks[after.unwrap().0].eval_impure_registers.iter() {
+                        match prg.impure_instructions[ir] {
+                            BlockInstruction::Phi(ref incomings) => {
+                                if let Some(&r) = incomings.get(&n) {
+                                    emit_const_or_inst(
+                                        prg,
+                                        r,
+                                        fnctx,
+                                        ctx,
+                                        &prg.blocks[n.0].eval_impure_registers,
+                                        None,
+                                    );
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                process(
+                    prg,
+                    after.unwrap(),
+                    until,
+                    last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    ctx,
+                );
             }
             BlockFlowInstruction::Funcall {
                 callee,
@@ -747,7 +962,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
             } => {
                 let arg_refs = args
                     .iter()
-                    .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, &HashSet::new()))
+                    .map(|&a| emit_const_or_inst(prg, a, fnctx, ctx, &HashSet::new(), None))
                     .collect::<Vec<_>>();
 
                 let ir: ConstOrInst = ctx
@@ -761,7 +976,42 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     .into();
                 fnctx.map_register(result, ir);
 
-                process(prg, after_return.unwrap(), until, last_block, fnctx, ctx);
+                if !flow_only_process {
+                    // 次の実行ブロックにPhiがあったらそのレジスタをここで評価する
+                    for ir in prg.blocks[after_return.unwrap().0]
+                        .eval_impure_registers
+                        .iter()
+                    {
+                        match prg.impure_instructions[ir] {
+                            BlockInstruction::Phi(ref incomings) => {
+                                if let Some(&r) = incomings.get(&n) {
+                                    emit_const_or_inst(
+                                        prg,
+                                        r,
+                                        fnctx,
+                                        ctx,
+                                        &prg.blocks[n.0].eval_impure_registers,
+                                        None,
+                                    );
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                process(
+                    prg,
+                    after_return.unwrap(),
+                    until,
+                    last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    ctx,
+                );
             }
             BlockFlowInstruction::Conditional {
                 source,
@@ -769,7 +1019,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 r#false,
                 merge,
             } => {
-                let source = emit_const_or_inst(prg, source, fnctx, ctx, &HashSet::new());
+                let source = emit_const_or_inst(prg, source, fnctx, ctx, &HashSet::new(), None);
 
                 let mut true_local_ctx = LocalInstGenContext::new();
                 let mut true_last_block = n;
@@ -778,6 +1028,10 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     r#true,
                     Some(merge),
                     &mut true_last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
                     fnctx,
                     &mut true_local_ctx,
                 );
@@ -788,6 +1042,10 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     r#false,
                     Some(merge),
                     &mut false_last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
                     fnctx,
                     &mut false_local_ctx,
                 );
@@ -823,6 +1081,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                         fnctx,
                         &mut true_local_ctx,
                         &HashSet::new(),
+                        None,
                     );
                     let false_phi_value = emit_const_or_inst(
                         prg,
@@ -830,6 +1089,7 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                         fnctx,
                         &mut false_local_ctx,
                         &HashSet::new(),
+                        None,
                     );
 
                     true_local_ctx.emit_inst(fnctx, Inst::BlockValue(true_phi_value.clone()));
@@ -860,7 +1120,18 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                     );
                 }
 
-                process(prg, merge, until, last_block, fnctx, ctx);
+                process(
+                    prg,
+                    merge,
+                    until,
+                    last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    ctx,
+                );
             }
             BlockFlowInstruction::ConditionalEnd => (/* end */),
             BlockFlowInstruction::ConditionalLoop {
@@ -869,28 +1140,92 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                 r#continue,
                 body,
             } => {
-                // TODO: 本当はr#continue..=nのブロック列を演算してconditionを結果として抜ける演算ブロックを算出する必要がある これどうやる......？
                 let mut condition_local_ctx = LocalInstGenContext::new();
-                let mut condition_last_block = condition;
+                let mut condition_last_block = r#continue;
+                process(
+                    prg,
+                    r#continue,
+                    Some(n),
+                    &mut condition_last_block,
+                    chead_to_cloop,
+                    true,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    &mut condition_local_ctx,
+                );
+
+                // eval this block(last part of condition)
+                for imr in prg.blocks[n.0].eval_impure_registers.iter() {
+                    if fnctx.has_generated(&RegisterRef::Impure(*imr)) {
+                        // すでに生成済み
+                        continue;
+                    }
+
+                    match prg.impure_instructions[imr] {
+                        BlockInstruction::LoadRef(ptr) => {
+                            let ConstOrInst::Inst(ptr) = emit_const_or_inst(
+                                prg,
+                                ptr,
+                                fnctx,
+                                &mut condition_local_ctx,
+                                &prg.blocks[n.0].eval_impure_registers,
+                                Some(incoming_block),
+                            ) else {
+                                unreachable!("cannot load from const");
+                            };
+
+                            let ir: ConstOrInst = condition_local_ctx
+                                .emit_inst(fnctx, Inst::LoadRef(ptr))
+                                .into();
+                            fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                        }
+                        BlockInstruction::Phi(ref incomings) => {
+                            // unimplemented!("phi decoding: {incomings:?}")
+                            let mut incomings = incomings.clone();
+                            let start_reg =
+                                incomings.remove(&incoming_block).expect("no enter state?");
+                            let ir: ConstOrInst = condition_local_ctx
+                                .emit_inst(
+                                    fnctx,
+                                    Inst::TmpLoopStateStorage {
+                                        start: start_reg,
+                                        continued: incomings,
+                                    },
+                                )
+                                .into();
+                            fnctx.map_register(RegisterRef::Impure(*imr), ir);
+                        }
+                    }
+                }
+
+                eprintln!("cont end");
                 let condition = emit_const_or_inst(
                     prg,
                     condition,
                     fnctx,
                     &mut condition_local_ctx,
-                    &HashSet::new(),
+                    &prg.blocks[n.0].eval_impure_registers,
+                    Some(incoming_block),
                 );
                 condition_local_ctx.emit_inst(fnctx, Inst::BlockValue(condition));
 
                 let mut body_local_ctx = LocalInstGenContext::new();
                 let mut body_last_block = body;
+                loop_stack.push((r#break, r#continue));
                 process(
                     prg,
                     body,
                     Some(r#break),
                     &mut body_last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
                     fnctx,
                     &mut body_local_ctx,
                 );
+                loop_stack.pop();
 
                 ctx.emit_inst(
                     fnctx,
@@ -902,16 +1237,73 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
                         body_order: body_local_ctx.instruction_order,
                     },
                 );
-                process(prg, r#break, until, last_block, fnctx, ctx);
+                process(
+                    prg,
+                    r#break,
+                    until,
+                    last_block,
+                    chead_to_cloop,
+                    false,
+                    false,
+                    loop_stack,
+                    fnctx,
+                    ctx,
+                );
             }
             BlockFlowInstruction::Break => {
+                let &(b, _) = loop_stack.last().unwrap();
+
+                if !flow_only_process {
+                    // 次の実行ブロックにPhiがあったらそのレジスタをここで評価する
+                    for ir in prg.blocks[b.0].eval_impure_registers.iter() {
+                        match prg.impure_instructions[ir] {
+                            BlockInstruction::Phi(ref incomings) => {
+                                if let Some(&r) = incomings.get(&n) {
+                                    emit_const_or_inst(
+                                        prg,
+                                        r,
+                                        fnctx,
+                                        ctx,
+                                        &prg.blocks[n.0].eval_impure_registers,
+                                        None,
+                                    );
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
                 ctx.emit_inst(fnctx, Inst::BreakLoop(n));
             }
             BlockFlowInstruction::Continue => {
-                ctx.emit_inst(fnctx, Inst::ContinueLoop(n));
+                let &(_, c) = loop_stack.last().unwrap();
+
+                if !flow_only_process {
+                    // 次の実行ブロックにPhiがあったらそのレジスタをここで評価する
+                    for ir in prg.blocks[c.0].eval_impure_registers.iter() {
+                        match prg.impure_instructions[ir] {
+                            BlockInstruction::Phi(ref incomings) => {
+                                if let Some(&r) = incomings.get(&n) {
+                                    emit_const_or_inst(
+                                        prg,
+                                        r,
+                                        fnctx,
+                                        ctx,
+                                        &prg.blocks[n.0].eval_impure_registers,
+                                        None,
+                                    );
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                ctx.r#continue(fnctx, n);
             }
             BlockFlowInstruction::Return(v) => {
-                let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new());
+                let v = emit_const_or_inst(prg, v, fnctx, ctx, &HashSet::new(), None);
                 ctx.emit_inst(fnctx, Inst::Return(v));
             }
             BlockFlowInstruction::Undetermined => unreachable!("undetermined destination"),
@@ -926,9 +1318,46 @@ pub fn reconstruct<'a, 's>(prg: &BlockifiedProgram<'a, 's>) -> Function<'s> {
         crate::ir::block::BlockRef(0),
         None,
         &mut crate::ir::block::BlockRef(0),
+        chead_to_cloop,
+        false,
+        false,
+        &mut Vec::new(),
         &mut function_ctx,
         &mut function_local_ctx,
     );
+
+    // TmpLoopStateStorageをLoopStateStorageに変換する（仮置きしてたRegisterの消化）
+    for x in function_local_ctx.instructions.iter_mut() {
+        x.1.flat_iter_mut(|x| match x {
+            Inst::TmpLoopStateStorage {
+                start,
+                ref continued,
+            } => {
+                let new_start = function_ctx
+                    .try_get_for_register(&start)
+                    .expect("no inst generated for start state register")
+                    .clone();
+                let new_continued = continued
+                    .iter()
+                    .map(|(b, r)| {
+                        (
+                            function_ctx.continue_inst_ref_for_block(b),
+                            function_ctx
+                                .try_get_for_register(r)
+                                .expect("no inst generated for register")
+                                .clone(),
+                        )
+                    })
+                    .collect();
+
+                *x = Inst::LoopStateStorage {
+                    start: new_start,
+                    continued: new_continued,
+                };
+            }
+            _ => (),
+        });
+    }
 
     Function {
         instructions: function_local_ctx.instructions,
