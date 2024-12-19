@@ -427,27 +427,16 @@ impl<'a, 's> SymbolScope<'a, 's> {
         .ok()
     }
 
-    pub fn declare_function_input(
-        &mut self,
-        name: SourceRef<'s>,
-        ty: ConcreteType<'s>,
-        mutable: bool,
-        storage_class: RefStorageClass,
-    ) -> VarId {
-        match self.var_id_by_name.borrow_mut().entry(name.slice) {
+    pub fn declare_function_input(&mut self, var: FunctionInputVariable<'s>) -> VarId {
+        match self.var_id_by_name.borrow_mut().entry(var.occurence.slice) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                self.function_input_vars.push(FunctionInputVariable {
-                    occurence: name.clone(),
-                    ty,
-                    mutable,
-                    storage_class,
-                });
+                self.function_input_vars.push(var);
                 let vid = VarId::FunctionInput(self.function_input_vars.len() - 1);
                 v.insert(vid);
                 vid
             }
             std::collections::hash_map::Entry::Occupied(_) => {
-                panic!("Function Input {} is already declared", name.slice);
+                panic!("Function Input {} is already declared", var.occurence.slice);
             }
         }
     }

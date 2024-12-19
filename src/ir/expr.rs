@@ -6,9 +6,8 @@ use crate::{
     concrete_type::{
         arithmetic_compare_op_type_conversion, bitwise_op_type_conversion,
         logical_op_type_conversion, multiply_op_type_conversion, pow_op_type_conversion,
-        BinaryOpScalarConversion, BinaryOpTermConversion, BinaryOpTypeConversion2,
-        BinaryOpValueDistributionRequirements, ConcreteType, IntrinsicScalarType, IntrinsicType,
-        UserDefinedType,
+        BinaryOpScalarConversion, BinaryOpTypeConversion2, BinaryOpValueDistributionRequirements,
+        ConcreteType, IntrinsicScalarType, IntrinsicType, UserDefinedType,
     },
     parser::ExpressionNode,
     ref_path::RefPath,

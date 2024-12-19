@@ -34,7 +34,7 @@ use scope::SymbolScope;
 use source_ref::{SourceRef, SourceRefSliceEq};
 use symbol::{
     meta::{eval_symbol_attributes, ShaderModel, SymbolAttribute},
-    UserDefinedFunctionInput, UserDefinedFunctionSymbol,
+    FunctionInputVariable, UserDefinedFunctionInput, UserDefinedFunctionSymbol,
 };
 use typed_arena::Arena;
 
@@ -213,14 +213,15 @@ fn main() {
                     symbol_scope_arena.alloc(SymbolScope::new(Some(top_scope), true));
                 match f.input_args {
                     FunctionDeclarationInputArguments::Single(a) => {
-                        function_symbol_scope.declare_function_input(
-                            SourceRef::from(&a.varname_token),
-                            ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
+                        function_symbol_scope.declare_function_input(FunctionInputVariable {
+                            occurence: SourceRef::from(&a.varname_token),
+                            ty: ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
                                 .instantiate(&function_symbol_scope),
-                            a.decorators.iter().any(|x| {
+                            mutable: a.decorators.iter().any(|x| {
                                 matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))
                             }),
-                            a.decorators
+                            storage_class: a
+                                .decorators
                                 .iter()
                                 .find_map(|x| match x {
                                     FunctionInputArgumentDecoratorSyntax::UniformStorageClass(
@@ -229,22 +230,22 @@ fn main() {
                                     _ => None,
                                 })
                                 .unwrap_or(RefStorageClass::Input),
-                        );
+                        });
                     }
                     FunctionDeclarationInputArguments::Multiple { args, .. } => {
                         for (a, _) in args {
-                            function_symbol_scope.declare_function_input(
-                                SourceRef::from(&a.varname_token),
-                                ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
+                            function_symbol_scope.declare_function_input(FunctionInputVariable {
+                                occurence: SourceRef::from(&a.varname_token),
+                                ty: ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
                                     .instantiate(&function_symbol_scope),
-                                a.decorators.iter().any(|x| {
+                                mutable: a.decorators.iter().any(|x| {
                                     matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))
                                 }),
-                                a.decorators.iter().find_map(|x| match x {
+                                storage_class: a.decorators.iter().find_map(|x| match x {
                                     FunctionInputArgumentDecoratorSyntax::UniformStorageClass(_) => Some(RefStorageClass::Uniform),
                                     _ => None,
                                 }).unwrap_or(RefStorageClass::Input),
-                            );
+                            });
                         }
                     }
                 }

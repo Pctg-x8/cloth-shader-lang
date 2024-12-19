@@ -51,18 +51,25 @@ pub fn reduce_const_expr(expr: &ExpressionNode) -> Constant {
     }
 }
 
+/// 定数
 #[derive(Debug, Clone, Copy)]
 pub enum Constant {
+    /// ブール
     Bool(bool),
+    /// 符号なし32bit整数
     UInt(u32),
+    /// 符号付き32bit整数
     SInt(i32),
+    /// 32bit浮動小数点数
     Float(f32),
+    /// 型明示なし整数
     UnknownInt(isize),
+    /// 型明示なし実数
     UnknownNumber(f64),
 }
 impl Constant {
-    #[inline(always)]
-    pub fn into_bool(self) -> bool {
+    /// boolにする
+    pub const fn into_bool(self) -> bool {
         match self {
             Self::Bool(x) => x,
             Self::UInt(x) => x != 0,
@@ -73,7 +80,7 @@ impl Constant {
         }
     }
 
-    #[inline(always)]
+    /// 符号なし32bit整数にする
     pub const fn into_u32(self) -> u32 {
         match self {
             Self::Bool(true) => 1,
@@ -720,13 +727,11 @@ impl Constant {
         }
     }
 
-    #[inline(always)]
-    pub fn logical_and(self, rhs: Self) -> bool {
+    pub const fn logical_and(self, rhs: Self) -> bool {
         self.into_bool() && rhs.into_bool()
     }
 
-    #[inline(always)]
-    pub fn logical_or(self, rhs: Self) -> bool {
+    pub const fn logical_or(self, rhs: Self) -> bool {
         self.into_bool() || rhs.into_bool()
     }
 }

@@ -422,29 +422,50 @@ pub enum IntrinsicUnaryOperation {
     LogNot,
 }
 
+/// 定数演算 定数（外的要因で実行時にも値が変わらない）かつ純粋（演算の結果を得る以外の作用がない）な命令列がここ
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlockConstInstruction<'a, 's> {
+    /// 型明示なし整数リテラル
     LitInt(ConstIntLiteral<'s>),
+    /// 型明示なし実数リテラル
     LitNum(ConstNumberLiteral<'s>),
+    /// 符号なし32bit整数リテラル
     LitUInt(ConstUIntLiteral<'s>),
+    /// 符号付き32bit整数リテラル
     LitSInt(ConstSIntLiteral<'s>),
+    /// 32bit浮動小数点数リテラル
     LitFloat(ConstFloatLiteral<'s>),
+    /// 即値 ()
     ImmUnit,
+    /// 即値 ブール
     ImmBool(bool),
+    /// 即値 型明示なし整数
     ImmInt(isize),
+    /// 即値 符号なし32bit整数
     ImmUInt(u32),
+    /// 即値 符号付き32bit整数
     ImmSInt(i32),
+    /// 組み込み関数参照
     IntrinsicFunctionRef(Vec<IntrinsicFunctionSymbol>),
+    /// 組み込み型コンストラクタ参照
     IntrinsicTypeConstructorRef(IntrinsicType),
+    /// スコープ内ローカル変数への参照
     ScopeLocalVarRef(PtrEq<'a, SymbolScope<'a, 's>>, usize),
+    /// 関数入力変数への参照
     FunctionInputVarRef(PtrEq<'a, SymbolScope<'a, 's>>, usize),
+    /// ユーザー定義関数への参照
     UserDefinedFunctionRef(PtrEq<'a, SymbolScope<'a, 's>>, SourceRefSliceEq<'s>),
+    /// 組み込み入出力への参照
     BuiltinIORef(BuiltinInputOutput),
+    /// デスクリプタバインディングへの参照
     DescriptorRef { set: u32, binding: u32 },
+    /// Push Constantへの参照
     PushConstantRef(u32),
+    /// ワークグループ単位で共有されるメモリ領域への参照
     WorkgroupSharedMemoryRef(RefPath),
 }
 impl<'a, 's> BlockConstInstruction<'a, 's> {
+    /// 定数を精度ロスなしで変換する 精度ロスが発生する場合はNone
     #[inline(always)]
     pub fn try_instantiate_lossless_const(&self) -> Option<LosslessConst> {
         match self {

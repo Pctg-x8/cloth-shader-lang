@@ -16,31 +16,6 @@ pub enum BinaryOpScalarConversion {
     Instantiate(IntrinsicScalarType),
 }
 
-pub enum BinaryOpTermConversion {
-    NoConversion,
-    PromoteUnknownNumber,
-    Cast(IntrinsicType),
-    Instantiate(IntrinsicType),
-    Distribute(IntrinsicType),
-    CastAndDistribute(IntrinsicType, u32),
-    InstantiateAndDistribute(IntrinsicType, u32),
-}
-impl BinaryOpTermConversion {
-    const fn distribute(self, to: IntrinsicType, component_count: u32) -> Self {
-        match self {
-            Self::NoConversion => Self::Distribute(to),
-            Self::Cast(x) => Self::CastAndDistribute(x, component_count),
-            Self::Instantiate(x) => Self::InstantiateAndDistribute(x, component_count),
-            Self::Distribute(_) => Self::Distribute(to),
-            Self::CastAndDistribute(x, _) => Self::CastAndDistribute(x, component_count),
-            Self::InstantiateAndDistribute(x, _) => {
-                Self::InstantiateAndDistribute(x, component_count)
-            }
-            Self::PromoteUnknownNumber => panic!("unknown op"),
-        }
-    }
-}
-
 /// 分配オペレーションの必要性を表す
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOpValueDistributionRequirements {
@@ -277,8 +252,7 @@ pub fn bitwise_op_type_conversion<'s>(
             ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
         ) => (
             Some(BinaryOpValueDistributionRequirements::LeftTerm),
-            rhs.intrinsic_composite_type_class()
-                .expect("no intrinsic type"),
+            rhs.intrinsic_composite_type_class()?,
         ),
         // 左がでかいので左に合わせるパターン
         (
@@ -370,181 +344,246 @@ pub fn bitwise_op_type_conversion<'s>(
     })
 }
 
+/// 組み込み論理積（`&&`）/論理和（`||`）の自動型変換ルール定義
 pub fn logical_op_type_conversion<'s>(
     lhs: &ConcreteType<'s>,
     rhs: &ConcreteType<'s>,
 ) -> Option<BinaryOpTypeConversion2<'s>> {
-    todo!("練り直し");
-    /*match (lhs, rhs) {
-        // between same type
-        (a, b) if a == b => Some((BinaryOpTypeConversion::NoConversion, a)),
-        // between same length vectors
-        (a, b) if a.vector_elements()? == b.vector_elements()? => {
-            match (a.scalar_type()?, b.scalar_type()?) {
-                // instantiate and cast
-                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass) => Some((
-                    BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::UInt),
-                    a,
-                )),
-                (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool) => Some((
-                    BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::UInt),
-                    a,
-                )),
-                (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => Some((
-                    BinaryOpTypeConversion::InstantiateAndCastRightHand(IntrinsicType::Float),
-                    a,
-                )),
-                (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => Some((
-                    BinaryOpTypeConversion::InstantiateAndCastLeftHand(IntrinsicType::Float),
-                    a,
-                )),
-                // simple casting
-                (IntrinsicScalarType::Bool, _) => Some((
-                    BinaryOpTypeConversion::CastRightHand(IntrinsicType::Bool),
-                    a,
-                )),
-                (_, IntrinsicScalarType::Bool) => {
-                    Some((BinaryOpTypeConversion::CastLeftHand(IntrinsicType::Bool), b))
-                }
-                // never
-                _ => None,
-            }
-        }
-        // never
-        _ => None,
-    }*/
+    if lhs == rhs {
+        // 同じ
+
+        return Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: lhs.clone(),
+        });
+    }
+
+    // 小ディメンションの値をより広いディメンションの値へと自動変換する（1.0 -> Float4(1.0, 1.0, 1.0, 1.0)みたいに値を分配する（distribute）操作）
+    let (dist, composite_type_class) = match (lhs, rhs) {
+        // 右がでかいので右に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::LeftTerm),
+            rhs.intrinsic_composite_type_class()?,
+        ),
+        // 左がでかいので左に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::RightTerm),
+            lhs.intrinsic_composite_type_class()?,
+        ),
+        // 同じサイズ
+        _ => (None, lhs.intrinsic_composite_type_class()?),
+    };
+
+    // 自動型変換ルール
+    let (l, r) = (lhs.scalar_type()?, rhs.scalar_type()?);
+    let (left_conv, right_conv, result_type) = match (l, r) {
+        // Unitとの演算は不可能
+        (IntrinsicScalarType::Unit, _) | (_, IntrinsicScalarType::Unit) => return None,
+        // 同型
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::None,
+            l,
+        ),
+        // 同型だがBoolにInstantiateするパターン
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Bool),
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Bool),
+            IntrinsicScalarType::Bool,
+        ),
+        // Instantiateするパターン
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Bool)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::Instantiate(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::Bool, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Instantiate(l),
+            l,
+        ),
+        // 左に合わせるパターン（汎用）
+        (IntrinsicScalarType::Bool, _) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Cast(l),
+            l,
+        ),
+        // 右に合わせるパターン（汎用）
+        (_, IntrinsicScalarType::Bool) => (
+            BinaryOpScalarConversion::Cast(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 両方ともBoolにキャスト/Instantiateするパターン（汎用）
+        (l, r) => (
+            if l.is_unknown_type() {
+                BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Bool)
+            } else {
+                BinaryOpScalarConversion::Cast(IntrinsicScalarType::Bool)
+            },
+            if r.is_unknown_type() {
+                BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Bool)
+            } else {
+                BinaryOpScalarConversion::Cast(IntrinsicScalarType::Bool)
+            },
+            IntrinsicScalarType::Bool,
+        ),
+    };
+
+    Some(BinaryOpTypeConversion2 {
+        left_op: left_conv,
+        right_op: right_conv,
+        dist,
+        result_type: ConcreteType::Intrinsic(composite_type_class.combine_scalar(result_type)),
+    })
 }
 
+/// 組み込み累乗（pow）の自動型変換ルール
 pub fn pow_op_type_conversion<'s>(
     lhs: &ConcreteType<'s>,
     rhs: &ConcreteType<'s>,
 ) -> Option<BinaryOpTypeConversion2<'s>> {
-    todo!("練り直し");
-    /*let (left_conversion, resulting_left_ty) = match self {
-        Self::Intrinsic(IntrinsicType::Bool) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
+    if lhs == rhs {
+        // 同じ
+
+        return Some(BinaryOpTypeConversion2 {
+            left_op: BinaryOpScalarConversion::None,
+            right_op: BinaryOpScalarConversion::None,
+            dist: None,
+            result_type: lhs.clone(),
+        });
+    }
+
+    // 小ディメンションの値をより広いディメンションの値へと自動変換する（1.0 -> Float4(1.0, 1.0, 1.0, 1.0)みたいに値を分配する（distribute）操作）
+    let (dist, composite_type_class) = match (lhs, rhs) {
+        // 右がでかいので右に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::LeftTerm),
+            rhs.intrinsic_composite_type_class()?,
         ),
-        Self::Intrinsic(IntrinsicType::UInt) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
+        // 左がでかいので左に合わせるパターン
+        (
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Scalar(_)),
+        )
+        | (
+            ConcreteType::Intrinsic(IntrinsicType::Matrix(_)),
+            ConcreteType::Intrinsic(IntrinsicType::Vector(_)),
+        ) => (
+            Some(BinaryOpValueDistributionRequirements::RightTerm),
+            lhs.intrinsic_composite_type_class()?,
         ),
-        Self::Intrinsic(IntrinsicType::SInt) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        Self::Intrinsic(IntrinsicType::Float) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
-        }
-        Self::Intrinsic(IntrinsicType::UInt2) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-            IntrinsicType::Float2,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt2) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-            IntrinsicType::Float2,
-        ),
-        Self::Intrinsic(IntrinsicType::Float2) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
-        }
-        Self::Intrinsic(IntrinsicType::UInt3) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-            IntrinsicType::Float3,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt3) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-            IntrinsicType::Float3,
-        ),
-        Self::Intrinsic(IntrinsicType::Float3) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
-        }
-        Self::Intrinsic(IntrinsicType::UInt4) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-            IntrinsicType::Float4,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt4) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-            IntrinsicType::Float4,
-        ),
-        Self::Intrinsic(IntrinsicType::Float4) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
-        }
-        Self::UnknownIntClass | Self::UnknownNumberClass => (
-            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        _ => return None,
-    };
-    let (right_conversion, resulting_right_ty) = match rhs {
-        Self::Intrinsic(IntrinsicType::Bool) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        Self::Intrinsic(IntrinsicType::UInt) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        Self::Intrinsic(IntrinsicType::Float) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float)
-        }
-        Self::Intrinsic(IntrinsicType::UInt2) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-            IntrinsicType::Float2,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt2) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float2),
-            IntrinsicType::Float2,
-        ),
-        Self::Intrinsic(IntrinsicType::Float2) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float2)
-        }
-        Self::Intrinsic(IntrinsicType::UInt3) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-            IntrinsicType::Float3,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt3) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float3),
-            IntrinsicType::Float3,
-        ),
-        Self::Intrinsic(IntrinsicType::Float3) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float3)
-        }
-        Self::Intrinsic(IntrinsicType::UInt4) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-            IntrinsicType::Float4,
-        ),
-        Self::Intrinsic(IntrinsicType::SInt4) => (
-            BinaryOpTermConversion::Cast(IntrinsicType::Float4),
-            IntrinsicType::Float4,
-        ),
-        Self::Intrinsic(IntrinsicType::Float4) => {
-            (BinaryOpTermConversion::NoConversion, IntrinsicType::Float4)
-        }
-        Self::UnknownIntClass | Self::UnknownNumberClass => (
-            BinaryOpTermConversion::Instantiate(IntrinsicType::Float),
-            IntrinsicType::Float,
-        ),
-        _ => return None,
+        // 同じサイズ
+        _ => (None, lhs.intrinsic_composite_type_class()?),
     };
 
-    match (resulting_left_ty, resulting_right_ty) {
-        (a, b) if a == b => Some((left_conversion, right_conversion, resulting_left_ty.into())),
-        (a, b) if a.is_scalar_type() && b.is_vector_type() => Some((
-            left_conversion.distribute(b, b.vector_elements().unwrap() as _),
-            right_conversion,
-            resulting_right_ty.into(),
-        )),
-        (a, b) if a.is_vector_type() && b.is_scalar_type() => Some((
-            left_conversion,
-            right_conversion.distribute(a, a.vector_elements().unwrap() as _),
-            resulting_left_ty.into(),
-        )),
-        _ => None,
-    }*/
+    // 自動型変換ルール
+    let (l, r) = (lhs.scalar_type()?, rhs.scalar_type()?);
+    let (left_conv, right_conv, result_type) = match (l, r) {
+        // Unitとの演算は不可能
+        (IntrinsicScalarType::Unit, _) | (_, IntrinsicScalarType::Unit) => return None,
+        // 同型
+        (IntrinsicScalarType::Float, IntrinsicScalarType::Float) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::None,
+            l,
+        ),
+        // 同型だがFloatにInstantiateするパターン
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+            BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float),
+            IntrinsicScalarType::Float,
+        ),
+        // Instantiateするパターン
+        (IntrinsicScalarType::UnknownIntClass, IntrinsicScalarType::Float)
+        | (IntrinsicScalarType::UnknownNumberClass, IntrinsicScalarType::Float) => (
+            BinaryOpScalarConversion::Instantiate(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownIntClass)
+        | (IntrinsicScalarType::Float, IntrinsicScalarType::UnknownNumberClass) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Instantiate(l),
+            l,
+        ),
+        // 左に合わせるパターン（汎用）
+        (IntrinsicScalarType::Float, _) => (
+            BinaryOpScalarConversion::None,
+            BinaryOpScalarConversion::Cast(l),
+            l,
+        ),
+        // 右に合わせるパターン（汎用）
+        (_, IntrinsicScalarType::Float) => (
+            BinaryOpScalarConversion::Cast(r),
+            BinaryOpScalarConversion::None,
+            r,
+        ),
+        // 両方ともFloatにキャスト/Instantiateするパターン（汎用）
+        (l, r) => (
+            if l.is_unknown_type() {
+                BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float)
+            } else {
+                BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float)
+            },
+            if r.is_unknown_type() {
+                BinaryOpScalarConversion::Instantiate(IntrinsicScalarType::Float)
+            } else {
+                BinaryOpScalarConversion::Cast(IntrinsicScalarType::Float)
+            },
+            IntrinsicScalarType::Float,
+        ),
+    };
+
+    Some(BinaryOpTypeConversion2 {
+        left_op: left_conv,
+        right_op: right_conv,
+        dist,
+        result_type: ConcreteType::Intrinsic(composite_type_class.combine_scalar(result_type)),
+    })
 }
 
 /// 乗算の自動型変換ルールの定義
