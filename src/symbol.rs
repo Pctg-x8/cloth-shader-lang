@@ -1,7 +1,7 @@
 use meta::SymbolAttribute;
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType, UserDefinedType},
+    concrete_type::{ConcreteType, IntrinsicType, RefStorageClass, UserDefinedType},
     ir::ExprRef,
     scope::SymbolScope,
     source_ref::SourceRef,
@@ -22,6 +22,7 @@ pub struct FunctionInputVariable<'s> {
     pub occurence: SourceRef<'s>,
     pub ty: ConcreteType<'s>,
     pub mutable: bool,
+    pub storage_class: RefStorageClass,
 }
 
 #[derive(Debug, Clone)]
@@ -32,10 +33,18 @@ pub struct LocalVariable<'s> {
 }
 
 #[derive(Debug, Clone)]
+pub struct UserDefinedFunctionInput<'s> {
+    pub attributes: SymbolAttribute,
+    pub mutable: bool,
+    pub name: SourceRef<'s>,
+    pub ty: ConcreteType<'s>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UserDefinedFunctionSymbol<'s> {
     pub occurence: SourceRef<'s>,
     pub attribute: SymbolAttribute,
-    pub inputs: Vec<(SymbolAttribute, bool, SourceRef<'s>, ConcreteType<'s>)>,
+    pub inputs: Vec<UserDefinedFunctionInput<'s>>,
     pub output: Vec<(SymbolAttribute, ConcreteType<'s>)>,
 }
 impl<'s> UserDefinedFunctionSymbol<'s> {
@@ -47,7 +56,7 @@ impl<'s> UserDefinedFunctionSymbol<'s> {
     #[inline(always)]
     pub fn concrete_type(&self) -> ConcreteType<'s> {
         ConcreteType::Function {
-            args: self.inputs.iter().map(|(_, _, _, t)| t.clone()).collect(),
+            args: self.inputs.iter().map(|x| x.ty.clone()).collect(),
             output: match &self.output[..] {
                 &[] => None,
                 &[(_, ref t)] => Some(Box::new(t.clone())),

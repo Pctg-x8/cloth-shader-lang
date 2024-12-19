@@ -2,7 +2,8 @@ use std::{cell::RefCell, collections::HashMap};
 
 use crate::{
     concrete_type::{
-        ConcreteType, IntrinsicScalarType, IntrinsicType, UserDefinedStructMember, UserDefinedType,
+        ConcreteType, IntrinsicScalarType, IntrinsicType, RefStorageClass, UserDefinedStructMember,
+        UserDefinedType,
     },
     ir::{ExprRef, FunctionBody},
     source_ref::SourceRef,
@@ -252,16 +253,28 @@ impl<'a, 's> SymbolScope<'a, 's> {
         );
         intrinsic_symbols.insert(
             "atomicAdd",
-            vec![IntrinsicFunctionSymbol {
-                name: "Cloth.Intrinsic.Atomic.Add#UInt",
-                args: vec![
-                    ConcreteType::from(IntrinsicType::Scalar(IntrinsicScalarType::UInt))
-                        .mutable_ref(),
-                    IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
-                ],
-                output: IntrinsicType::UNIT.into(),
-                is_pure: false,
-            }],
+            vec![
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Atomic.Add#&mut local,Int",
+                    args: vec![
+                        ConcreteType::from(IntrinsicType::Scalar(IntrinsicScalarType::UInt))
+                            .mutable_ref(RefStorageClass::Local),
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                    ],
+                    output: IntrinsicType::UNIT.into(),
+                    is_pure: false,
+                },
+                IntrinsicFunctionSymbol {
+                    name: "Cloth.Intrinsic.Atomic.Add#&mut device,Int",
+                    args: vec![
+                        ConcreteType::from(IntrinsicType::Scalar(IntrinsicScalarType::UInt))
+                            .mutable_ref(RefStorageClass::Device),
+                        IntrinsicType::Scalar(IntrinsicScalarType::UInt).into(),
+                    ],
+                    output: IntrinsicType::UNIT.into(),
+                    is_pure: false,
+                },
+            ],
         );
         var_id_by_name.insert(
             "Float4",
@@ -419,6 +432,7 @@ impl<'a, 's> SymbolScope<'a, 's> {
         name: SourceRef<'s>,
         ty: ConcreteType<'s>,
         mutable: bool,
+        storage_class: RefStorageClass,
     ) -> VarId {
         match self.var_id_by_name.borrow_mut().entry(name.slice) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -426,6 +440,7 @@ impl<'a, 's> SymbolScope<'a, 's> {
                     occurence: name.clone(),
                     ty,
                     mutable,
+                    storage_class,
                 });
                 let vid = VarId::FunctionInput(self.function_input_vars.len() - 1);
                 v.insert(vid);

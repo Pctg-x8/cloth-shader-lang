@@ -87,16 +87,18 @@ impl<'s> ShaderEntryPointDescription<'s> {
             push_constants: Vec::new(),
             workgroup_shared_vars: Vec::new(),
         };
-        for (n, (attr, _, _, ty)) in func.inputs.iter().enumerate() {
+        for (n, x) in func.inputs.iter().enumerate() {
             process_entry_point_inputs(
-                attr,
+                &x.attributes,
                 &RefPath::FunctionInput(n),
-                ty,
+                &x.ty,
                 scope,
                 &mut global_vars,
             );
         }
-        if func.output.len() > 1 || func.output[0].1 != IntrinsicType::Scalar(IntrinsicScalarType::Unit).into() {
+        if func.output.len() > 1
+            || func.output[0].1 != IntrinsicType::Scalar(IntrinsicScalarType::Unit).into()
+        {
             for (attr, ty) in func.output.iter() {
                 process_entry_point_outputs(attr, ty, scope, &mut global_vars.outputs);
             }

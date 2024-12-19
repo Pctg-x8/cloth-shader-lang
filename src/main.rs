@@ -5,7 +5,7 @@ use std::{
 
 use clap::Parser;
 use codegen::entrypoint::ShaderEntryPointDescription;
-use concrete_type::{ConcreteType, IntrinsicType, UserDefinedStructMember};
+use concrete_type::{ConcreteType, IntrinsicType, RefStorageClass, UserDefinedStructMember};
 use ir::{
     block::{
         dump_blocks, dump_registers, parse_incoming_flows, Block, BlockFlowInstruction,
@@ -26,15 +26,15 @@ use ir::{
     FunctionBody,
 };
 use parser::{
-    CompilationUnit, FunctionDeclarationInputArguments, FunctionDeclarationOutput, ParseState,
-    Tokenizer, ToplevelDeclaration,
+    CompilationUnit, FunctionDeclarationInputArguments, FunctionDeclarationOutput,
+    FunctionInputArgumentDecoratorSyntax, ParseState, Tokenizer, ToplevelDeclaration,
 };
 use ref_path::RefPath;
 use scope::SymbolScope;
 use source_ref::{SourceRef, SourceRefSliceEq};
 use symbol::{
     meta::{eval_symbol_attributes, ShaderModel, SymbolAttribute},
-    UserDefinedFunctionSymbol,
+    UserDefinedFunctionInput, UserDefinedFunctionSymbol,
 };
 use typed_arena::Arena;
 
@@ -121,45 +121,49 @@ fn main() {
                     eval_symbol_attributes(attrs, a.clone())
                 }),
             inputs: match &f.input_args {
-                FunctionDeclarationInputArguments::Single {
-                    attribute_lists,
-                    mut_token,
-                    varname_token,
-                    ty,
-                    ..
-                } => vec![(
-                    attribute_lists
+                FunctionDeclarationInputArguments::Single(a) => vec![UserDefinedFunctionInput {
+                    attributes: a
+                        .attribute_lists
                         .iter()
                         .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a))
                         .fold(SymbolAttribute::default(), |attrs, a| {
                             eval_symbol_attributes(attrs, a.clone())
                         }),
-                    mut_token.is_some(),
-                    SourceRef::from(varname_token),
-                    ConcreteType::build(global_symbol_scope, &toplevel_opaque_types, ty.clone())
-                        .instantiate(&top_scope),
-                )],
-                FunctionDeclarationInputArguments::Multiple { args, .. } => args
-                    .iter()
-                    .map(|(attribute_lists, mut_token, varname_token, _, ty, _)| {
-                        (
-                            attribute_lists
+                    mutable: a
+                        .decorators
+                        .iter()
+                        .any(|x| matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))),
+                    name: SourceRef::from(&a.varname_token),
+                    ty: ConcreteType::build(
+                        global_symbol_scope,
+                        &toplevel_opaque_types,
+                        a.ty.clone(),
+                    )
+                    .instantiate(&top_scope),
+                }],
+                FunctionDeclarationInputArguments::Multiple { args, .. } => {
+                    args.iter()
+                        .map(|(a, _)| UserDefinedFunctionInput {
+                            attributes: a
+                                .attribute_lists
                                 .iter()
                                 .flat_map(|xs| xs.attribute_list.iter().map(|(a, _)| a))
                                 .fold(SymbolAttribute::default(), |attrs, a| {
                                     eval_symbol_attributes(attrs, a.clone())
                                 }),
-                            mut_token.is_some(),
-                            SourceRef::from(varname_token),
-                            ConcreteType::build(
+                            mutable: a.decorators.iter().any(|x| {
+                                matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))
+                            }),
+                            name: SourceRef::from(&a.varname_token),
+                            ty: ConcreteType::build(
                                 global_symbol_scope,
                                 &toplevel_opaque_types,
-                                ty.clone(),
+                                a.ty.clone(),
                             )
                             .instantiate(&top_scope),
-                        )
-                    })
-                    .collect(),
+                        })
+                        .collect()
+                }
             },
             output: match &f.output {
                 Some(FunctionDeclarationOutput::Single {
@@ -208,26 +212,38 @@ fn main() {
                 let function_symbol_scope =
                     symbol_scope_arena.alloc(SymbolScope::new(Some(top_scope), true));
                 match f.input_args {
-                    FunctionDeclarationInputArguments::Single {
-                        varname_token,
-                        ty,
-                        mut_token,
-                        ..
-                    } => {
+                    FunctionDeclarationInputArguments::Single(a) => {
                         function_symbol_scope.declare_function_input(
-                            SourceRef::from(&varname_token),
-                            ConcreteType::build(function_symbol_scope, &HashSet::new(), ty)
+                            SourceRef::from(&a.varname_token),
+                            ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
                                 .instantiate(&function_symbol_scope),
-                            mut_token.is_some(),
+                            a.decorators.iter().any(|x| {
+                                matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))
+                            }),
+                            a.decorators
+                                .iter()
+                                .find_map(|x| match x {
+                                    FunctionInputArgumentDecoratorSyntax::UniformStorageClass(
+                                        _,
+                                    ) => Some(RefStorageClass::Uniform),
+                                    _ => None,
+                                })
+                                .unwrap_or(RefStorageClass::Input),
                         );
                     }
                     FunctionDeclarationInputArguments::Multiple { args, .. } => {
-                        for (_, mut_token, n, _, ty, _) in args {
+                        for (a, _) in args {
                             function_symbol_scope.declare_function_input(
-                                SourceRef::from(&n),
-                                ConcreteType::build(function_symbol_scope, &HashSet::new(), ty)
+                                SourceRef::from(&a.varname_token),
+                                ConcreteType::build(function_symbol_scope, &HashSet::new(), a.ty)
                                     .instantiate(&function_symbol_scope),
-                                mut_token.is_some(),
+                                a.decorators.iter().any(|x| {
+                                    matches!(x, FunctionInputArgumentDecoratorSyntax::Mutable(_))
+                                }),
+                                a.decorators.iter().find_map(|x| match x {
+                                    FunctionInputArgumentDecoratorSyntax::UniformStorageClass(_) => Some(RefStorageClass::Uniform),
+                                    _ => None,
+                                }).unwrap_or(RefStorageClass::Input),
                             );
                         }
                     }

@@ -7,7 +7,7 @@ use std::{
 use typed_arena::Arena;
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicScalarType, IntrinsicType},
+    concrete_type::{ConcreteType, IntrinsicScalarType, IntrinsicType, RefStorageClass},
     parser::StatementNode,
     ref_path::RefPath,
     scope::{SymbolScope, VarId},
@@ -1041,7 +1041,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     #[inline]
     pub fn loaded(&mut self, ptr: RegisterRef) -> RegisterRef {
         match &*ptr.ty(self) {
-            ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => self.load_ref(ptr),
+            ConcreteType::Ref(_, _) | ConcreteType::MutableRef(_, _) => self.load_ref(ptr),
             _ => ptr,
         }
     }
@@ -1165,7 +1165,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         scope: &'a SymbolScope<'a, 's>,
         var_id: usize,
     ) -> RegisterRef {
-        let ty = scope.local_vars.borrow()[var_id].ty.clone().imm_ref();
+        let ty = scope.local_vars.borrow()[var_id]
+            .ty
+            .clone()
+            .imm_ref(RefStorageClass::Local);
 
         RegisterRef::Const(
             self.instruction_emission_context.add_constant(
@@ -1179,7 +1182,10 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         scope: &'a SymbolScope<'a, 's>,
         var_id: usize,
     ) -> RegisterRef {
-        let ty = scope.local_vars.borrow()[var_id].ty.clone().mutable_ref();
+        let ty = scope.local_vars.borrow()[var_id]
+            .ty
+            .clone()
+            .mutable_ref(RefStorageClass::Local);
 
         RegisterRef::Const(
             self.instruction_emission_context.add_constant(
@@ -1193,7 +1199,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         scope: &'a SymbolScope<'a, 's>,
         var_id: usize,
     ) -> RegisterRef {
-        let ty = scope.function_input_vars[var_id].ty.clone().imm_ref();
+        let v = &scope.function_input_vars[var_id];
+        let ty = v.ty.clone().imm_ref(v.storage_class);
 
         RegisterRef::Const(self.instruction_emission_context.add_constant(
             BlockConstInstruction::FunctionInputVarRef(PtrEq(scope), var_id).typed(ty),
@@ -1205,7 +1212,8 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         scope: &'a SymbolScope<'a, 's>,
         var_id: usize,
     ) -> RegisterRef {
-        let ty = scope.function_input_vars[var_id].ty.clone().mutable_ref();
+        let v = &scope.function_input_vars[var_id];
+        let ty = v.ty.clone().mutable_ref(v.storage_class);
 
         RegisterRef::Const(self.instruction_emission_context.add_constant(
             BlockConstInstruction::FunctionInputVarRef(PtrEq(scope), var_id).typed(ty),
@@ -1219,7 +1227,7 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     ) -> RegisterRef {
         let fs = scope.user_defined_function_symbol(name.slice).unwrap();
         let ty = ConcreteType::Function {
-            args: fs.inputs.iter().map(|(_, _, _, t)| t.clone()).collect(),
+            args: fs.inputs.iter().map(|x| x.ty.clone()).collect(),
             output: match &fs.output[..] {
                 &[] => None,
                 &[(_, ref t)] => Some(Box::new(t.clone())),
@@ -1253,16 +1261,18 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
     }
 
     pub fn swizzle_ref(&mut self, source: RegisterRef, elements: Vec<usize>) -> RegisterRef {
+        let (base, sc) = match source.ty(self) {
+            &ConcreteType::Ref(ref base, sc) | &ConcreteType::MutableRef(ref base, sc) => {
+                (base, sc)
+            }
+            _ => unreachable!("cannot get swizzle_ref from non-ref values"),
+        };
         let ty = ConcreteType::from(IntrinsicType::Vector(
-            source
-                .ty(self)
-                .as_dereferenced()
-                .unwrap()
-                .scalar_type()
+            base.scalar_type()
                 .unwrap()
                 .vec(elements.len().try_into().unwrap()),
         ))
-        .imm_ref();
+        .imm_ref(sc);
 
         RegisterRef::Pure(
             self.instruction_emission_context
@@ -1275,16 +1285,18 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         source: RegisterRef,
         elements: Vec<usize>,
     ) -> RegisterRef {
+        let (base, sc) = match source.ty(self) {
+            &ConcreteType::Ref(ref base, sc) | &ConcreteType::MutableRef(ref base, sc) => {
+                (base, sc)
+            }
+            _ => unreachable!("cannot get swizzle_mutable_ref from non-ref values"),
+        };
         let ty = ConcreteType::from(IntrinsicType::Vector(
-            source
-                .ty(self)
-                .as_dereferenced()
-                .unwrap()
-                .scalar_type()
+            base.scalar_type()
                 .unwrap()
                 .vec(elements.len().try_into().unwrap()),
         ))
-        .mutable_ref();
+        .mutable_ref(sc);
 
         RegisterRef::Pure(
             self.instruction_emission_context
@@ -1298,10 +1310,15 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         name: SourceRef<'s>,
         member_type: ConcreteType<'s>,
     ) -> RegisterRef {
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get member_ref from non-ref values"),
+        };
+
         RegisterRef::Pure(
             self.instruction_emission_context.add_pure_instruction(
                 BlockPureInstruction::MemberRef(source, SourceRefSliceEq(name))
-                    .typed(member_type.imm_ref()),
+                    .typed(member_type.imm_ref(base_storage_class)),
             ),
         )
     }
@@ -1312,10 +1329,15 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         name: SourceRef<'s>,
         member_type: ConcreteType<'s>,
     ) -> RegisterRef {
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get member_mutable_ref from non-ref values"),
+        };
+
         RegisterRef::Pure(
             self.instruction_emission_context.add_pure_instruction(
                 BlockPureInstruction::MemberRef(source, SourceRefSliceEq(name))
-                    .typed(member_type.mutable_ref()),
+                    .typed(member_type.mutable_ref(base_storage_class)),
             ),
         )
     }
@@ -1326,9 +1348,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: RegisterRef,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        RegisterRef::Pure(self.instruction_emission_context.add_pure_instruction(
-            BlockPureInstruction::ArrayRef { source, index }.typed(element_type.imm_ref()),
-        ))
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get array_ref from non-ref values"),
+        };
+
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_pure_instruction(
+                BlockPureInstruction::ArrayRef { source, index }
+                    .typed(element_type.imm_ref(base_storage_class)),
+            ),
+        )
     }
 
     pub fn array_mutable_ref(
@@ -1337,9 +1367,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: RegisterRef,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        RegisterRef::Pure(self.instruction_emission_context.add_pure_instruction(
-            BlockPureInstruction::ArrayRef { source, index }.typed(element_type.mutable_ref()),
-        ))
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get array_mutable_ref from non-ref values"),
+        };
+
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_pure_instruction(
+                BlockPureInstruction::ArrayRef { source, index }
+                    .typed(element_type.mutable_ref(base_storage_class)),
+            ),
+        )
     }
 
     pub fn tuple_ref(
@@ -1348,9 +1386,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: usize,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        RegisterRef::Pure(self.instruction_emission_context.add_pure_instruction(
-            BlockPureInstruction::TupleRef(source, index).typed(element_type.imm_ref()),
-        ))
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get tuple_Ref from non-ref values"),
+        };
+
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_pure_instruction(
+                BlockPureInstruction::TupleRef(source, index)
+                    .typed(element_type.imm_ref(base_storage_class)),
+            ),
+        )
     }
 
     pub fn tuple_mutable_ref(
@@ -1359,9 +1405,17 @@ impl<'c, 'a, 's> BlockInstructionEmitter<'c, 'a, 's> {
         index: usize,
         element_type: ConcreteType<'s>,
     ) -> RegisterRef {
-        RegisterRef::Pure(self.instruction_emission_context.add_pure_instruction(
-            BlockPureInstruction::TupleRef(source, index).typed(element_type.mutable_ref()),
-        ))
+        let base_storage_class = match source.ty(self) {
+            &ConcreteType::Ref(_, c) | &ConcreteType::MutableRef(_, c) => c,
+            _ => unreachable!("cannot get tuple_mutable_ref from non-ref values"),
+        };
+
+        RegisterRef::Pure(
+            self.instruction_emission_context.add_pure_instruction(
+                BlockPureInstruction::TupleRef(source, index)
+                    .typed(element_type.mutable_ref(base_storage_class)),
+            ),
+        )
     }
 
     pub fn const_int(&mut self, repr: SourceRef<'s>) -> RegisterRef {
@@ -1753,7 +1807,7 @@ pub fn transform_statement<'a, 's>(
                 | "&&=" | "||=" => {
                     let left_expr_loaded =
                         match &*left_ref_expr.result.ty(inst.instruction_emission_context) {
-                            ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
+                            ConcreteType::Ref(_, _) | ConcreteType::MutableRef(_, _) => {
                                 inst.load_ref(left_ref_expr.result)
                             }
                             _ => unreachable!("cannot store to right hand value"),
@@ -1773,7 +1827,7 @@ pub fn transform_statement<'a, 's>(
                 _ => unreachable!("unknown opeq token"),
             };
             let right_value = match &*left_ref_expr.result.ty(inst.instruction_emission_context) {
-                ConcreteType::MutableRef(inner) => {
+                ConcreteType::MutableRef(inner, _) => {
                     match (
                         &*right_value.ty(inst.instruction_emission_context),
                         &**inner,
@@ -1828,10 +1882,10 @@ pub fn transform_statement<'a, 's>(
                         }
                     }
                 }
-                ConcreteType::Ref(t) => {
+                &ConcreteType::Ref(ref t, sc) => {
                     panic!(
                         "Error: cannot assign to immutable variable: {:?}",
-                        t.clone().imm_ref()
+                        t.clone().imm_ref(sc)
                     )
                 }
                 _ => panic!("Error: cannot assign to non-ref type value"),

@@ -75,6 +75,11 @@ impl<'s> ParseState<'s> {
     }
 
     #[inline]
+    pub fn current_token_of(&self, kind: TokenKind) -> Option<&Token<'s>> {
+        self.current_token().filter(|t| t.kind == kind)
+    }
+
+    #[inline]
     pub fn current_token_in_block(&self) -> Option<&Token<'s>> {
         if !self.check_indent_requirements() {
             return None;
@@ -83,6 +88,7 @@ impl<'s> ParseState<'s> {
         self.current_token()
     }
 
+    /// ポインタを進めてトークンを消費したことにする
     #[inline]
     pub fn consume_token(&mut self) {
         self.token_ptr += 1;
@@ -121,6 +127,9 @@ impl<'s> ParseState<'s> {
         Ok(())
     }
 
+    /// 指定のキーワードのトークンを消費する
+    ///
+    /// 次のトークンが指定のキーワードのトークンでなければ失敗し、ポインタは進まない
     #[inline]
     pub fn consume_keyword(&mut self, kw: &'static str) -> Result<&Token<'s>, ParseError> {
         match self.token_list.get(self.token_ptr) {
@@ -132,6 +141,9 @@ impl<'s> ParseState<'s> {
         }
     }
 
+    /// 特定の種類のトークンを消費する
+    ///
+    /// 次のトークンの種類が指定したものでなければ失敗し、ポインタは進まない
     #[inline]
     pub fn consume_by_kind(&mut self, kind: TokenKind) -> Result<&Token<'s>, ParseError> {
         match self.token_list.get(self.token_ptr) {
@@ -188,6 +200,33 @@ impl<'s> ParseState<'s> {
     pub fn err(&self, kind: ParseErrorKind) -> ParseError {
         self.err_on(kind, self.current_token())
     }
+
+    #[inline(always)]
+    pub fn parse<S: Syntax<'s>>(&mut self) -> ParseResult<S> {
+        S::parse(self)
+    }
+
+    #[inline(always)]
+    pub fn can_parse<S: LookaheadSyntax>(&self) -> bool {
+        S::lookahead(self)
+    }
+
+    #[inline(always)]
+    pub fn try_parse<S: Syntax<'s> + LookaheadSyntax>(&mut self) -> ParseResult<Option<S>> {
+        if S::lookahead(self) {
+            S::parse(self).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+pub trait Syntax<'s>: Sized {
+    fn parse(state: &mut ParseState<'s>) -> ParseResult<Self>;
+}
+
+pub trait LookaheadSyntax: Sized {
+    fn lookahead(state: &ParseState<'_>) -> bool;
 }
 
 #[derive(Debug)]
@@ -197,11 +236,7 @@ pub struct CompilationUnit<'s> {
 }
 impl<'s> CompilationUnit<'s> {
     pub fn parse(mut state: ParseState<'s>) -> ParseResult<Self> {
-        let module = if ModuleDeclaration::lookahead(&mut state) {
-            Some(ModuleDeclaration::parse(&mut state)?)
-        } else {
-            None
-        };
+        let module = state.try_parse::<ModuleDeclaration>()?;
 
         let mut declarations = Vec::new();
         while state.current_token().is_some() {
@@ -220,7 +255,7 @@ pub struct PathSyntax<'s> {
     pub root_token: Token<'s>,
     pub tails: Vec<(Token<'s>, Token<'s>)>,
 }
-impl<'s> PathSyntax<'s> {
+impl<'s> Syntax<'s> for PathSyntax<'s> {
     fn parse(state: &mut ParseState<'s>) -> ParseResult<Self> {
         let root_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
 
@@ -245,15 +280,16 @@ pub struct ModuleDeclaration<'s> {
     module_token: Token<'s>,
     path: PathSyntax<'s>,
 }
-impl<'s> ModuleDeclaration<'s> {
+impl<'s> Syntax<'s> for ModuleDeclaration<'s> {
     fn parse(state: &mut ParseState<'s>) -> ParseResult<Self> {
         let module_token = state.consume_keyword("module")?.clone();
         let path = PathSyntax::parse(state)?;
 
         Ok(Self { module_token, path })
     }
-
-    fn lookahead(state: &ParseState<'s>) -> bool {
+}
+impl LookaheadSyntax for ModuleDeclaration<'_> {
+    fn lookahead(state: &ParseState<'_>) -> bool {
         state
             .current_token()
             .is_some_and(|t| t.kind == TokenKind::Keyword && t.slice == "module")
@@ -265,7 +301,7 @@ pub enum ToplevelDeclaration<'s> {
     Struct(StructDeclaration<'s>),
     Function(FunctionDeclaration<'s>),
 }
-impl<'s> ToplevelDeclaration<'s> {
+impl<'s> Syntax<'s> for ToplevelDeclaration<'s> {
     fn parse(state: &mut ParseState<'s>) -> ParseResult<Self> {
         match state.current_token() {
             Some(t) if t.kind == TokenKind::Keyword && t.slice == "struct" => {
@@ -282,35 +318,43 @@ pub struct TypeGenericArgsSyntax<'s> {
     pub args: Vec<(TypeSyntax<'s>, Option<Token<'s>>)>,
     pub close_angle_bracket_token: Token<'s>,
 }
-fn parse_type_generic_args<'s>(
-    state: &mut ParseState<'s>,
-) -> ParseResult<TypeGenericArgsSyntax<'s>> {
-    let open_angle_bracket_token = state.consume_by_kind(TokenKind::OpenAngleBracket)?.clone();
+impl<'s> Syntax<'s> for TypeGenericArgsSyntax<'s> {
+    fn parse(state: &mut ParseState<'s>) -> ParseResult<Self> {
+        let open_angle_bracket_token = state.consume_by_kind(TokenKind::OpenAngleBracket)?.clone();
 
-    let mut args = Vec::new();
-    let mut can_continue = true;
-    while state
-        .current_token()
-        .is_some_and(|t| t.kind != TokenKind::CloseAngleBracket)
-    {
-        if !can_continue {
-            return Err(state.err(ParseErrorKind::ListNotPunctuated(TokenKind::Comma)));
+        let mut args = Vec::new();
+        let mut can_continue = true;
+        while state
+            .current_token_of(TokenKind::CloseAngleBracket)
+            .is_some()
+        {
+            if !can_continue {
+                return Err(state.err(ParseErrorKind::ListNotPunctuated(TokenKind::Comma)));
+            }
+
+            let t = TypeSyntax::parse(state)?;
+            let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
+
+            can_continue = opt_comma_token.is_some();
+            args.push((t, opt_comma_token));
         }
 
-        let t = parse_type(state)?;
-        let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
+        let close_angle_bracket_token =
+            state.consume_by_kind(TokenKind::CloseAngleBracket)?.clone();
 
-        can_continue = opt_comma_token.is_some();
-        args.push((t, opt_comma_token));
+        Ok(Self {
+            open_angle_bracket_token,
+            args,
+            close_angle_bracket_token,
+        })
     }
-
-    let close_angle_bracket_token = state.consume_by_kind(TokenKind::CloseAngleBracket)?.clone();
-
-    Ok(TypeGenericArgsSyntax {
-        open_angle_bracket_token,
-        args,
-        close_angle_bracket_token,
-    })
+}
+impl LookaheadSyntax for TypeGenericArgsSyntax<'_> {
+    fn lookahead(state: &ParseState<'_>) -> bool {
+        state
+            .current_token()
+            .is_some_and(|t| t.kind == TokenKind::OpenAngleBracket)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -332,62 +376,62 @@ pub enum TypeSyntax<'s> {
         pointee_type: Box<TypeSyntax<'s>>,
     },
 }
-fn parse_type<'s>(state: &mut ParseState<'s>) -> ParseResult<TypeSyntax<'s>> {
-    if let Some(t) = state
-        .current_token()
-        .filter(|t| t.kind == TokenKind::Op && t.slice == "&")
-    {
-        // ref
-        let ampasand_token = t.clone();
-        state.consume_token();
+impl<'s> Syntax<'s> for TypeSyntax<'s> {
+    fn parse(state: &mut ParseState<'s>) -> ParseResult<Self> {
+        if let Some(t) = state
+            .current_token()
+            .filter(|t| t.kind == TokenKind::Op && t.slice == "&")
+        {
+            // ref
+            let ampasand_token = t.clone();
+            state.consume_token();
 
-        let mut_token = state.consume_keyword("mut").ok().cloned();
-        let decorator_token = match state.current_token_in_block() {
-            Some(t) if t.kind == TokenKind::Keyword && t.slice == "uniform" => {
-                let tok = t.clone();
-                state.consume_token();
-                Some(tok)
-            }
-            _ => None,
+            let mut_token = state.consume_keyword("mut").ok().cloned();
+            let decorator_token = match state.current_token_in_block() {
+                Some(t) if t.kind == TokenKind::Keyword && t.slice == "uniform" => {
+                    let tok = t.clone();
+                    state.consume_token();
+                    Some(tok)
+                }
+                _ => None,
+            };
+            let pointee_type = Self::parse(state)?;
+
+            return Ok(Self::Ref {
+                ampasand_token,
+                mut_token,
+                decorator_token,
+                pointee_type: Box::new(pointee_type),
+            });
+        }
+
+        let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+        let generic_args = state.try_parse::<TypeGenericArgsSyntax>()?;
+
+        let mut node = Self::Simple {
+            name_token,
+            generic_args,
         };
-        let pointee_type = parse_type(state)?;
+        loop {
+            match state.current_token_in_block() {
+                Some(t) if t.kind == TokenKind::OpenBracket => {
+                    let open_bracket_token = t.clone();
+                    state.consume_token();
 
-        return Ok(TypeSyntax::Ref {
-            ampasand_token,
-            mut_token,
-            decorator_token,
-            pointee_type: Box::new(pointee_type),
-        });
-    }
+                    let length = parse_expression(state)?;
 
-    let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
-    let generic_args = match state.current_token() {
-        Some(t) if t.kind == TokenKind::OpenAngleBracket => Some(parse_type_generic_args(state)?),
-        _ => None,
-    };
+                    let close_bracket_token =
+                        state.consume_by_kind(TokenKind::CloseBracket)?.clone();
 
-    let mut node = TypeSyntax::Simple {
-        name_token,
-        generic_args,
-    };
-    loop {
-        match state.current_token_in_block() {
-            Some(t) if t.kind == TokenKind::OpenBracket => {
-                let open_bracket_token = t.clone();
-                state.consume_token();
-
-                let length = parse_expression(state)?;
-
-                let close_bracket_token = state.consume_by_kind(TokenKind::CloseBracket)?.clone();
-
-                node = TypeSyntax::Array(
-                    Box::new(node),
-                    open_bracket_token,
-                    length,
-                    close_bracket_token,
-                );
+                    node = Self::Array(
+                        Box::new(node),
+                        open_bracket_token,
+                        length,
+                        close_bracket_token,
+                    );
+                }
+                _ => break Ok(node),
             }
-            _ => break Ok(node),
         }
     }
 }
@@ -540,7 +584,7 @@ fn parse_struct_member<'s>(state: &mut ParseState<'s>) -> ParseResult<StructMemb
         .clone();
     let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
     state.push_indent_context(IndentContext::Exclusive(name_token.line_indent));
-    let ty = parse_type(state)?;
+    let ty = TypeSyntax::parse(state)?;
     state.pop_indent_context();
 
     Ok(StructMember {
@@ -600,24 +644,45 @@ fn parse_struct_declaration<'s>(
 }
 
 #[derive(Debug)]
+pub enum FunctionInputArgumentDecoratorSyntax<'s> {
+    Mutable(Token<'s>),
+    UniformStorageClass(Token<'s>),
+}
+impl<'s> FunctionInputArgumentDecoratorSyntax<'s> {
+    fn try_parse(state: &mut ParseState<'s>) -> Option<Self> {
+        match state.current_token() {
+            Some(t) if t.kind == TokenKind::Keyword && t.slice == "mut" => {
+                let t = t.clone();
+                state.consume_token();
+
+                Some(Self::Mutable(t))
+            }
+            Some(t) if t.kind == TokenKind::Keyword && t.slice == "uniform" => {
+                let t = t.clone();
+                state.consume_token();
+
+                Some(Self::UniformStorageClass(t))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FunctionInputArgumentSyntax<'s> {
+    pub attribute_lists: Vec<AttributeList<'s>>,
+    pub decorators: Vec<FunctionInputArgumentDecoratorSyntax<'s>>,
+    pub varname_token: Token<'s>,
+    pub colon_token: Token<'s>,
+    pub ty: TypeSyntax<'s>,
+}
+
+#[derive(Debug)]
 pub enum FunctionDeclarationInputArguments<'s> {
-    Single {
-        attribute_lists: Vec<AttributeList<'s>>,
-        mut_token: Option<Token<'s>>,
-        varname_token: Token<'s>,
-        colon_token: Token<'s>,
-        ty: TypeSyntax<'s>,
-    },
+    Single(FunctionInputArgumentSyntax<'s>),
     Multiple {
         open_parenthese_token: Token<'s>,
-        args: Vec<(
-            Vec<AttributeList<'s>>,
-            Option<Token<'s>>,
-            Token<'s>,
-            Token<'s>,
-            TypeSyntax<'s>,
-            Option<Token<'s>>,
-        )>,
+        args: Vec<(FunctionInputArgumentSyntax<'s>, Option<Token<'s>>)>,
         close_parenthese_token: Token<'s>,
     },
 }
@@ -647,19 +712,24 @@ fn parse_function_declaration_input_arguments<'s>(
                     attribute_lists.push(parse_attribute_list(state)?);
                 }
 
-                let mut_token = state.consume_keyword("mut").ok().cloned();
-                let name_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
+                let mut decorators = Vec::new();
+                while let Some(d) = FunctionInputArgumentDecoratorSyntax::try_parse(state) {
+                    decorators.push(d);
+                }
+                let varname_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
                 let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
-                let ty = parse_type(state)?;
+                let ty = TypeSyntax::parse(state)?;
                 let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
 
                 can_continue = opt_comma_token.is_some();
                 args.push((
-                    attribute_lists,
-                    mut_token,
-                    name_token,
-                    colon_token,
-                    ty,
+                    FunctionInputArgumentSyntax {
+                        attribute_lists,
+                        decorators,
+                        varname_token,
+                        colon_token,
+                        ty,
+                    },
                     opt_comma_token,
                 ));
             }
@@ -681,18 +751,23 @@ fn parse_function_declaration_input_arguments<'s>(
                 attribute_lists.push(parse_attribute_list(state)?);
             }
 
-            let mut_token = state.consume_keyword("mut").ok().cloned();
+            let mut decorators = Vec::new();
+            while let Some(d) = FunctionInputArgumentDecoratorSyntax::try_parse(state) {
+                decorators.push(d);
+            }
             let varname_token = state.consume_by_kind(TokenKind::Identifier)?.clone();
             let colon_token = state.consume_by_kind(TokenKind::Colon)?.clone();
-            let ty = parse_type(state)?;
+            let ty = TypeSyntax::parse(state)?;
 
-            Ok(FunctionDeclarationInputArguments::Single {
-                attribute_lists,
-                mut_token,
-                varname_token,
-                colon_token,
-                ty,
-            })
+            Ok(FunctionDeclarationInputArguments::Single(
+                FunctionInputArgumentSyntax {
+                    attribute_lists,
+                    decorators,
+                    varname_token,
+                    colon_token,
+                    ty,
+                },
+            ))
         }
     }
 }
@@ -735,7 +810,7 @@ fn parse_function_declaration_output<'s>(
                     attribute_lists.push(parse_attribute_list(state)?);
                 }
 
-                let ty = parse_type(state)?;
+                let ty = TypeSyntax::parse(state)?;
                 let opt_comma_token = state.consume_by_kind(TokenKind::Comma).ok().cloned();
 
                 can_continue = opt_comma_token.is_some();
@@ -759,7 +834,7 @@ fn parse_function_declaration_output<'s>(
                 attribute_lists.push(parse_attribute_list(state)?);
             }
 
-            let ty = parse_type(state)?;
+            let ty = TypeSyntax::parse(state)?;
 
             Ok(FunctionDeclarationOutput::Single {
                 attribute_lists,
@@ -1409,7 +1484,7 @@ fn parse_expression_prime<'s>(state: &mut ParseState<'s>) -> ParseResult<Express
             'alt: {
                 let savepoint = state.save();
 
-                let Ok(ty) = parse_type(state) else {
+                let Ok(ty) = TypeSyntax::parse(state) else {
                     state.restore(savepoint);
                     break 'alt;
                 };

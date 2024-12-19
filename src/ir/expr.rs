@@ -85,7 +85,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
 
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let result = match *base.result.ty(inst.instruction_emission_context) {
-                ConcreteType::Ref(ref inner) => match &**inner {
+                ConcreteType::Ref(ref inner, _) => match &**inner {
                     ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                         (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                         (_, Some(1)) => panic!("scalar value cannot be swizzled"),
@@ -134,7 +134,7 @@ pub fn simplify_lefthand_expression<'a, 's>(
                         panic!("unsupported member ref op for type {ty:?}");
                     }
                 },
-                ConcreteType::MutableRef(ref inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner, _) => match &**inner {
                     ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                         (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                         (_, Some(1)) => panic!("scalar value cannot be swizzled"),
@@ -197,13 +197,13 @@ pub fn simplify_lefthand_expression<'a, 's>(
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let ix_value = inst.loaded(ix.result);
             let result = match *base.result.ty(inst.instruction_emission_context) {
-                ConcreteType::Ref(ref inner) => match &**inner {
+                ConcreteType::Ref(ref inner, _) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_ref(base.result, ix_value, *elm.clone())
                     }
                     _ => panic!("Error: cannot indexing this type: {inner:?}"),
                 },
-                ConcreteType::MutableRef(ref inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner, _) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_mutable_ref(base.result, ix_value, *elm.clone())
                     }
@@ -270,12 +270,7 @@ pub fn simplify_expression<'a, 's>(
                     &mut function_load_inst,
                     symbol_scope,
                 );
-                let f = match *f.ty(function_load_inst.instruction_emission_context) {
-                    ConcreteType::Ref(_) | ConcreteType::MutableRef(_) => {
-                        function_load_inst.load_ref(f)
-                    }
-                    _ => f,
-                };
+                let f = function_load_inst.loaded(f);
 
                 let function_load_block =
                     function_load_inst.create_block(BlockFlowInstruction::Undetermined);
@@ -570,7 +565,7 @@ pub fn simplify_expression<'a, 's>(
                         }
                     }
                 }
-                ConcreteType::Ref(ref inner) => match &**inner {
+                ConcreteType::Ref(ref inner, _) => match &**inner {
                     ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                         (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                         (_, Some(1)) => panic!("scalar value cannot be swizzled"),
@@ -627,7 +622,7 @@ pub fn simplify_expression<'a, 's>(
                         panic!("Error: unsupported member ref op for type {ty:?}");
                     }
                 },
-                ConcreteType::MutableRef(ref inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner, _) => match &**inner {
                     ConcreteType::Intrinsic(x) => match (x.scalar_type(), x.vector_elements()) {
                         (None, _) | (_, None) => panic!("cannot member ref to complex data"),
                         (_, Some(1)) => panic!("scalar value cannot be swizzled"),
@@ -698,13 +693,13 @@ pub fn simplify_expression<'a, 's>(
             let mut inst = BlockInstructionEmitter::new(block_ctx, inst_ctx);
             let index_value = inst.loaded(index.result);
             let result = match *base.result.ty(&inst) {
-                ConcreteType::Ref(ref inner) => match &**inner {
+                ConcreteType::Ref(ref inner, _) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_ref(base.result, index_value, *elm.clone())
                     }
                     _ => panic!("Error: cannot indexing this type: {inner:?}"),
                 },
-                ConcreteType::MutableRef(ref inner) => match &**inner {
+                ConcreteType::MutableRef(ref inner, _) => match &**inner {
                     ConcreteType::Array(elm, _) => {
                         inst.array_mutable_ref(base.result, index_value, *elm.clone())
                     }
@@ -1665,11 +1660,11 @@ fn funcall<'a, 's>(
                             );
                             true
                         }
-                        (ConcreteType::Ref(ref c), c2) if **c == *c2 => {
+                        (ConcreteType::Ref(ref c, _), c2) if **c == *c2 => {
                             *a = inst.load_ref(*a);
                             true
                         }
-                        (ConcreteType::MutableRef(ref c), c2) if **c == *c2 => {
+                        (ConcreteType::MutableRef(ref c, _), c2) if **c == *c2 => {
                             *a = inst.load_ref(*a);
                             true
                         }
@@ -1835,10 +1830,10 @@ fn resolve_overload<'v, 's>(
                         IntrinsicType::Scalar(IntrinsicScalarType::Float),
                     ),
                 )),
-                (c, ConcreteType::Ref(c2)) if c == &**c2 => {
+                (c, ConcreteType::Ref(c2, _)) if c == &**c2 => {
                     args_promotion.push(Some(OverloadArgumentPromotionType::Dereference))
                 }
-                (c, ConcreteType::MutableRef(c2)) if c == &**c2 => {
+                (c, ConcreteType::MutableRef(c2, _)) if c == &**c2 => {
                     args_promotion.push(Some(OverloadArgumentPromotionType::Dereference))
                 }
                 // not match

@@ -3,7 +3,7 @@ mod r#const;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    concrete_type::{ConcreteType, IntrinsicType},
+    concrete_type::{ConcreteType, IntrinsicType, RefStorageClass},
     ir::block::{BlockFlowInstruction, IntrinsicUnaryOperation},
     ref_path::RefPath,
     scope::{SymbolScope, VarId},
@@ -1672,16 +1672,16 @@ pub fn inline_function1<'a, 's>(
                         .zip(user_function_symbol.inputs.iter())
                         .map(|(&r, a)| {
                             let VarId::ScopeLocal(lvid) =
-                                root_scope.declare_anon_local_var(a.3.clone(), a.1)
+                                root_scope.declare_anon_local_var(a.ty.clone(), a.mutable)
                             else {
                                 unreachable!();
                             };
                             let vptr = prg.add_constant(
                                 BlockConstInstruction::ScopeLocalVarRef(PtrEq(root_scope), lvid)
-                                    .typed(if a.1 {
-                                        a.3.clone().mutable_ref()
+                                    .typed(if a.mutable {
+                                        a.ty.clone().mutable_ref(RefStorageClass::Local)
                                     } else {
-                                        a.3.clone().imm_ref()
+                                        a.ty.clone().imm_ref(RefStorageClass::Local)
                                     }),
                             );
 
@@ -1872,7 +1872,7 @@ pub fn replace_shader_input_refs<'a, 's>(
     for x in prg.constants.iter_mut() {
         match x.inst {
             BlockConstInstruction::FunctionInputVarRef(scope, id) if scope == root_scope => {
-                let descriptor_bound = match function_symbol.inputs[id].0 {
+                let descriptor_bound = match function_symbol.inputs[id].attributes {
                     SymbolAttribute {
                         descriptor_set_location: Some(set),
                         descriptor_set_binding: Some(binding),
@@ -1880,21 +1880,21 @@ pub fn replace_shader_input_refs<'a, 's>(
                     } => Some(DescriptorBound { set, binding }),
                     _ => None,
                 };
-                let push_constant_bound = match function_symbol.inputs[id].0 {
+                let push_constant_bound = match function_symbol.inputs[id].attributes {
                     SymbolAttribute {
                         push_constant_offset: Some(offset),
                         ..
                     } => Some(PushConstantBound { offset }),
                     _ => None,
                 };
-                let builtin_bound = match function_symbol.inputs[id].0 {
+                let builtin_bound = match function_symbol.inputs[id].attributes {
                     SymbolAttribute {
                         bound_builtin_io: Some(io),
                         ..
                     } => Some(BuiltinBound(io)),
                     _ => None,
                 };
-                let workgroup_shared = function_symbol.inputs[id].0.workgroup_shared;
+                let workgroup_shared = function_symbol.inputs[id].attributes.workgroup_shared;
 
                 match (
                     descriptor_bound,
